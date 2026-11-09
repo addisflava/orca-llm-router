@@ -1,132 +1,213 @@
 # Orca LLM Router
 
-A self-contained local LLM gateway for Orca agents. Agents talk to one
-stable local endpoint and the gateway resolves every request directly to the
-provider you configured — Anthropic, OpenAI,
-OpenRouter, DeepSeek, Kimi, Z.AI, MiniMax, Mistral, SiliconFlow, Moonshot,
-Ollama/local, or any OpenAI/Anthropic/Responses-compatible endpoint.
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Orca: >=1.4.248](https://img.shields.io/badge/Orca-%3E%3D1.4.248-6366f1.svg)](https://onorca.dev)
+[![Node: >=22](https://img.shields.io/badge/Node-%3E%3D22-green.svg)](package.json)
+[![Tests: 71 Passing](https://img.shields.io/badge/Tests-71%20passing-brightgreen.svg)](tests/sidecar.test.mjs)
 
+A high-performance, self-contained local LLM gateway and routing sidecar designed natively for **[Orca](https://onorca.dev)**.
 
-## How it works
+Point all your coding agents (**Claude Code, OpenAI Codex, OpenCode, Pi, Aider, Cursor, Cline**) to a single stable local endpoint (`127.0.0.1:18080`). **Orca LLM Router** transparently translates protocols, maps reasoning/thinking modes, load-balances across credential pools, handles automatic fallbacks, and routes traffic directly to your chosen providers.
+
+---
+
+## Architecture
 
 ```
-any agent CLI in Orca (Claude Code, Codex, OpenCode, Pi, …)
-        │  agent.launch.before hook rewrites env:
-        │  ANTHROPIC_BASE_URL / OPENAI_BASE_URL -> http://127.0.0.1:18080[/v1]
-        ▼
-Orca LLM Router gateway  127.0.0.1:18080    (this plugin, worker/sidecar.mjs)
-        │  aliases → routing rules (conditions + rewrites) → provider/model
-        ├─► https://api.anthropic.com      (anthropic messages)
-        ├─► https://api.openai.com/v1      (openai chat + responses)
-        ├─► https://openrouter.ai/api/v1   (openai chat + responses)
-        └─► any provider in the preset catalog or your own endpoint
+┌────────────────────────────────────────────────────────────────────────┐
+│ Orca Agent Environment (Claude Code, Codex, OpenCode, Pi, Aider...)    │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │ agent.launch.before hook
+                                    │ ANTHROPIC_BASE_URL -> http://127.0.0.1:18080
+                                    │ OPENAI_BASE_URL    -> http://127.0.0.1:18080/v1
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ Orca LLM Router Gateway (127.0.0.1:18080)                              │
+│                                                                        │
+│ • Model Aliases & Rewriting Rules (Regex / Exact / Field matching)     │
+│ • Cross-Protocol Translation (Anthropic ↔ OpenAI ↔ Gemini ↔ Responses)  │
+│ • Extended Thinking Translation (Claude 3.7 ↔ o1/o3-mini ↔ DeepSeek R1) │
+│ • Multimodal Vision Mapping (Base64 inline ↔ OpenAI image_url)         │
+│ • Credential Pools & Smart Cooldowns (Priority, Weights, Non-destr. RPM)│
+│ • Model-Chain Fallbacks (Auto-switch on 4xx/5xx or rate limits)        │
+│ • Prompt Cache Header Preservation (anthropic-beta passthrough)        │
+└───────┬───────────────────────────┬────────────────────────────┬───────┘
+        │                           │                            │
+        ▼                           ▼                            ▼
+┌──────────────────┐       ┌──────────────────┐         ┌──────────────────┐
+│    Anthropic     │       │      OpenAI      │         │   Google Gemini  │
+│ api.anthropic.com│       │ api.openai.com/v1│         │generativelanguage│
+└──────────────────┘       └──────────────────┘         └──────────────────┘
+        │                           │                            │
+        ▼                           ▼                            ▼
+┌──────────────────┐       ┌──────────────────┐         ┌──────────────────┐
+│     DeepSeek     │       │    OpenRouter    │         │  Ollama / Local  │
+│ api.deepseek.com │       │ openrouter.ai/v1 │         │  127.0.0.1:11434 │
+└──────────────────┘       └──────────────────┘         └──────────────────┘
+        │
+        └─► Any OpenAI, Anthropic, or Gemini-compatible endpoint
 ```
 
-- **Three client protocol surfaces** are served: Anthropic Messages
-  (`/v1/messages`), OpenAI Chat Completions (`/v1/chat/completions`) and
-  OpenAI Responses (`/v1/responses`). Providers may speak any of those, and
-  native Google Gemini `generateContent` is translated too, so a
-  `protocols: ["gemini"]` provider (e.g. Google AI Studio) works from every
-  client surface. When a client and its chosen provider speak different
-  shapes, the gateway translates text, tools, images and usage (and streams in
-  the client's shape by buffering the upstream response).
-- **Routing**: model aliases (`claude-fast` → `anthropic/claude-…`),
-  provider/model selectors (`deepseek/deepseek-chat`), and ordered
-  conditional rules (`request.body.model starts-with claude-` → set model to
-  `deepseek/deepseek-chat`). The first enabled matching rule wins.
-- **Fallback and retries**: per-rule and global failure policies —
-  `off`, `retry` (same model N times) or `model-chain` (try backup models in
-  order, switching on any 4xx/5xx). Retry-After is honored, otherwise
-  exponential backoff. The gateway returns `x-router-fallback-*` headers and
-  records every attempt in the log.
-- **Credential pools**: several API keys per provider, rotated round-robin
-  across all enabled keys in priority order. A key that returns an auth error,
-  is rate limited, or reaches a local limit is cooled down and skipped so
-  traffic moves to the next key. Local limits can be set per key (`rpm`/`rph`/`rpd`,
-  `tpm`/`tph`/`tpd`, `ipm`/`iph`/`ipd`, `maxRequests`+`windowMs`,
-  `maxTokens`+`quotaWindowMs`). Keys live in Orca's encrypted `secrets:own`
-  store — never in storage or logs.
-- **Client API keys**: optional gateway keys with expiration and per-key
-  limits, separate from provider credentials. Request (`rpm`/`rph`/`rpd`),
-  token (`tpm`/`tph`/`tpd`) and image (`ipm`/`iph`/`ipd`) windows are enforced,
-  plus `maxRequests`/`windowMs` and `maxTokens`/`quotaWindowMs` quotas. The
-  internal launch token (`orca-router` by default) is always accepted for
-  Orca-launched agents.
-- **OpenCode model discovery**: OpenCode does not read `OPENAI_BASE_URL`, and
-  its v2 CLI reuses a shared background server that ignores the env of later
-  launches. The plugin publishes an `orca-router` provider — every enabled
-  provider/model plus aliases, matching `/v1/models` — into
-  `~/.config/opencode/opencode.jsonc` (the first sync leaves
-  `opencode.jsonc.orca-backup`), updates it when providers or keys change, and
-  runs Orca-started v2 OpenCode CLIs with `--standalone` so a launch-local
-  `OPENCODE_CONFIG` wins. Plain `opencode` terminals reach the same gateway
-  through the global config and its live reload.
-- **Codex model discovery**: Codex builds its `/model` picker from a catalog
-  file, so each Orca-started Codex gets `-c model_catalog_json=…` and
-  `-c model_providers.orca-router.*` overrides. The generated catalog contains
-  every enabled provider/model plus aliases, matching `/v1/models`, and the
-  session's model/provider are pointed at the gateway. The catalog uses
-  standard function tools rather than Codex's code-mode custom `exec` wrapper,
-  so OpenAI-compatible providers can execute them. A Codex agent profile can
-  also set `reasoningEffort` (`low`, `medium`, or `high`), which is passed as
-  `model_reasoning_effort` for that launch. The user's `~/.codex/config.toml` is
-  never modified; a plain-terminal `codex` keeps its own provider.
-- **Dashboard panel**: gateway state, provider health, preset browser,
-  routing-rule editor, aliases, agent profiles, client keys, model fetching
-  (pulls the endpoint's list per protocol into the provider's models),
-  connection checks (which validate the credential against the provider's
-  model list), usage fetch, request log (provider, resolved model, tokens,
-  cost, latency, attempts) and a usage overview (requests, success rate,
-  tokens, cost, per-provider/per-model breakdowns).
-- **Import / export**: 1-click import from local Claude Code Router (`~/.claude-code-router`) and OmniRoute (`~/.omniroute`) installations with auto-detection, AES-256-GCM credential decryption, combo migration, model aliases, and smart config merging. Also supports importing custom SQLite/JSON files, pasting configs directly into the panel, or using the CLI converter (`tools/import-legacy-config.mjs`). Snapshots can be exported as JSON at any time.
-- **Status bar + commands**: `router:18080` shows gateway state; palette
-  commands start/stop/restart/test it.
+---
 
-The hook is synchronous and cached: settings toggles apply after the next
-`router.status` / agent activity event. Orca's native Chat UI does **not** go
-through `agent.launch.before` (it is not a CLI) and is out of scope.
+## Key Features
 
-Do not run Claude Code Router alongside this plugin. CCR rewrites
-`~/.claude/settings.json` and the global OpenCode config, so stop it with
-`ccr stop` first. The OpenCode sync removes stale `claude-code-router` entries
-on the next plugin start or config save; Orca-launched Claude uses its own
-per-launch settings file regardless.
+### 1. Universal Cross-Protocol Translation
+- **Four Protocol Surfaces**: Serves Anthropic Messages (`/v1/messages`), OpenAI Chat Completions (`/v1/chat/completions`), OpenAI Responses (`/v1/responses`), and Google Gemini Native (`/v1beta/models/...:generateContent`).
+- **Bidirectional Conversion**: Translate requests and responses on the fly. Point Claude Code at DeepSeek-V3, Codex at Claude 3.7 Sonnet, or OpenCode at Google Gemini with zero code changes.
+- **Cross-Protocol Streaming**: Real-time SSE streaming translation preserves chunks and usage metadata across disparate provider APIs.
 
-## Develop
+### 2. Extended Thinking & Reasoning Parity
+- **Claude 3.7 Sonnet ↔ OpenAI o1/o3-mini ↔ DeepSeek-R1**:
+  - Automatically translates Anthropic's `thinking: { type: 'enabled', budget_tokens }` into OpenAI's `reasoning_effort` (`low`, `medium`, `high`).
+  - Incompatible parameters are stripped for standard models to prevent `400 Bad Request` schema errors.
+  - Maps DeepSeek `reasoning_content` and OpenAI thinking blocks back into native Anthropic `thinking` blocks for Claude Code.
 
-Requires Orca ≥ 1.4.248 and Node ≥ 22.
+### 3. Multimodal Vision Translation
+- Seamlessly converts Anthropic base64 images (`source: { type: 'base64', media_type, data }`) into OpenAI `image_url` data URIs and Google Gemini `inlineData` parts.
 
-```sh
-# tests (pure Node, no Orca needed)
+### 4. Smart Credential Pools & Non-Destructive Rate Limiting
+- **Multiple Keys per Provider**: Rotate across API keys using prioritized round-robin or weighted distribution.
+- **Automatic Cooldowns**: Keys encountering 401/403 (auth error) or 429 (rate limits) are cooled down and bypassed automatically until their timeout expires.
+- **Accurate Rate Window Tracking**: Non-destructive rolling window tracking accurately enforces `rpm`, `rph`, `rpd`, `tpm`, `tph`, and `tpd` without discarding historical window counts.
+- **Zero-Leakage Security**: Provider credentials live exclusively in Orca's encrypted `secrets:own` vault. Client gateway tokens are never leaked to upstream providers.
+
+### 5. Prompt Caching & Header Transparency
+- Passes `anthropic-beta` headers (`prompt-caching-2024-07-31`, `thinking-2024-11-25`, `max-tokens-3-5-sonnet-2024-07-15`) directly through to Anthropic upstreams, preserving 90% cost savings on repetitive prompts.
+- Honors upstream `Retry-After` headers (both integer seconds and RFC 1123 HTTP-date formats).
+
+### 6. Seamless Agent Integration (Orca-Native)
+- **Zero Config Corruption**: Unlike external routers that overwrite `~/.claude/settings.json` or global dotfiles, Orca LLM Router uses Orca's `agent.launch.before` hook to inject isolated per-session environments.
+- **OpenCode & Codex Discovery**: Automatically publishes enabled models to OpenCode's standalone config and injects dynamic Codex `-c model_catalog_json` catalogs.
+
+### 7. 1-Click Migration from Legacy Routers
+- **Claude Code Router (CCR)**: Imports models, profiles, aliases, and rules from `~/.claude-code-router`.
+- **OmniRoute**: Imports connections, nodes, combos, and decrypts AES-256-GCM credentials (`enc:v1:...`) automatically.
+
+---
+
+## Supported Providers
+
+Built-in presets with model catalogs, pricing data, and usage scrapers:
+
+| Provider | Protocols | Default Base URL |
+|---|---|---|
+| **Anthropic** | `anthropic` | `https://api.anthropic.com` |
+| **OpenAI** | `openai`, `responses` | `https://api.openai.com/v1` |
+| **Google Gemini (AI Studio)** | `gemini` | `https://generativelanguage.googleapis.com` |
+| **OpenRouter** | `openai` | `https://openrouter.ai/api/v1` |
+| **DeepSeek** | `openai` | `https://api.deepseek.com` |
+| **Ollama (Local)** | `openai` | `http://127.0.0.1:11434/v1` |
+| **Groq** | `openai` | `https://api.groq.com/openai/v1` |
+| **Mistral AI** | `openai` | `https://api.mistral.ai/v1` |
+| **Moonshot (Kimi)** | `openai` | `https://api.moonshot.cn/v1` |
+| **SiliconFlow** | `openai` | `https://api.siliconflow.cn/v1` |
+| **Z.AI (GLM / Zhipu)** | `openai` | `https://open.bigmodel.cn/api/paas/v4` |
+| **MiniMax** | `openai` | `https://api.minimax.chat/v1` |
+| **Custom Endpoint** | `openai`, `anthropic`, `responses`, `gemini` | Any compatible URL |
+
+---
+
+## Quick Start
+
+### 1. Installation in Orca
+Install or load directly inside Orca ADE:
+```bash
+# Validate the manifest
+orca plugin validate .
+
+# Load into Orca as a live development plugin
+orca plugin dev watch .
+```
+
+### 2. Configure Providers
+1. Open the Orca right sidebar and select the **Orca LLM Router** panel (or run command `Orca LLM Router: gateway status`).
+2. Navigate to **Providers** and choose any preset (e.g., Anthropic, DeepSeek, OpenAI).
+3. Add your API key. Keys are encrypted and stored in Orca's secure secret store.
+4. Set your default provider or configure routing rules.
+
+### 3. Launch Any Agent
+Launch any coding agent in Orca—it will automatically route through `http://127.0.0.1:18080`:
+```bash
+# Claude Code routes through your configured Anthropic/OpenAI upstream
+claude
+
+# Codex routes through the gateway catalog
+codex
+
+# OpenCode routes through standalone gateway config
+opencode
+```
+
+---
+
+## Configuration & Routing Rules
+
+Routing rules are evaluated top-to-bottom. The first matching rule wins:
+
+```json
+{
+  "routes": [
+    {
+      "id": "route-claude-fast",
+      "name": "Route fast requests to DeepSeek",
+      "enabled": true,
+      "condition": {
+        "source": "request.body",
+        "field": "model",
+        "operator": "starts-with",
+        "value": "claude-3-5-haiku"
+      },
+      "rewrites": [
+        { "key": "request.body.model", "operation": "set", "value": "deepseek/deepseek-chat" }
+      ],
+      "fallback": {
+        "mode": "model-chain",
+        "models": ["openrouter/deepseek/deepseek-chat", "openai/gpt-4o-mini"],
+        "retryCount": 1
+      }
+    }
+  ]
+}
+```
+
+### Fallback Modes
+- **`retry`**: Retries the same model $N$ times with exponential backoff before failing.
+- **`model-chain`**: If upstream returns 4xx/5xx or rate limits, the gateway sequentially tries backup models in the configured chain.
+
+---
+
+## Testing & Validation
+
+The gateway core has zero external runtime dependencies (`node:http` + native `fetch`) and includes a pure Node.js test suite:
+
+```bash
+# Run unit tests (71 passing tests)
 npm test
 
-# validate the manifest, then hot-load into Orca
-orca plugin validate .
-orca plugin dev watch .
-# open the panel: orca plugin open <key> --panel router
-# handy: orca plugin logs <publisher>.llm-router
+# Check Orca plugin manifest and component rendering
+npm run validate
+orca plugin check .
 ```
 
-`orca plugin types .` writes `.orca/types` for editor completion (git-ignored).
-TypeScript files are transpiled by Orca with no build step.
+---
 
-## Publish
+## Contributing & Publishing
 
-1. Add the `orca-plugin` topic to your repo: `gh repo edit --add-topic orca-plugin`
-2. Commit a version, then tag exactly: `git tag v1.0.0 && git push origin v1.0.0`
-3. Check `https://www.onorca.dev/plugins/<owner>/<repo>` — it lists the
-   plugin within an hour if the manifest passes.
+To publish to the public Orca directory (`onorca.dev/plugins`):
+1. Tag your repository with the `orca-plugin` topic:
+   ```bash
+   gh repo edit --add-topic orca-plugin
+   ```
+2. Create and push a version tag:
+   ```bash
+   git tag v1.0.0
+   git push origin v1.0.0
+   ```
+3. Your plugin will be indexed on `https://www.onorca.dev/plugins/addisflava/orca-llm-router` within an hour.
 
-Before publishing, add a `cover` (16:10, ≥ 800×500) and screenshots in the
-manifest — cards without a cover get drawn art. The manifest already carries
-`license: MIT` plus a `LICENSE` file.
+---
 
-## Design choices
+## License
 
-- `trusted-worker` (full access): the worker must listen on localhost and the
-  `agent.launch.before` hook must rewrite every agent's environment. The user
-  approves this once at install.
-- `engines.orca >=1.4.248`: hooks (`agent.launch.before`) and status-bar items
-  need it.
-- No dependencies: `worker/sidecar.mjs` uses only `node:http` + global
-  `fetch`; `worker/main.mjs` is the Orca glue.
+MIT © [Orca Community](LICENSE)

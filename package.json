@@ -5,6 +5,10 @@
   "private": true,
   "type": "module",
   "engines": { "node": ">=22" },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/addisflava/orca-llm-router.git"
+  },
   "scripts": {
     "test": "node --test tests/sidecar.test.mjs",
     "validate": "orca plugin validate ."
