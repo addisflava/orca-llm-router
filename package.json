@@ -1,0 +1,13 @@
+{
+  "name": "orca-llm-router",
+  "version": "1.0.0",
+  "description": "Orca plugin: local LLM routing sidecar with direct provider connections.",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "node --test tests/sidecar.test.mjs",
+    "validate": "orca plugin validate ."
+  },
+  "license": "MIT"
+}

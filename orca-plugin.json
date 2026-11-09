@@ -1,0 +1,107 @@
+{
+  "$schema": "https://raw.githubusercontent.com/stablyai/orca/main/docs/schemas/plugins/orca-plugin.v2.schema.json",
+  "manifestVersion": 2,
+  "execution": "trusted-worker",
+  "id": "llm-router",
+  "name": "Orca LLM Router",
+  "version": "1.0.0",
+  "description": "A self-contained local LLM gateway for Orca agents: direct provider connections (Anthropic, OpenAI, OpenRouter, DeepSeek, …), conditional routing rules with rewrites, fallback chains, credential pools, a request log and usage dashboard.",
+  "author": { "name": "Orca Community" },
+  "license": "MIT",
+  "engines": { "orca": ">=1.4.248" },
+  "pluginApi": 1,
+  "main": "worker/main.mjs",
+  "contributes": {
+    "panels": [
+      {
+        "id": "router",
+        "title": "Orca LLM Router",
+        "icon": "zap",
+        "entry": "src/panel.tsx",
+        "ui": "components"
+      }
+    ],
+    "commands": [
+      { "id": "router.status", "title": "Orca LLM Router: gateway status" },
+      { "id": "router.start", "title": "Orca LLM Router: start sidecar" },
+      { "id": "router.stop", "title": "Orca LLM Router: stop sidecar" },
+      { "id": "router.restart", "title": "Orca LLM Router: restart sidecar" },
+      { "id": "router.test", "title": "Orca LLM Router: test providers" }
+    ],
+    "hooks": [
+      { "event": "agent.launch.before" }
+    ],
+    "events": [
+      { "on": "agent.status.changed" }
+    ],
+    "statusBarItems": [
+      {
+        "id": "router-status",
+        "text": "router:18080",
+        "icon": "zap",
+        "tone": "neutral",
+        "tooltip": "Orca LLM Router sidecar",
+        "command": "router.status"
+      }
+    ],
+    "settings": [
+      {
+        "key": "enabled",
+        "title": "Route agent traffic",
+        "description": "When on, every enabled agent Orca launches is pointed at the sidecar. Turn individual agents off in the Agents tab.",
+        "type": "boolean",
+        "default": true
+      },
+      {
+        "key": "port",
+        "title": "Sidecar port",
+        "description": "Local port the gateway listens on. 18080 by default.",
+        "type": "integer",
+        "minimum": 1024,
+        "maximum": 65535,
+        "default": 18080
+      },
+      {
+        "key": "bindHost",
+        "title": "Sidecar host",
+        "description": "Bind address. Keep 127.0.0.1 unless other machines must reach the gateway.",
+        "type": "string",
+        "default": "127.0.0.1"
+      },
+      {
+        "key": "timeoutMs",
+        "title": "Upstream timeout (ms)",
+        "description": "Per-request ceiling for one upstream attempt, including long streams. 600000 keeps 10-minute streams alive.",
+        "type": "integer",
+        "minimum": 1000,
+        "maximum": 3600000,
+        "default": 600000
+      },
+      {
+        "key": "retries",
+        "title": "Retries per upstream",
+        "description": "Retries after 429, 5xx and network errors before falling over to the next model in the chain.",
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 10,
+        "default": 2
+      },
+      {
+        "key": "baseDelayMs",
+        "title": "Retry backoff base (ms)",
+        "description": "Exponential backoff starts at this delay; a positive Retry-After wins.",
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 30000,
+        "default": 200
+      }
+    ]
+  },
+  "capabilities": [
+    { "kind": "storage:own" },
+    { "kind": "settings:own" },
+    { "kind": "secrets:own" },
+    { "kind": "agent:read" },
+    { "kind": "notifications:show" }
+  ]
+}
