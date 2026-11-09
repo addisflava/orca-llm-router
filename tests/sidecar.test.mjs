@@ -2,7 +2,7 @@
 // Run: node --test tests/
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { injectCodexProvider } from '../worker/main.mjs'
+import { buildCodexManagedConfig, injectCodexProvider } from '../worker/main.mjs'
 import {
   DEFAULT_CONFIG,
   PROVIDER_PRESETS,
@@ -26,6 +26,7 @@ import {
   joinUpstreamUrl,
   matchRoute,
   normalizeConfig,
+  normalizeResponsesCustomTools,
   openAIResponseToResponses,
   openAIResponseToAnthropic,
   openAIToAnthropic,
@@ -498,7 +499,66 @@ test('injectCodexProvider adds the gateway, catalog, direct model and reasoning 
   assert.match(command, /model_reasoning_effort="low"/)
   assert.match(command, /model_catalog_json="\/tmp\/orca-llm-router\/codex-models\.json"/)
   assert.match(command, /base_url="http:\/\/127\.0\.0\.1:18080\/v1"/)
+  assert.match(command, /experimental_bearer_token="orca-router"/)
+  assert.doesNotMatch(command, /env_key=/)
   assert.equal(injectCodexProvider(command, { base: 'http://127.0.0.1:18080' }), command)
+})
+
+test('buildCodexManagedConfig installs and removes a marker-delimited block', () => {
+  const original = [
+    'model = "gpt-5.5"',
+    'model_reasoning_effort = "xhigh"',
+    '',
+    '[subagents]',
+    'model = "gpt-5.4-mini"',
+    '',
+    '[projects."/mnt/e/ecom"]',
+    'trust_level = "trusted"',
+    ''
+  ].join('\n')
+  const managed = buildCodexManagedConfig(original, {
+    base: 'http://127.0.0.1:18080',
+    token: 'orca-router',
+    catalogPath: '/tmp/orca-llm-router/codex-models.json',
+    model: 'tokenharbor/mimo-v2.5:free',
+    reasoningEffort: 'xhigh'
+  })
+  assert.match(managed, /^# BEGIN Orca LLM Router managed profile/)
+  assert.match(managed, /model_provider = "orca-router"/)
+  assert.match(managed, /model_reasoning_effort = "high"/)
+  assert.match(managed, /\[model_providers\.orca-router\]/)
+  assert.match(managed, /experimental_bearer_token = "orca-router"/)
+  assert.match(managed, /\[subagents\]/)
+  assert.match(managed, /\[projects\."\/mnt\/e\/ecom"\]/)
+  // The original top-level model/reasoning keys are replaced, not duplicated.
+  assert.equal((managed.match(/^model = "tokenharbor\/mimo-v2\.5:free"$/gm) ?? []).length, 1)
+  assert.equal((managed.match(/^model_reasoning_effort = /gm) ?? []).length, 1)
+  // Re-applying is idempotent.
+  assert.equal(buildCodexManagedConfig(managed, {
+    base: 'http://127.0.0.1:18080',
+    token: 'orca-router',
+    catalogPath: '/tmp/orca-llm-router/codex-models.json',
+    model: 'tokenharbor/mimo-v2.5:free',
+    reasoningEffort: 'high'
+  }), managed)
+})
+
+test('normalizeResponsesCustomTools turns grammar tools into text for third-party providers', () => {
+  const body = {
+    model: 'm',
+    tools: [
+      { type: 'custom', name: 'apply_patch', format: { type: 'grammar', syntax: 'lark', definition: 'start: x' } },
+      { type: 'function', name: 'shell', parameters: { type: 'object' } }
+    ]
+  }
+  const normalized = normalizeResponsesCustomTools(body)
+  assert.deepEqual(normalized.tools[0].format, { type: 'text' })
+  assert.deepEqual(normalized.tools[1], body.tools[1])
+  // Grammar-capable providers keep the original tool definition.
+  assert.equal(normalizeResponsesCustomTools(body, { supportsGrammar: true }), body)
+  // Bodies without grammar tools are returned untouched.
+  const plain = { tools: [{ type: 'function', name: 'shell' }] }
+  assert.equal(normalizeResponsesCustomTools(plain), plain)
 })
 
 test('mergeOpenCodeConfig replaces CCR and repoints its model references', () => {
@@ -550,6 +610,63 @@ async function withSidecar(config, fetchImpl, fn, secrets = {}) {
     await sidecar.stop()
   }
 }
+
+test('normalizes Codex grammar custom tools for a third-party responses provider', async () => {
+  const responsesConfig = (supportsCustomToolGrammar) => testConfig({
+    providers: [{
+      name: 'responses',
+      baseUrl: 'https://responses.example.test/v1',
+      protocols: ['responses'],
+      models: [{ id: 'm' }],
+      keys: [],
+      ...(supportsCustomToolGrammar ? { supportsCustomToolGrammar: true } : {})
+    }],
+    defaultProvider: 'responses',
+    defaultModel: 'responses/m'
+  })
+  const body = {
+    model: 'responses/m',
+    input: 'hi',
+    tools: [{ type: 'custom', name: 'apply_patch', format: { type: 'grammar', syntax: 'lark', definition: 'start: x' } }]
+  }
+  let seen
+  await withSidecar(responsesConfig(false), async (url, init) => {
+    seen = JSON.parse(init.body)
+    return new Response(JSON.stringify({
+      id: 'resp_1',
+      object: 'response',
+      status: 'completed',
+      output: [{ type: 'custom_tool_call', id: 'call_1', call_id: 'call_1', name: 'apply_patch', input: '*** Begin Patch\n' }],
+      usage: { input_tokens: 1, output_tokens: 1 }
+    }), { status: 200, headers: { 'content-type': 'application/json' } })
+  }, async (base) => {
+    const res = await fetch(`${base}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body)
+    })
+    assert.equal(res.status, 200)
+    assert.deepEqual(seen.tools[0].format, { type: 'text' })
+    const payload = await res.json()
+    assert.equal(payload.output[0].type, 'custom_tool_call')
+  })
+
+  await withSidecar(responsesConfig(true), async (url, init) => {
+    seen = JSON.parse(init.body)
+    return new Response(JSON.stringify({ id: 'resp_2', object: 'response', status: 'completed', output: [], usage: {} }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' }
+    })
+  }, async (base) => {
+    const res = await fetch(`${base}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body)
+    })
+    assert.equal(res.status, 200)
+    assert.equal(seen.tools[0].format.type, 'grammar')
+  })
+})
 
 test('proxies chat completions directly to the resolved provider and logs the route', async () => {
   const seen = []

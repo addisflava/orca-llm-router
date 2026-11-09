@@ -1,7 +1,7 @@
 {
   "name": "orca-llm-router",
   "version": "1.0.0",
-  "description": "Orca plugin: local LLM routing sidecar with direct provider connections.",
+  "description": "Use all your subscriptions and API credits from any provider and coding plan on any agent in Orca, in one place, without leaving Orca. Multi-key pools, fastest-endpoint load balancing, and multi-provider routing.",
   "private": true,
   "type": "module",
   "engines": { "node": ">=22" },

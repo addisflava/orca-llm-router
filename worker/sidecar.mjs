@@ -191,7 +191,10 @@ export function normalizeProvider(provider) {
     // configs that marked a keyed provider disabled still route through it.
     enabled: keys.length ? keys.some((key) => key.enabled !== false) : provider.enabled !== false,
     pricing: provider.pricing ?? {},
-    usageFetch: provider.usageFetch
+    usageFetch: provider.usageFetch,
+    // Most third-party Responses endpoints reject Codex's Lark-constrained
+    // custom tools; only providers that explicitly opt in keep the grammar.
+    supportsCustomToolGrammar: provider.supportsCustomToolGrammar === true
   }
   return normalized
 }
@@ -1290,6 +1293,24 @@ export function anthropicResponseToOpenAI(raw, model) {
       total_tokens: (raw?.usage?.input_tokens ?? 0) + (raw?.usage?.output_tokens ?? 0)
     }
   }
+}
+
+// Codex's apply_patch/code-mode tools are Responses `custom` tools constrained
+// by a Lark grammar. OpenAI accepts that format; most third-party Responses
+// endpoints reject it with "Grammar-constrained custom tools are not supported".
+// Falling back to a text-format custom tool keeps the same tool shape and lets
+// Codex parse the model's freeform input.
+export function normalizeResponsesCustomTools(body, { supportsGrammar = false } = {}) {
+  if (supportsGrammar || !Array.isArray(body?.tools)) return body
+  let changed = false
+  const tools = body.tools.map((tool) => {
+    if (tool?.type === 'custom' && tool?.format?.type === 'grammar') {
+      changed = true
+      return { ...tool, format: { type: 'text' } }
+    }
+    return tool
+  })
+  return changed ? { ...body, tools } : body
 }
 
 export function responsesToOpenAI(body) {
@@ -2441,14 +2462,28 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     const responseProtocol = targetProtocol(provider, clientProtocol)
     const baseUrl = endpointFor(provider, responseProtocol)
     const chat = isChatPath(path)
-    const wantsStream = wantsStreamHint ?? upstreamBody?.stream === true
+    const wantsStream = wantsStreamHint ?? body?.stream === true
     const geminiStreamUpstream = responseProtocol === 'gemini' && clientProtocol === 'gemini' && wantsStream === true
     let targetPath = path
     if (responseProtocol === 'gemini' && chat) targetPath = geminiPath(target.model, geminiStreamUpstream)
     else if (responseProtocol !== clientProtocol && chat) targetPath = canonicalPath(responseProtocol, path)
     else if (responseProtocol !== clientProtocol && !chat) targetPath = path
     const url = joinUpstreamUrl(baseUrl, targetPath)
-    const upstreamBody = body ? structuredClone(body) : null
+    let upstreamBody = body ? structuredClone(body) : null
+    // Codex sends apply_patch/code-mode as grammar-constrained custom tools.
+    // Keep the grammar only for endpoints known to accept it; everyone else
+    // gets the text-format custom tool the Responses spec also allows.
+    if (upstreamBody && clientProtocol === 'responses') {
+      let supportsGrammar = provider.supportsCustomToolGrammar === true
+      if (!supportsGrammar) {
+        try {
+          supportsGrammar = /(^|\.)openai\.com$/i.test(new URL(endpointFor(provider, 'responses')).hostname)
+        } catch {
+          /* non-URL base: assume no grammar support */
+        }
+      }
+      upstreamBody = normalizeResponsesCustomTools(upstreamBody, { supportsGrammar })
+    }
     // The chain has already resolved the client selector (provider/model or an
     // alias) to a provider + bare upstream model. Providers expect their own
     // model id, so never leak the routing prefix or alias upstream.

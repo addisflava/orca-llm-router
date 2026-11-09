@@ -7,7 +7,9 @@
 //                   OpenCode gets a generated OPENCODE_CONFIG so its model
 //                   picker lists the gateway's providers and models; Codex gets
 //                   a generated model catalog plus per-launch `-c` provider
-//                   overrides for the same list.
+//                   overrides for terminal launches, and a managed block in
+//                   ~/.codex/config.toml while the gateway runs so Orca's
+//                   native Codex chat sees the same list.
 //   CLI -> sidecar (worker/sidecar.mjs) -> providers in the config, with
 //                   conditional routing rules, rewrites, aliases, fallback
 //                   chains, retries and per-provider credential pools.
@@ -237,23 +239,253 @@ function injectOpenCodeStandalone(command) {
   return `${script.slice(0, at)} --standalone${script.slice(at)}`
 }
 
-// Codex reads its provider and model catalog from config, so an Orca launch
-// writes the catalog once and passes per-launch `-c key=value` overrides. The
-// user's ~/.codex/config.toml is never modified: a plain `codex` keeps its own
-// provider, while an Orca-launched session sees the router's model list.
+// Codex reads its provider and model catalog from config. Terminal launches get
+// per-launch `-c key=value` overrides, while Orca's native chat starts its own
+// `codex app-server` that ignores the launch hook. Native chat reads the user's
+// ~/.codex/config.toml directly, so while the router is running we install a
+// marker-delimited managed block there and remove it again when the router
+// stops or the plugin is deactivated. The user's original values are kept in
+// plugin storage so the restore preserves unrelated edits.
+const CODEX_CONFIG_MARKER_BEGIN = '# BEGIN Orca LLM Router managed profile'
+const CODEX_CONFIG_MARKER_END = '# END Orca LLM Router managed profile'
+const CODEX_PROVIDER_MARKER_BEGIN = '# BEGIN Orca LLM Router managed Codex provider'
+const CODEX_PROVIDER_MARKER_END = '# END Orca LLM Router managed Codex provider'
+const CODEX_MANAGED_TOP_LEVEL = ['model', 'model_provider', 'model_catalog_json', 'model_reasoning_effort']
+const CODEX_CONFIG_BACKUP_KEY = 'router.codexConfigBackup'
+let lastCodexCatalogJson = null
+let activeOrca = null
+
 function writeCodexCatalog(config, { agentId }) {
   const { document, model } = buildCodexModelCatalog(config, { agentId })
+  const serialized = JSON.stringify(document)
+  if (serialized === lastCodexCatalogJson && existsSync(CODEX_CATALOG_FILE)) {
+    return { path: CODEX_CATALOG_FILE, model }
+  }
   try {
     mkdirSync(OPENCODE_CONFIG_DIR, { recursive: true })
     // Atomic replace: parallel launches share one file and must never read a
     // partially written catalog.
     const temporary = `${CODEX_CATALOG_FILE}.${process.pid}.tmp`
-    writeFileSync(temporary, JSON.stringify(document))
+    writeFileSync(temporary, serialized)
     renameSync(temporary, CODEX_CATALOG_FILE)
+    lastCodexCatalogJson = serialized
     return { path: CODEX_CATALOG_FILE, model }
   } catch {
     return null
   }
+}
+
+function codexConfigPath() {
+  const home = process.env.CODEX_HOME || join(homedir(), '.codex')
+  return join(home, 'config.toml')
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function tomlQuoted(value) {
+  return `"${tomlString(value)}"`
+}
+
+// Remove a marker-delimited managed block, leaving every other line intact.
+function stripCodexManagedBlocks(text) {
+  const lines = String(text ?? '').split('\n')
+  const out = []
+  let skipping = false
+  for (const line of lines) {
+    const trimmed = line.trim()
+    if (trimmed === CODEX_CONFIG_MARKER_BEGIN || trimmed === CODEX_PROVIDER_MARKER_BEGIN) {
+      skipping = true
+      continue
+    }
+    if (skipping) {
+      if (trimmed === CODEX_CONFIG_MARKER_END) skipping = false
+      continue
+    }
+    out.push(line)
+  }
+  return out.join('\n')
+}
+
+// Return a top-level TOML table (header plus its key lines), or null.
+function extractTomlTable(text, tableName) {
+  const lines = String(text ?? '').split('\n')
+  const header = new RegExp(`^\\s*\\[${escapeRegExp(tableName)}\\]\\s*(?:#.*)?$`)
+  const anyHeader = /^\s*\[/
+  let start = -1
+  for (let index = 0; index < lines.length; index++) {
+    if (header.test(lines[index])) { start = index; break }
+  }
+  if (start < 0) return null
+  let end = lines.length
+  for (let index = start + 1; index < lines.length; index++) {
+    if (anyHeader.test(lines[index])) { end = index; break }
+  }
+  return lines.slice(start, end).join('\n').replace(/\n+$/, '')
+}
+
+function stripTomlTable(text, tableName) {
+  const lines = String(text ?? '').split('\n')
+  const header = new RegExp(`^\\s*\\[${escapeRegExp(tableName)}\\]\\s*(?:#.*)?$`)
+  const anyHeader = /^\s*\[/
+  const out = []
+  let skipping = false
+  for (const line of lines) {
+    if (header.test(line)) { skipping = true; continue }
+    if (skipping && anyHeader.test(line)) skipping = false
+    if (!skipping) out.push(line)
+  }
+  return out.join('\n')
+}
+
+// Top-level keys are the bare `key = value` lines before the first table.
+function extractTopLevelKeys(text, keys) {
+  const lines = String(text ?? '').split('\n')
+  const found = {}
+  let inTopLevel = true
+  for (const line of lines) {
+    if (/^\s*\[/.test(line)) inTopLevel = false
+    if (!inTopLevel) continue
+    const match = line.match(/^\s*([A-Za-z0-9_-]+)\s*=/)
+    if (match && keys.includes(match[1]) && !(match[1] in found)) found[match[1]] = line.trim()
+  }
+  return found
+}
+
+function stripTopLevelKeys(text, keys) {
+  const lines = String(text ?? '').split('\n')
+  const out = []
+  let inTopLevel = true
+  for (const line of lines) {
+    if (/^\s*\[/.test(line)) inTopLevel = false
+    if (inTopLevel) {
+      const match = line.match(/^\s*([A-Za-z0-9_-]+)\s*=/)
+      if (match && keys.includes(match[1])) continue
+    }
+    out.push(line)
+  }
+  return out.join('\n')
+}
+
+// Build the managed Codex config. The profile keys must come before any table,
+// so the profile block is prepended and the provider table appended.
+export function buildCodexManagedConfig(text, { base, token, catalogPath, model, reasoningEffort }) {
+  let clean = stripCodexManagedBlocks(text)
+  clean = stripTomlTable(clean, 'model_providers.orca-router')
+  clean = stripTopLevelKeys(clean, CODEX_MANAGED_TOP_LEVEL)
+  clean = clean.replace(/^\n+/, '').replace(/\n+$/, '')
+  const effort = ['low', 'medium', 'high'].includes(String(reasoningEffort)) ? String(reasoningEffort) : 'high'
+  const baseUrl = `${String(base).replace(/\/+$/, '').replace(/\/v1$/, '')}/v1`
+  const profile = [
+    CODEX_CONFIG_MARKER_BEGIN,
+    `model = ${tomlQuoted(model)}`,
+    'model_provider = "orca-router"',
+    `model_catalog_json = ${tomlQuoted(catalogPath)}`,
+    `model_reasoning_effort = ${tomlQuoted(effort)}`,
+    CODEX_CONFIG_MARKER_END
+  ].join('\n')
+  const provider = [
+    CODEX_PROVIDER_MARKER_BEGIN,
+    '[model_providers.orca-router]',
+    'name = "Orca LLM Router"',
+    `base_url = ${tomlQuoted(baseUrl)}`,
+    `experimental_bearer_token = ${tomlQuoted(token)}`,
+    'wire_api = "responses"',
+    'requires_openai_auth = false',
+    CODEX_PROVIDER_MARKER_END
+  ].join('\n')
+  return `${profile}\n\n${clean ? `${clean}\n\n` : ''}${provider}\n`
+}
+
+function readCodexConfigFile() {
+  const path = codexConfigPath()
+  try {
+    return { path, text: readFileSync(path, 'utf8') }
+  } catch {
+    return { path, text: '' }
+  }
+}
+
+function writeCodexConfigFile(path, text) {
+  mkdirSync(dirname(path), { recursive: true })
+  const temporary = `${path}.${process.pid}.tmp`
+  writeFileSync(temporary, text)
+  renameSync(temporary, path)
+}
+
+async function applyCodexGlobal(orca, options) {
+  if (!orca || !options?.model || !options?.catalogPath) return null
+  const { path, text: current } = readCodexConfigFile()
+  const managed = current.includes(CODEX_CONFIG_MARKER_BEGIN) || current.includes('[model_providers.orca-router]')
+  const stored = await storageGet(orca, CODEX_CONFIG_BACKUP_KEY)
+  const backup = stored.ok ? stored.value : null
+  if (!managed) {
+    // First apply: remember only the values we replace, so unrelated edits made
+    // while the router is active survive the restore.
+    await orca.storage.set(CODEX_CONFIG_BACKUP_KEY, {
+      path,
+      keys: extractTopLevelKeys(current, CODEX_MANAGED_TOP_LEVEL),
+      providerTable: extractTomlTable(current, 'model_providers.orca-router'),
+      appliedAt: new Date().toISOString()
+    }).catch(() => {})
+  } else if (!backup || backup.path !== path) {
+    // Marker present without a usable backup (for example storage was cleared):
+    // restore what we can by stripping our own block.
+    await orca.storage.set(CODEX_CONFIG_BACKUP_KEY, {
+      path,
+      keys: {},
+      providerTable: null,
+      appliedAt: new Date().toISOString(),
+      fallback: true
+    }).catch(() => {})
+  }
+  const next = buildCodexManagedConfig(current, options)
+  if (next === current) return path
+  writeCodexConfigFile(path, next)
+  return path
+}
+
+async function restoreCodexGlobal(orca) {
+  if (!orca) return false
+  const { path, text: current } = readCodexConfigFile()
+  const managed = current.includes(CODEX_CONFIG_MARKER_BEGIN) || current.includes('[model_providers.orca-router]')
+  if (!managed) {
+    await storageDelete(orca, CODEX_CONFIG_BACKUP_KEY)
+    return false
+  }
+  const stored = await storageGet(orca, CODEX_CONFIG_BACKUP_KEY)
+  const backup = stored.ok ? stored.value : null
+  let next = stripCodexManagedBlocks(current)
+  next = stripTomlTable(next, 'model_providers.orca-router')
+  next = stripTopLevelKeys(next, CODEX_MANAGED_TOP_LEVEL)
+  next = next.replace(/^\n+/, '').replace(/\n+$/, '')
+  if (backup && backup.path === path) {
+    const keyLines = Object.values(backup.keys ?? {}).filter(Boolean)
+    if (keyLines.length) next = `${keyLines.join('\n')}\n\n${next}`
+    if (backup.providerTable) next = `${next ? `${next}\n\n` : ''}${backup.providerTable}`
+  }
+  writeCodexConfigFile(path, next ? `${next}\n` : '')
+  await storageDelete(orca, CODEX_CONFIG_BACKUP_KEY)
+  return true
+}
+
+async function syncCodexGlobal(orca, current) {
+  if (!orca) return null
+  if (!settings.enabled || !current || !sidecar?.status().running) {
+    await restoreCodexGlobal(orca)
+    return null
+  }
+  const catalog = writeCodexCatalog(current, { agentId: 'codex' })
+  if (!catalog) return null
+  const profile = agentProfileFor(normalizeConfig(current), 'codex')
+  return applyCodexGlobal(orca, {
+    base: gatewayAddress(),
+    token: current.token || 'orca-router',
+    catalogPath: catalog.path,
+    model: catalog.model,
+    reasoningEffort: profile?.reasoningEffort
+  })
 }
 
 function shellQuote(value) {
@@ -269,9 +501,10 @@ function tomlString(value) {
 }
 
 // Insert the provider and catalog overrides after the leading codex executable.
-// `-c key=value` is Codex's supported per-launch config override, so the user's
-// config file and its trust/hook state stay untouched.
-export function injectCodexProvider(command, { base, catalogPath, model, reasoningEffort }) {
+// `-c key=value` is Codex's supported per-launch config override, so a terminal
+// launch never needs to rewrite the user's config file. Native chat, which does
+// not run this hook, is handled by the managed block above.
+export function injectCodexProvider(command, { base, catalogPath, model, reasoningEffort, token = 'orca-router' }) {
   const script = String(command ?? '')
   if (!script || script.includes('model_providers.orca-router')) return script
   const first = script.match(/^(\s*)((?:"[^"]*"|'[^']*'|\S+))/)
@@ -285,7 +518,7 @@ export function injectCodexProvider(command, { base, catalogPath, model, reasoni
     ...(catalogPath ? [`model_catalog_json="${tomlString(catalogPath)}"`] : []),
     'model_providers.orca-router.name="Orca LLM Router"',
     `model_providers.orca-router.base_url="${tomlString(base)}/v1"`,
-    'model_providers.orca-router.env_key="OPENAI_API_KEY"',
+    `model_providers.orca-router.experimental_bearer_token="${tomlString(token)}"`,
     'model_providers.orca-router.wire_api="responses"',
     'model_providers.orca-router.requires_openai_auth=false'
   ]
@@ -344,6 +577,15 @@ async function storageGet(orca, key) {
   }
 }
 
+async function storageDelete(orca, key) {
+  try {
+    if (typeof orca?.storage?.delete === 'function') await orca.storage.delete(key)
+    else if (typeof orca?.storage?.set === 'function') await orca.storage.set(key, null)
+  } catch {
+    /* best-effort cleanup */
+  }
+}
+
 function jsonSafe(value) {
   return JSON.parse(JSON.stringify(value))
 }
@@ -379,6 +621,7 @@ async function refreshSecrets(orca) {
 }
 
 async function refreshSettings(orca) {
+  const wasEnabled = settings.enabled
   try {
     const live = await orca.settings.get()
     if (live && typeof live === 'object') {
@@ -394,6 +637,7 @@ async function refreshSettings(orca) {
   } catch {
     /* keep cache: hook must stay synchronous */
   }
+  if (wasEnabled !== settings.enabled) await syncCodexGlobal(orca, config).catch(() => {})
 }
 
 function effectiveConfig() {
@@ -433,12 +677,14 @@ function syncOpenCodeGlobal(current) {
 async function ensureRunning(orca) {
   if (sidecar?.status().running) {
     syncOpenCodeGlobal(config)
+    await syncCodexGlobal(orca, config)
     return
   }
   try {
     boundAddress = await sidecar.start(settings.bindHost, settings.port)
     await announce(orca, true, boundAddress.port)
     syncOpenCodeGlobal(config)
+    await syncCodexGlobal(orca, config)
   } catch (error) {
     await hostCall(orca, 'notifications.show', {
       title: 'Orca LLM Router',
@@ -450,6 +696,7 @@ async function ensureRunning(orca) {
 async function stopSidecar(orca) {
   await sidecar?.stop?.().catch(() => {})
   boundAddress = null
+  await restoreCodexGlobal(orca).catch(() => {})
   await announce(orca, false, settings.port)
 }
 
@@ -499,13 +746,15 @@ async function persistConfig(orca, next, options = {}) {
   await orca.storage.set(CONFIG_KEY, config)
   await refreshSecrets(orca)
   // Keep the model list a plain `opencode` terminal sees in sync with provider
-  // and key changes made in the panel.
+  // and key changes made in the panel, and refresh Codex native chat too.
   syncOpenCodeGlobal(config)
+  await syncCodexGlobal(orca, config)
   return config
 }
 
 /** @type {import('orca/worker').Activate} */
 export default async function activate(orca) {
+  activeOrca = orca
   const stored = await storageGet(orca, CONFIG_KEY)
   // Never replace what the store holds just because a read failed: a transient
   // error at activation used to overwrite an imported config with the default.
@@ -533,6 +782,9 @@ export default async function activate(orca) {
 
   if (settings.enabled) await ensureRunning(orca)
   else await announce(orca, false, settings.port)
+  // A previous run may have left the managed Codex block behind after a crash;
+  // restore first, then publish the current provider/catalog.
+  await syncCodexGlobal(orca, config).catch(() => {})
 
   // --- panel requests ---
   orca.panels.handle('router.status', async () => {
@@ -918,6 +1170,7 @@ export default async function activate(orca) {
       const catalog = writeCodexCatalog(config, { agentId })
       update.command = injectCodexProvider(event.command, {
         base,
+        token: config.token || 'orca-router',
         catalogPath: catalog?.path,
         model: catalog?.model ?? model,
         reasoningEffort: profile?.reasoningEffort
@@ -1016,6 +1269,8 @@ async function testProviders(only) {
 }
 
 export async function deactivate() {
+  await restoreCodexGlobal(activeOrca).catch(() => {})
   await sidecar?.stop?.().catch(() => {})
   boundAddress = null
+  activeOrca = null
 }
