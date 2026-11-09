@@ -1684,30 +1684,28 @@ function Overview() {
 
       <Card>
         <Stack gap="sm">
-          <Row justify="between" align="center" wrap gap="xs">
+          <Row align="center" gap="xs">
             <Heading level={2}>Gateway</Heading>
-            <Row gap="xs" align="center">
-              <Text muted size="xs">
-                Port
-              </Text>
-              {!read(editingPort) ? (
-                <>
-                  <Text size="sm" weight="semibold">
-                    {read(port)}
-                  </Text>
-                  <IconButton
-                    size="xs"
-                    icon="edit"
-                    label="Edit gateway port"
-                    tooltip="Change port"
-                    onPress={() => {
-                      set(portDraft, String(read(port)))
-                      set(editingPort, true)
-                    }}
-                  />
-                </>
-              ) : null}
-            </Row>
+            <Text muted size="xs">
+              Port
+            </Text>
+            {!read(editingPort) ? (
+              <>
+                <Text size="sm" weight="semibold">
+                  {read(port)}
+                </Text>
+                <IconButton
+                  size="xs"
+                  icon="edit"
+                  label="Edit gateway port"
+                  tooltip="Change port"
+                  onPress={() => {
+                    set(portDraft, String(read(port)))
+                    set(editingPort, true)
+                  }}
+                />
+              </>
+            ) : null}
           </Row>
           <Text muted size="sm">
             Point agents at these addresses

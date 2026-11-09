@@ -4,12 +4,33 @@
   "execution": "trusted-worker",
   "id": "llm-router",
   "name": "Orca LLM Router",
-  "version": "1.0.0",
-  "description": "A self-contained local LLM gateway for Orca agents: direct provider connections (Anthropic, OpenAI, OpenRouter, DeepSeek, …), conditional routing rules with rewrites, fallback chains, credential pools, a request log and usage dashboard.",
-  "author": { "name": "addisflava" },
+  "version": "1.0.1",
+  "description": "Use all your subscriptions and API credits from any provider and coding plan on any agent in Orca, in one place, without leaving Orca. Features multi-key credential pools with auto-rotation, load balancing, and routing different providers behind a single model name by prioritizing the fastest endpoint with seamless fallback.",
+  "author": {
+    "name": "addisflava"
+  },
   "repository": "https://github.com/addisflava/orca-llm-router",
   "license": "MIT",
-  "engines": { "orca": ">=1.4.248" },
+  "icon": "assets/icon.png",
+  "cover": {
+    "path": "assets/cover.jpg",
+    "alt": "Orca LLM Router gateway overview banner showing intelligent multi-provider routing"
+  },
+  "screenshots": [
+    {
+      "path": "assets/screenshot-overview.png",
+      "alt": "Orca LLM Router overview panel showing active gateway, metrics, and agent endpoints",
+      "caption": "Live gateway status, real-time metrics, and agent endpoint configuration"
+    },
+    {
+      "path": "assets/screenshot-providers.png",
+      "alt": "Orca LLM Router providers panel showing multi-provider configuration and model discovery",
+      "caption": "Provider credentials, model discovery, and multi-key load balancing"
+    }
+  ],
+  "engines": {
+    "orca": ">=1.4.248"
+  },
   "pluginApi": 1,
   "main": "worker/main.mjs",
   "contributes": {
@@ -23,17 +44,36 @@
       }
     ],
     "commands": [
-      { "id": "router.status", "title": "Orca LLM Router: gateway status" },
-      { "id": "router.start", "title": "Orca LLM Router: start sidecar" },
-      { "id": "router.stop", "title": "Orca LLM Router: stop sidecar" },
-      { "id": "router.restart", "title": "Orca LLM Router: restart sidecar" },
-      { "id": "router.test", "title": "Orca LLM Router: test providers" }
+      {
+        "id": "router.status",
+        "title": "Orca LLM Router: gateway status"
+      },
+      {
+        "id": "router.start",
+        "title": "Orca LLM Router: start sidecar"
+      },
+      {
+        "id": "router.stop",
+        "title": "Orca LLM Router: stop sidecar"
+      },
+      {
+        "id": "router.restart",
+        "title": "Orca LLM Router: restart sidecar"
+      },
+      {
+        "id": "router.test",
+        "title": "Orca LLM Router: test providers"
+      }
     ],
     "hooks": [
-      { "event": "agent.launch.before" }
+      {
+        "event": "agent.launch.before"
+      }
     ],
     "events": [
-      { "on": "agent.status.changed" }
+      {
+        "on": "agent.status.changed"
+      }
     ],
     "statusBarItems": [
       {
@@ -99,10 +139,20 @@
     ]
   },
   "capabilities": [
-    { "kind": "storage:own" },
-    { "kind": "settings:own" },
-    { "kind": "secrets:own" },
-    { "kind": "agent:read" },
-    { "kind": "notifications:show" }
+    {
+      "kind": "storage:own"
+    },
+    {
+      "kind": "settings:own"
+    },
+    {
+      "kind": "secrets:own"
+    },
+    {
+      "kind": "agent:read"
+    },
+    {
+      "kind": "notifications:show"
+    }
   ]
 }

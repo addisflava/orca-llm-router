@@ -3,9 +3,9 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Orca: >=1.4.248](https://img.shields.io/badge/Orca-%3E%3D1.4.248-6366f1.svg)](https://onorca.dev)
 [![Node: >=22](https://img.shields.io/badge/Node-%3E%3D22-green.svg)](package.json)
-[![Tests: 71 Passing](https://img.shields.io/badge/Tests-71%20passing-brightgreen.svg)](tests/sidecar.test.mjs)
+[![Tests: 73 Passing](https://img.shields.io/badge/Tests-73%20passing-brightgreen.svg)](tests/sidecar.test.mjs)
 
-A high-performance, self-contained local LLM gateway and routing sidecar designed natively for **[Orca](https://onorca.dev)**.
+**Use all your subscriptions and API credits from any provider and coding plan on any agent in Orca, in one place, without leaving Orca.** Features multi-key credential pools with auto-rotation, load balancing, and routing different providers behind a single model name by prioritizing the fastest, lowest-latency endpoints with seamless fallback.
 
 Point all your coding agents (**Claude Code, OpenAI Codex, OpenCode, Pi, Aider, Cursor, Cline**) to a single stable local endpoint (`127.0.0.1:18080`). **Orca LLM Router** transparently translates protocols, maps reasoning/thinking modes, load-balances across credential pools, handles automatic fallbacks, and routes traffic directly to your chosen providers.
 
@@ -201,8 +201,8 @@ To publish to the public Orca directory (`onorca.dev/plugins`):
    ```
 2. Create and push a version tag:
    ```bash
-   git tag v1.0.0
-   git push origin v1.0.0
+   git tag v1.0.1
+   git push origin v1.0.1
    ```
 3. Your plugin will be indexed on `https://www.onorca.dev/plugins/addisflava/orca-llm-router` within an hour.
 
