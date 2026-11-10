@@ -1891,6 +1891,20 @@ export function mergeOpenCodeConfig(existing, generated, legacyProviders = ['cla
   return document
 }
 
+// Undo mergeOpenCodeConfig's published provider: drop `orca-router` and the
+// default model refs that point at it, leaving everything else as it is.
+// Returns null when the document carries nothing of ours.
+export function removeOpenCodeRouterProvider(existing) {
+  if (!existing || typeof existing !== 'object' || !existing.provider?.['orca-router']) return null
+  const document = structuredClone(existing)
+  delete document.provider['orca-router']
+  if (!Object.keys(document.provider).length) delete document.provider
+  for (const key of ['model', 'small_model']) {
+    if (typeof document[key] === 'string' && document[key].startsWith('orca-router/')) delete document[key]
+  }
+  return document
+}
+
 // Localhost should never be sent through a corporate proxy: add the loopback
 // hosts to whatever NO_PROXY the launch already carries.
 function mergeNoProxy(value) {

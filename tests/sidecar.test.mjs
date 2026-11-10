@@ -19,6 +19,7 @@ import {
   buildOpenCodeConfig,
   buildCodexModelCatalog,
   mergeOpenCodeConfig,
+  removeOpenCodeRouterProvider,
   convertLegacyConfig,
   convertClaudeCodeRouterConfig,
   convertOmniRouteConfig,
@@ -692,6 +693,25 @@ test('applyCodexGlobal merges a partial Codex rewrite with the original keys', a
   }
 })
 
+test('restoreCodexGlobal keeps lines added after the managed provider block', async () => {
+  const harness = codexGlobalHarness()
+  try {
+    writeFileSync(harness.path, 'model = "gpt-5.5"\n')
+    await applyCodexGlobal(harness.orca, harness.options)
+    writeFileSync(
+      harness.path,
+      `${readFileSync(harness.path, 'utf8')}\n[projects."/tmp/later"]\ntrust_level = "trusted"\n`
+    )
+    await restoreCodexGlobal(harness.orca)
+    const restored = readFileSync(harness.path, 'utf8')
+    assert.match(restored, /^model = "gpt-5.5"/m)
+    assert.match(restored, /\[projects\."\/tmp\/later"\]/)
+    assert.doesNotMatch(restored, /orca-router/)
+  } finally {
+    harness.cleanup()
+  }
+})
+
 test('restoreCodexGlobal uses the in-memory backup when storage is unavailable', async () => {
   const harness = codexGlobalHarness()
   try {
@@ -768,6 +788,27 @@ test('mergeOpenCodeConfig replaces CCR and repoints its model references', () =>
   assert.deepEqual(merged.mcp, existing.mcp)
   // The caller's document is untouched (the sync merges a clone).
   assert.ok(existing.provider['claude-code-router'])
+})
+
+test('removeOpenCodeRouterProvider undoes the published provider only', () => {
+  const config = testConfig()
+  const { document: generated } = buildOpenCodeConfig(config, {
+    base: 'http://127.0.0.1:18080',
+    token: 'orca-router'
+  })
+  const existing = {
+    $schema: 'https://opencode.ai/config.json',
+    mcp: { servers: { docs: { type: 'remote', url: 'https://example.com/mcp' } } },
+    provider: { keep: { name: 'Keep', options: { baseURL: 'https://keep.example.com/v1' } } }
+  }
+  const merged = mergeOpenCodeConfig(existing, generated)
+  assert.ok(merged.provider['orca-router'])
+  assert.deepEqual(removeOpenCodeRouterProvider(merged), existing)
+  // A model the person picked themselves is kept.
+  const own = removeOpenCodeRouterProvider({ ...merged, model: 'keep/some-model' })
+  assert.equal(own.model, 'keep/some-model')
+  // Nothing of ours: nothing to write.
+  assert.equal(removeOpenCodeRouterProvider(existing), null)
 })
 
 async function withSidecar(config, fetchImpl, fn, secrets = {}) {
@@ -1299,6 +1340,55 @@ test('worker key pool handlers add, update and remove keys without resurrecting 
   await call('router.key.remove', { provider: 'deepseek', secretKey: 'deepseek-b' })
   assert.equal((await keysOf()).length, 1)
   assert.equal(store.get('router.config').providers.find((provider) => provider.name === 'deepseek').keys.length, 1)
+})
+
+test('only Orca launches are routed unless global agent config is turned on', async () => {
+  const harness = codexGlobalHarness()
+  const original = 'model = "gpt-5.5"\n\n[projects."/mnt/e/ecom"]\ntrust_level = "trusted"\n'
+  writeFileSync(harness.path, original)
+  const clone = (value) => JSON.parse(JSON.stringify(value))
+  const store = new Map([['router.config', clone(normalizeConfig(testConfig()))]])
+  let live = { enabled: true, globalAgentConfig: false, port: 0, bindHost: '127.0.0.1' }
+  const commands = new Map()
+  let launchHook = null
+  const orca = {
+    storage: {
+      get: async (key) => (store.has(key) ? clone(store.get(key)) : null),
+      set: async (key, value) => { store.set(key, clone(value)) },
+      delete: async (key) => { store.delete(key) }
+    },
+    settings: { get: async () => live },
+    secrets: { get: async () => null, set: async () => {}, delete: async () => {} },
+    host: { call: async () => null },
+    panels: { handle: () => {}, post: () => {} },
+    commands: { register: (name, fn) => commands.set(name, fn) },
+    hooks: { on: (event, fn) => { if (event === 'agent.launch.before') launchHook = fn } },
+    events: { on: () => {} },
+    log: () => {}
+  }
+  const { default: activate, deactivate } = await import('../worker/main.mjs')
+  try {
+    await activate(orca)
+    // The sidecar runs, but the person's Codex config is left alone.
+    assert.equal(readFileSync(harness.path, 'utf8'), original)
+    // An Orca launch still gets the gateway through per-launch overrides.
+    const launched = launchHook({ agent: 'codex', command: 'codex', env: {} }, (event) => event)
+    assert.match(launched.command, /model_provider="orca-router"/)
+
+    live = { ...live, globalAgentConfig: true }
+    await commands.get('router.status')()
+    assert.match(readFileSync(harness.path, 'utf8'), /# BEGIN Orca LLM Router managed profile/)
+
+    live = { ...live, globalAgentConfig: false }
+    await commands.get('router.status')()
+    const restored = readFileSync(harness.path, 'utf8')
+    assert.doesNotMatch(restored, /orca-router/)
+    assert.match(restored, /^model = "gpt-5.5"/m)
+    assert.match(restored, /\[projects\."\/mnt\/e\/ecom"\]/)
+  } finally {
+    await deactivate()
+    harness.cleanup()
+  }
 })
 
 // ---------------------------------------------------------------------------

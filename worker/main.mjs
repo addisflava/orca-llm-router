@@ -1,4 +1,4 @@
-// Orca LLM Router worker: owns the self-contained local gateway and wires it into Orca.
+// LLM Router for Orca worker: owns the self-contained local gateway and wires it into Orca.
 //
 //   agent launch -> agent.launch.before hook rewrites env (ANTHROPIC_BASE_URL,
 //                   OPENAI_BASE_URL, auth) and, for Claude Code, adds
@@ -7,9 +7,11 @@
 //                   OpenCode gets a generated OPENCODE_CONFIG so its model
 //                   picker lists the gateway's providers and models; Codex gets
 //                   a generated model catalog plus per-launch `-c` provider
-//                   overrides for terminal launches, and a managed block in
-//                   ~/.codex/config.toml while the gateway runs so Orca's
-//                   native Codex chat sees the same list.
+//                   overrides for the same list. Nothing outside Orca's own
+//                   launches is touched unless the person turns on
+//                   `globalAgentConfig`, which also publishes the gateway in
+//                   ~/.codex/config.toml (for Orca's native Codex chat) and
+//                   the OpenCode user config while the gateway runs.
 //   CLI -> sidecar (worker/sidecar.mjs) -> providers in the config, with
 //                   conditional routing rules, rewrites, aliases, fallback
 //                   chains, retries and per-provider credential pools.
@@ -40,6 +42,7 @@ import {
   buildOpenCodeConfig,
   buildCodexModelCatalog,
   mergeOpenCodeConfig,
+  removeOpenCodeRouterProvider,
   agentProfileFor,
   providerFromPreset
 } from './sidecar.mjs'
@@ -50,7 +53,15 @@ const STATUS_BAR_ID = 'router-status'
 
 let sidecar = null
 let config = null
-let settings = { enabled: true, port: 18080, bindHost: '127.0.0.1', timeoutMs: 600000, retries: 2, baseDelayMs: 200 }
+let settings = {
+  enabled: true,
+  globalAgentConfig: false,
+  port: 18080,
+  bindHost: '127.0.0.1',
+  timeoutMs: 600000,
+  retries: 2,
+  baseDelayMs: 200
+}
 const secretsCache = new Map()
 let boundAddress = null
 let installedAgentsCache = null
@@ -242,8 +253,10 @@ function injectOpenCodeStandalone(command) {
 // Codex reads its provider and model catalog from config. Terminal launches get
 // per-launch `-c key=value` overrides, while Orca's native chat starts its own
 // `codex app-server` that ignores the launch hook. Native chat reads the user's
-// ~/.codex/config.toml directly, so while the router is running we install a
-// marker-delimited managed block there and remove it again when the router
+// ~/.codex/config.toml directly, which every other Codex session on the machine
+// reads too, so the managed block below is opt-in (`globalAgentConfig`, off by
+// default). While it is on and the router runs we install a marker-delimited
+// block there and remove it again when the setting is turned off, the router
 // stops or the plugin is deactivated. The user's original values are kept in
 // plugin storage so the restore preserves unrelated edits.
 const CODEX_CONFIG_MARKER_BEGIN = '# BEGIN Orca LLM Router managed profile'
@@ -254,8 +267,6 @@ const CODEX_MANAGED_TOP_LEVEL = ['model', 'model_provider', 'model_catalog_json'
 const CODEX_CONFIG_BACKUP_KEY = 'router.codexConfigBackup'
 let lastCodexCatalogJson = null
 let activeOrca = null
-let codexConfigGuard = null
-let codexConfigGuardBusy = false
 let lastCodexBackup = null
 
 function writeCodexCatalog(config, { agentId }) {
@@ -303,7 +314,7 @@ function stripCodexManagedBlocks(text) {
       continue
     }
     if (skipping) {
-      if (trimmed === CODEX_CONFIG_MARKER_END) skipping = false
+      if (trimmed === CODEX_CONFIG_MARKER_END || trimmed === CODEX_PROVIDER_MARKER_END) skipping = false
       continue
     }
     out.push(line)
@@ -504,8 +515,7 @@ export async function restoreCodexGlobal(orca) {
 
 async function syncCodexGlobal(orca, current) {
   if (!orca) return null
-  if (!settings.enabled || !current || !sidecar?.status().running) {
-    stopCodexConfigGuard()
+  if (!settings.enabled || !settings.globalAgentConfig || !current || !sidecar?.status().running) {
     await restoreCodexGlobal(orca)
     return null
   }
@@ -519,44 +529,6 @@ async function syncCodexGlobal(orca, current) {
     model: catalog.model,
     reasoningEffort: profile?.reasoningEffort
   })
-}
-
-// `codex exec` rewrites config.toml when it records a new project trust entry
-// or a migration, and its writer drops keys it did not originate (including the
-// managed block). Native chat's app-server does not rewrite the file, but a
-// person who also uses the Codex CLI would lose router routing after one such
-// command. Re-apply the block while the router is active so the next native
-// chat probe still sees the gateway catalog.
-function stopCodexConfigGuard() {
-  if (codexConfigGuard) {
-    clearInterval(codexConfigGuard)
-    codexConfigGuard = null
-  }
-}
-
-function startCodexConfigGuard(orca) {
-  if (codexConfigGuard || !orca || !settings.enabled || !sidecar?.status().running) return
-  codexConfigGuard = setInterval(() => {
-    if (!settings.enabled || !sidecar?.status().running) {
-      stopCodexConfigGuard()
-      return
-    }
-    if (codexConfigGuardBusy) return
-    codexConfigGuardBusy = true
-    void (async () => {
-      try {
-        const { text } = readCodexConfigFile()
-        if (!text.includes(CODEX_CONFIG_MARKER_BEGIN) || !text.includes('[model_providers.orca-router]')) {
-          await syncCodexGlobal(orca, config)
-        }
-      } catch {
-        /* best-effort: Codex may be in the middle of an atomic rewrite */
-      } finally {
-        codexConfigGuardBusy = false
-      }
-    })()
-  }, 2000)
-  codexConfigGuard.unref?.()
 }
 
 function shellQuote(value) {
@@ -600,9 +572,11 @@ export function injectCodexProvider(command, { base, catalogPath, model, reasoni
 
 // A person can also open a plain terminal and type `opencode`; that launch has
 // no agent hook to rewrite. OpenCode merges the global config and watches it
-// live, so publish the same provider there. The modification is intentionally
-// narrow: replace the stale CCR provider with ours and repoint model ids,
-// leaving MCP servers, agents, plugins and unrelated providers untouched.
+// live, so with `globalAgentConfig` on we publish the same provider there. The
+// modification is intentionally narrow: replace the stale CCR provider with
+// ours and repoint model ids, leaving MCP servers, agents, plugins and
+// unrelated providers untouched. Turning the setting off, stopping the router
+// or deactivating removes our provider again.
 const OPENCODE_USER_DIR = join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'opencode')
 const OPENCODE_USER_FILE = join(OPENCODE_USER_DIR, 'opencode.jsonc')
 const OPENCODE_USER_BACKUP = `${OPENCODE_USER_FILE}.orca-backup`
@@ -637,6 +611,25 @@ function syncOpenCodeUserConfig(config, { base, token }) {
     return OPENCODE_USER_FILE
   } catch {
     return null
+  }
+}
+
+function restoreOpenCodeUserConfig() {
+  if (!existsSync(OPENCODE_USER_FILE)) return false
+  let document
+  try {
+    document = removeOpenCodeRouterProvider(JSON.parse(readFileSync(OPENCODE_USER_FILE, 'utf8')))
+  } catch {
+    return false
+  }
+  if (!document) return false
+  try {
+    const temporary = `${OPENCODE_USER_FILE}.${process.pid}.tmp`
+    writeFileSync(temporary, `${JSON.stringify(document, null, 2)}\n`)
+    renameSync(temporary, OPENCODE_USER_FILE)
+    return true
+  } catch {
+    return false
   }
 }
 
@@ -693,11 +686,13 @@ async function refreshSecrets(orca) {
 
 async function refreshSettings(orca) {
   const wasEnabled = settings.enabled
+  const wasGlobal = settings.globalAgentConfig
   try {
     const live = await orca.settings.get()
     if (live && typeof live === 'object') {
       settings = {
         enabled: live.enabled ?? true,
+        globalAgentConfig: live.globalAgentConfig === true,
         port: live.port ?? 18080,
         bindHost: live.bindHost ?? '127.0.0.1',
         timeoutMs: live.timeoutMs ?? 600000,
@@ -708,11 +703,10 @@ async function refreshSettings(orca) {
   } catch {
     /* keep cache: hook must stay synchronous */
   }
-  if (wasEnabled !== settings.enabled) {
-    if (!settings.enabled) stopCodexConfigGuard()
+  if (sidecar && (wasEnabled !== settings.enabled || wasGlobal !== settings.globalAgentConfig)) {
+    syncOpenCodeGlobal(config)
     await syncCodexGlobal(orca, config).catch(() => {})
   }
-  if (settings.enabled && sidecar?.status().running) startCodexConfigGuard(orca)
 }
 
 function effectiveConfig() {
@@ -742,7 +736,10 @@ function gatewayAddress() {
 }
 
 function syncOpenCodeGlobal(current) {
-  if (!settings.enabled || !current || !sidecar?.status().running) return null
+  if (!settings.enabled || !settings.globalAgentConfig || !current || !sidecar?.status().running) {
+    restoreOpenCodeUserConfig()
+    return null
+  }
   return syncOpenCodeUserConfig(current, {
     base: gatewayAddress(),
     token: current.token || 'orca-router'
@@ -753,7 +750,6 @@ async function ensureRunning(orca) {
   if (sidecar?.status().running) {
     syncOpenCodeGlobal(config)
     await syncCodexGlobal(orca, config)
-    startCodexConfigGuard(orca)
     return
   }
   try {
@@ -761,20 +757,18 @@ async function ensureRunning(orca) {
     await announce(orca, true, boundAddress.port)
     syncOpenCodeGlobal(config)
     await syncCodexGlobal(orca, config)
-    startCodexConfigGuard(orca)
   } catch (error) {
-    stopCodexConfigGuard()
     await hostCall(orca, 'notifications.show', {
-      title: 'Orca LLM Router',
+      title: 'LLM Router',
       body: `Sidecar failed to start: ${error?.message ?? error}`
     })
   }
 }
 
 async function stopSidecar(orca) {
-  stopCodexConfigGuard()
   await sidecar?.stop?.().catch(() => {})
   boundAddress = null
+  restoreOpenCodeUserConfig()
   await restoreCodexGlobal(orca).catch(() => {})
   await announce(orca, false, settings.port)
 }
@@ -825,10 +819,10 @@ async function persistConfig(orca, next, options = {}) {
   await orca.storage.set(CONFIG_KEY, config)
   await refreshSecrets(orca)
   // Keep the model list a plain `opencode` terminal sees in sync with provider
-  // and key changes made in the panel, and refresh Codex native chat too.
+  // and key changes made in the panel, and refresh Codex native chat too (both
+  // only when `globalAgentConfig` is on).
   syncOpenCodeGlobal(config)
   await syncCodexGlobal(orca, config)
-  startCodexConfigGuard(orca)
   return config
 }
 
@@ -862,10 +856,12 @@ export default async function activate(orca) {
 
   if (settings.enabled) await ensureRunning(orca)
   else await announce(orca, false, settings.port)
-  // A previous run may have left the managed Codex block behind after a crash;
-  // restore first, then publish the current provider/catalog.
+  // A previous run (or an older version, which always wrote them) may have left
+  // the managed Codex block or OpenCode provider behind: this removes them
+  // unless `globalAgentConfig` is on, in which case it publishes the current
+  // provider/catalog.
+  syncOpenCodeGlobal(config)
   await syncCodexGlobal(orca, config).catch(() => {})
-  startCodexConfigGuard(orca)
 
   // --- panel requests ---
   orca.panels.handle('router.status', async () => {
@@ -1181,10 +1177,10 @@ export default async function activate(orca) {
     await refreshSettings(orca)
     const status = sidecar.status()
     await hostCall(orca, 'notifications.show', {
-      title: 'Orca LLM Router',
+      title: 'LLM Router',
       body: status.running
         ? `Sidecar on ${status.host}:${status.port} — providers: ${status.providers.map((p) => p.name).join(', ') || 'none'}`
-        : 'Sidecar is stopped. Open the Orca LLM Router panel to start it.'
+        : 'Sidecar is stopped. Open the LLM Router panel to start it.'
     })
     return { running: status.running, port: status.port }
   })
@@ -1207,7 +1203,7 @@ export default async function activate(orca) {
     const { results } = await testProviders()
     const down = results.filter((result) => !result.ok).map((result) => result.provider).join(', ')
     await hostCall(orca, 'notifications.show', {
-      title: 'Orca LLM Router',
+      title: 'LLM Router',
       body: down ? `Unreachable providers: ${down}` : `All ${results.length} providers reachable`
     })
     return { results }
@@ -1228,7 +1224,7 @@ export default async function activate(orca) {
       eventEnv: event.env ?? {}
     })
     if (routed === false) {
-      orca.log(`skip ${event.agent}: disabled in Orca LLM Router`)
+      orca.log(`skip ${event.agent}: disabled in LLM Router`)
       return next(event)
     }
     const agentId = String(event.agent ?? '').toLowerCase()
@@ -1350,7 +1346,7 @@ async function testProviders(only) {
 }
 
 export async function deactivate() {
-  stopCodexConfigGuard()
+  restoreOpenCodeUserConfig()
   await restoreCodexGlobal(activeOrca).catch(() => {})
   await sidecar?.stop?.().catch(() => {})
   boundAddress = null

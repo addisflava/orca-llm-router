@@ -1,4 +1,4 @@
-# Orca LLM Router
+# LLM Router for Orca
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Orca: >=1.4.248](https://img.shields.io/badge/Orca-%3E%3D1.4.248-6366f1.svg)](https://onorca.dev)
@@ -7,7 +7,7 @@
 
 **Use all your subscriptions and API credits from any provider and coding plan on any agent in Orca, in one place, without leaving Orca.** Features multi-key credential pools with auto-rotation, load balancing, and routing different providers behind a single model name by prioritizing the fastest, lowest-latency endpoints with seamless fallback.
 
-Point all your coding agents (**Claude Code, OpenAI Codex, OpenCode, Pi, Aider, Cursor, Cline**) to a single stable local endpoint (`127.0.0.1:18080`). **Orca LLM Router** transparently translates protocols, maps reasoning/thinking modes, load-balances across credential pools, handles automatic fallbacks, and routes traffic directly to your chosen providers.
+Point all your coding agents (**Claude Code, OpenAI Codex, OpenCode, Pi, Aider, Cursor, Cline**) to a single stable local endpoint (`127.0.0.1:18080`). **LLM Router for Orca** transparently translates protocols, maps reasoning/thinking modes, load-balances across credential pools, handles automatic fallbacks, and routes traffic directly to your chosen providers.
 
 ---
 
@@ -22,7 +22,7 @@ Point all your coding agents (**Claude Code, OpenAI Codex, OpenCode, Pi, Aider, 
                                     │ OPENAI_BASE_URL    -> http://127.0.0.1:18080/v1
                                     ▼
 ┌────────────────────────────────────────────────────────────────────────┐
-│ Orca LLM Router Gateway (127.0.0.1:18080)                              │
+│ LLM Router Gateway (127.0.0.1:18080)                                   │
 │                                                                        │
 │ • Model Aliases & Rewriting Rules (Regex / Exact / Field matching)     │
 │ • Cross-Protocol Translation (Anthropic ↔ OpenAI ↔ Gemini ↔ Responses)  │
@@ -77,8 +77,9 @@ Point all your coding agents (**Claude Code, OpenAI Codex, OpenCode, Pi, Aider, 
 - Honors upstream `Retry-After` headers (both integer seconds and RFC 1123 HTTP-date formats).
 
 ### 6. Seamless Agent Integration (Orca-Native)
-- **Zero Config Corruption**: Unlike external routers that overwrite `~/.claude/settings.json` or global dotfiles, Orca LLM Router uses Orca's `agent.launch.before` hook to inject isolated per-session environments.
+- **Zero Config Corruption**: Unlike external routers that overwrite `~/.claude/settings.json` or global dotfiles, LLM Router for Orca uses Orca's `agent.launch.before` hook to inject isolated per-session environments.
 - **OpenCode & Codex Discovery**: Automatically publishes enabled models to OpenCode's standalone config and injects dynamic Codex `-c model_catalog_json` catalogs.
+- **Optional global config**: Only agents Orca launches are routed by default. Turn on **Also route Codex and OpenCode outside Orca** in the plugin settings if you also want Orca's native Codex chat and a plain `codex` or `opencode` in any terminal to use the gateway. That adds a managed block to `~/.codex/config.toml` and the OpenCode user config while the router runs, and removes it again when you turn the setting off, stop the router or disable the plugin.
 
 ### 7. 1-Click Migration from Legacy Routers
 - **Claude Code Router (CCR)**: Imports models, profiles, aliases, and rules from `~/.claude-code-router`.
@@ -121,7 +122,7 @@ orca plugin dev watch .
 ```
 
 ### 2. Configure Providers
-1. Open the Orca right sidebar and select the **Orca LLM Router** panel (or run command `Orca LLM Router: gateway status`).
+1. Open the Orca right sidebar and select the **LLM Router** panel (or run command `LLM Router: gateway status`).
 2. Navigate to **Providers** and choose any preset (e.g., Anthropic, DeepSeek, OpenAI).
 3. Add your API key. Keys are encrypted and stored in Orca's secure secret store.
 4. Set your default provider or configure routing rules.

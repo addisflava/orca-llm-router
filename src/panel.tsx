@@ -1516,7 +1516,7 @@ function StatusBanner() {
     <Stack gap="sm">
       <Row justify="between" align="start" gap="sm">
         <Stack gap="xs">
-          <Heading>Orca LLM Router</Heading>
+          <Heading>LLM Router for Orca</Heading>
           <Row gap="xs" align="center" wrap>
             <Badge tone={isRunning ? 'success' : 'warning'}>{isRunning ? 'Running' : 'Stopped'}</Badge>
             <Text muted size="xs" truncate>
@@ -1593,7 +1593,7 @@ function Overview() {
     <Stack gap="md">
       <InfoBanner
         tone="accent"
-        title="Welcome to Orca LLM Router"
+        title="Welcome to LLM Router for Orca"
         open={read(overviewInfoOpen) ?? ups.length === 0}
         onOpenChange={(open) => set(overviewInfoOpen, open)}
       >

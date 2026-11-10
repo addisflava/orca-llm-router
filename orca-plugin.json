@@ -3,7 +3,7 @@
   "manifestVersion": 2,
   "execution": "trusted-worker",
   "id": "llm-router",
-  "name": "Orca LLM Router",
+  "name": "LLM Router for Orca",
   "version": "1.0.1",
   "description": "Use all your subscriptions and API credits from any provider and coding plan on any agent in Orca, in one place, without leaving Orca. Features multi-key credential pools with auto-rotation, load balancing, and routing different providers behind a single model name by prioritizing the fastest endpoint with seamless fallback.",
   "author": {
@@ -14,17 +14,17 @@
   "icon": "assets/icon.png",
   "cover": {
     "path": "assets/cover.jpg",
-    "alt": "Orca LLM Router gateway overview banner showing intelligent multi-provider routing"
+    "alt": "LLM Router gateway overview banner showing intelligent multi-provider routing"
   },
   "screenshots": [
     {
       "path": "assets/screenshot-overview.png",
-      "alt": "Orca LLM Router overview panel showing active gateway, metrics, and agent endpoints",
+      "alt": "LLM Router overview panel showing active gateway, metrics, and agent endpoints",
       "caption": "Live gateway status, real-time metrics, and agent endpoint configuration"
     },
     {
       "path": "assets/screenshot-providers.png",
-      "alt": "Orca LLM Router providers panel showing multi-provider configuration and model discovery",
+      "alt": "LLM Router providers panel showing multi-provider configuration and model discovery",
       "caption": "Provider credentials, model discovery, and multi-key load balancing"
     }
   ],
@@ -37,7 +37,7 @@
     "panels": [
       {
         "id": "router",
-        "title": "Orca LLM Router",
+        "title": "LLM Router",
         "icon": "zap",
         "entry": "src/panel.tsx",
         "ui": "components"
@@ -46,23 +46,23 @@
     "commands": [
       {
         "id": "router.status",
-        "title": "Orca LLM Router: gateway status"
+        "title": "LLM Router: gateway status"
       },
       {
         "id": "router.start",
-        "title": "Orca LLM Router: start sidecar"
+        "title": "LLM Router: start sidecar"
       },
       {
         "id": "router.stop",
-        "title": "Orca LLM Router: stop sidecar"
+        "title": "LLM Router: stop sidecar"
       },
       {
         "id": "router.restart",
-        "title": "Orca LLM Router: restart sidecar"
+        "title": "LLM Router: restart sidecar"
       },
       {
         "id": "router.test",
-        "title": "Orca LLM Router: test providers"
+        "title": "LLM Router: test providers"
       }
     ],
     "hooks": [
@@ -81,7 +81,7 @@
         "text": "router:18080",
         "icon": "zap",
         "tone": "neutral",
-        "tooltip": "Orca LLM Router sidecar",
+        "tooltip": "LLM Router sidecar",
         "command": "router.status"
       }
     ],
@@ -92,6 +92,13 @@
         "description": "When on, every enabled agent Orca launches is pointed at the sidecar. Turn individual agents off in the Agents tab.",
         "type": "boolean",
         "default": true
+      },
+      {
+        "key": "globalAgentConfig",
+        "title": "Also route Codex and OpenCode outside Orca",
+        "description": "Off by default, so only agents Orca launches are routed. When on, the router also adds its provider to ~/.codex/config.toml and the OpenCode user config so Orca's native Codex chat and a plain codex or opencode in any terminal use the gateway. That affects every Codex and OpenCode session on this machine while the router runs. Turning this off, stopping the router or disabling the plugin removes it again.",
+        "type": "boolean",
+        "default": false
       },
       {
         "key": "port",
