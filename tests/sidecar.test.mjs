@@ -28,6 +28,8 @@ import {
   readSqliteConfig,
   detectLocalRouterConfigs,
   createSidecar,
+  deriveAffinityKey,
+  fetchProviderUsage,
   safeCaptureBody,
   truncateText,
   geminiResponseToOpenAI,
@@ -43,8 +45,31 @@ import {
   providerFromPreset,
   resolveAgentProfile,
   resolveChain,
+  buildChainFromFallback,
   responsesToOpenAI
 } from '../worker/sidecar.mjs'
+import {
+  createSchedulerState,
+  normalizeCircuitBreaker,
+  normalizeProviderHealth,
+  normalizeScheduler,
+  rankProviderTargets,
+  retryAfterMs,
+  selectScheduledKey
+} from '../worker/scheduler.mjs'
+import {
+  compressChatBody,
+  normalizeCompression,
+  normalizeContextRelay,
+  relayChatBody
+} from '../worker/transforms.mjs'
+import {
+  canonicalCacheKey,
+  cosineSimilarity,
+  normalizeResponseCache,
+  semanticParamsKey,
+  shouldCacheRequest
+} from '../worker/cache.mjs'
 
 const anthropicProvider = {
   name: 'anthropic',
@@ -72,9 +97,10 @@ const deepseekProvider = {
 
 function testConfig(overrides = {}) {
   return normalizeConfig({
+    version: 3,
     providers: [anthropicProvider, deepseekProvider, openaiProvider],
-    defaultProvider: 'anthropic',
     defaultFallback: { mode: 'retry', models: [], retryCount: 0 },
+    retries: 0,
     routes: [],
     aliases: {},
     clientKeys: [],
@@ -101,6 +127,133 @@ test('resolveChain: provider prefix, aliases and default', () => {
   assert.deepEqual(resolveChain(config, 'deepseek/deepseek-chat').map((item) => item.provider.name), ['deepseek'])
   assert.deepEqual(resolveChain(config, 'claude').map((item) => item.provider.name), ['anthropic'])
   assert.deepEqual(resolveChain(config, 'gpt-4o').map((item) => item.provider.name), ['openai'])
+})
+
+test('routes expand to their ordered provider/model targets', () => {
+  const config = testConfig({
+    routes: [{
+      name: 'fast',
+      targets: [
+        { provider: 'anthropic', model: 'claude-sonnet-4-20250514' },
+        { provider: 'openai', model: 'gpt-4o' }
+      ],
+      strategy: 'fastest'
+    }]
+  })
+  assert.deepEqual(
+    resolveChain(config, 'fast').map((item) => `${item.provider.name}/${item.model}`),
+    ['anthropic/claude-sonnet-4-20250514', 'openai/gpt-4o']
+  )
+})
+
+test('a legacy modelGroups config still normalizes into routes', () => {
+  const config = testConfig({
+    version: 2,
+    modelGroups: [{
+      name: 'fast',
+      targets: [{ provider: 'anthropic', model: 'claude-sonnet-4-20250514' }],
+      strategy: 'ordered'
+    }]
+  })
+  assert.equal(config.routes.length, 1, 'the old field is read once')
+  assert.equal(config.routes[0].name, 'fast')
+  assert.equal('modelGroups' in config, false, 'saved configs use the routes field')
+})
+
+test('legacy aliases still resolve and become ordered one-target routes', () => {
+  const config = testConfig({ aliases: { claude: 'anthropic/claude-sonnet-4-20250514' } })
+  assert.deepEqual(resolveChain(config, 'claude').map((item) => item.provider.name), ['anthropic'])
+  const route = normalizeConfig(config).routes.find((entry) => entry.name === 'claude')
+  assert.equal(route.strategy, 'ordered', 'an upgraded alias keeps its single-target order')
+  assert.deepEqual(route.targets, [{ provider: 'anthropic', model: 'claude-sonnet-4-20250514' }])
+})
+
+test('a policy fallback route expands after the primary and a raw target also expands', () => {
+  const config = testConfig({
+    routes: [{
+      name: 'backup',
+      targets: [
+        { provider: 'openai', model: 'gpt-4o' },
+        { provider: 'deepseek', model: 'deepseek-chat' }
+      ],
+      strategy: 'ordered'
+    }]
+  })
+  assert.deepEqual(
+    buildChainFromFallback(config, 'anthropic/claude-sonnet-4-20250514', { mode: 'provider-chain', models: ['backup'] })
+      .map((item) => `${item.provider.name}/${item.model}`),
+    [
+      'anthropic/claude-sonnet-4-20250514',
+      'openai/gpt-4o',
+      'deepseek/deepseek-chat'
+    ]
+  )
+  // A policy fallback can name a route or a raw provider/model target. A raw
+  // target is resolved directly and appended after the primary.
+  assert.deepEqual(
+    buildChainFromFallback(config, 'anthropic/claude-sonnet-4-20250514', { mode: 'provider-chain', models: ['openai/gpt-4o'] })
+      .map((item) => `${item.provider.name}/${item.model}`),
+    ['anthropic/claude-sonnet-4-20250514', 'openai/gpt-4o']
+  )
+})
+
+test('a route target with no model reuses the primary model on that provider', () => {
+  const config = testConfig({
+    routes: [{ name: 'backup', targets: [{ provider: 'openai', model: '' }], strategy: 'ordered' }]
+  })
+  assert.deepEqual(
+    buildChainFromFallback(config, 'anthropic/claude-sonnet-4-20250514', { mode: 'provider-chain', models: ['backup'] })
+      .map((item) => `${item.provider.name}/${item.model}`),
+    ['anthropic/claude-sonnet-4-20250514', 'openai/claude-sonnet-4-20250514'],
+    'the same model name is tried on the other provider'
+  )
+})
+
+test('a legacy global fallback chain is migrated to an opt-in route and stops applying', () => {
+  const config = testConfig({ defaultFallback: { mode: 'provider-chain', models: ['deepseek/deepseek-chat'], retryCount: 0 } })
+  assert.deepEqual(
+    resolveChain(config, 'anthropic/claude-sonnet-4-20250514').map((item) => `${item.provider.name}/${item.model}`),
+    ['anthropic/claude-sonnet-4-20250514'],
+    'the global chain no longer adds a target to a raw provider/model request'
+  )
+  const route = config.routes.find((entry) => entry.name === 'default-failover')
+  assert.ok(route, 'the chain is preserved as a route')
+  assert.deepEqual(route.targets, [{ provider: 'deepseek', model: 'deepseek-chat' }])
+  assert.equal(config.migration.at(-1).kind, 'global-chain')
+  assert.equal(config.migration.at(-1).to, 'default-failover')
+})
+
+test('a legacy rule fallback chain is migrated into an ordered backup route', () => {
+  const config = testConfig({
+    version: 2,
+    routes: [{
+      name: 'claude default',
+      condition: { source: 'request.body', field: 'model', operator: 'starts-with', value: 'claude-' },
+      fallback: { mode: 'provider-chain', models: ['openai/gpt-4o', 'deepseek/deepseek-chat'], retryCount: 1 }
+    }]
+  })
+  const policy = config.policies[0]
+  assert.deepEqual(policy.fallback.models, ['claude-default-backups'], 'the policy now points at a route')
+  const route = config.routes.find((entry) => entry.name === 'claude-default-backups')
+  assert.ok(route)
+  assert.deepEqual(route.targets, [
+    { provider: 'openai', model: 'gpt-4o' },
+    { provider: 'deepseek', model: 'deepseek-chat' }
+  ])
+  assert.equal(route.strategy, 'ordered')
+  assert.equal(route.retries, 1)
+  assert.equal(config.migration.at(-1).kind, 'rule-chain')
+  // Re-normalizing the migrated config must not create a second route.
+  const again = normalizeConfig(config)
+  assert.equal(again.routes.filter((entry) => entry.name === 'claude-default-backups').length, 1)
+  assert.equal(again.migration.filter((entry) => entry.kind === 'rule-chain').length, 1)
+})
+
+test('a provider/model request migrates and normalizes a lowercase provider prefix', () => {
+  const config = testConfig({
+    routes: [{ name: 'mixed', targets: [{ provider: 'Anthropic', model: '' }], strategy: 'ordered' }]
+  })
+  assert.deepEqual(config.routes[0].targets, [{ provider: 'anthropic', model: '' }])
 })
 
 test('responsesToOpenAI forwards reasoning effort and function tools', () => {
@@ -208,7 +361,7 @@ test('normalizeConfig migrates legacy upstreams/routes', () => {
     defaultUpstream: 'acme'
   })
   assert.equal(normalized.providers[0].name, 'acme')
-  assert.equal(normalized.routes[0].condition.value, 'acme/')
+  assert.equal(normalized.policies[0].condition.value, 'acme/')
 })
 
 test('provider enabled follows its key pool', () => {
@@ -273,7 +426,7 @@ test('convertLegacyConfig imports providers, rules, keys and profiles', () => {
     profile: { profiles: [{ agent: 'claude-code', name: 'Claude Code', model: 'DeepSeek/deepseek-chat', enabled: true, scope: 'ccr' }] }
   })
   assert.equal(result.config.providers[0].name, 'deepseek')
-  assert.equal(result.config.routes[0].condition.value, 'claude-')
+  assert.equal(result.config.policies[0].condition.value, 'claude-')
   assert.equal(result.config.clientKeys[0].id, 'laptop')
   assert.ok(result.secrets.some((entry) => entry.value === 'sk-deep'))
   assert.equal(result.config.agentProfiles[0].agent, 'claude-code')
@@ -397,10 +550,11 @@ test('buildOpenCodeConfig publishes the gateway providers and model list', () =>
     token: 'orca-router'
   })
   assert.equal(provider, 'orca-router')
-  // Defaults to the default provider's first model, like the gateway itself.
-  assert.equal(model, 'anthropic/claude-sonnet-4-20250514')
-  assert.equal(document.model, 'orca-router/anthropic/claude-sonnet-4-20250514')
-  assert.equal(document.small_model, document.model)
+  // The router never picks a startup model: with no explicit profile model
+  // there is no pin, so OpenCode starts on its last-used model.
+  assert.equal(model, '')
+  assert.equal(document.model, undefined)
+  assert.equal(document.small_model, undefined)
   // A stale CCR config would otherwise remain selectable.
   assert.deepEqual(document.disabled_providers, ['claude-code-router'])
   const published = document.provider['orca-router']
@@ -453,7 +607,7 @@ test('buildOpenCodeConfig honors aliases, profiles and disabled providers', () =
 test('buildCodexModelCatalog publishes the gateway models for the Codex picker', () => {
   const config = testConfig({ aliases: { fast: 'deepseek/deepseek-chat' } })
   const { document, model } = buildCodexModelCatalog(config, { agentId: 'codex' })
-  assert.equal(model, 'anthropic/claude-sonnet-4-20250514')
+  assert.equal(model, '')
   assert.deepEqual(document.models.map((item) => item.slug), [
     'anthropic/claude-sonnet-4-20250514',
     'deepseek/deepseek-chat',
@@ -770,6 +924,61 @@ test('mergeOpenCodeConfig replaces CCR and repoints its model references', () =>
   assert.ok(existing.provider['claude-code-router'])
 })
 
+test('mergeOpenCodeConfig does not invent a model for the user', () => {
+  const config = testConfig()
+  const { document: generated } = buildOpenCodeConfig(config, {
+    base: 'http://127.0.0.1:18080',
+    token: 'orca-router'
+  })
+  const existing = {
+    $schema: 'https://opencode.ai/config.json',
+    mcp: { servers: { docs: { type: 'remote', url: 'https://example.com/mcp' } } },
+    provider: {}
+  }
+  const merged = mergeOpenCodeConfig(existing, generated)
+  assert.equal(merged.model, undefined)
+  assert.equal(merged.small_model, undefined)
+})
+
+test('buildAgentLaunchEnv does not fall back to a router default model', () => {
+  const config = testConfig({
+    defaultModel: 'anthropic/claude-sonnet-4-20250514',
+    agentProfiles: [
+      { agent: 'claude', name: 'Claude Code', model: '', enabled: true, scope: 'system-default', env: {} }
+    ]
+  })
+  const { env, model } = buildAgentLaunchEnv(config, 'claude', {
+    base: 'http://127.0.0.1:18080',
+    token: 'orca-router'
+  })
+  assert.equal(model, '')
+  assert.equal(env.ANTHROPIC_MODEL, undefined)
+  assert.equal(env.OPENAI_MODEL, undefined)
+  assert.equal(env.MODEL, undefined)
+})
+
+test('buildCodexManagedConfig leaves the user model untouched when no pin is given', () => {
+  const base = 'http://127.0.0.1:18080'
+  const original = [
+    'model = "gpt-5.5"',
+    'model_reasoning_effort = "xhigh"',
+    '',
+    '[projects."/tmp/new-project"]',
+    'trust_level = "trusted"',
+    ''
+  ].join('\n')
+  const options = { base, token: 'orca-router', catalogPath: '/tmp/orca-llm-router/codex-models.json' }
+  const managed = buildCodexManagedConfig(original, options)
+  // The user's own keys survive and the block adds routing only.
+  assert.equal((managed.match(/^model = "gpt-5\.5"$/gm) ?? []).length, 1)
+  assert.equal((managed.match(/^model_reasoning_effort = "xhigh"$/gm) ?? []).length, 1)
+  assert.doesNotMatch(managed, /^model_reasoning_effort = "high"$/m)
+  assert.match(managed, /model_provider = "orca-router"/)
+  assert.match(managed, /model_catalog_json = "\/tmp\/orca-llm-router\/codex-models\.json"/)
+  // Re-applying is idempotent.
+  assert.equal(buildCodexManagedConfig(managed, options), managed)
+})
+
 async function withSidecar(config, fetchImpl, fn, secrets = {}) {
   const sidecar = createSidecar({
     getConfig: () => config,
@@ -786,6 +995,151 @@ async function withSidecar(config, fetchImpl, fn, secrets = {}) {
   }
 }
 
+test('provider health normalization clamps its bounds', () => {
+  assert.deepEqual(normalizeProviderHealth(), { enabled: false, smoothing: 0.3, staleMs: 300_000 })
+  assert.deepEqual(normalizeProviderHealth({ enabled: true, smoothing: 5, staleMs: 1 }), { enabled: true, smoothing: 0.9, staleMs: 30_000 })
+})
+
+test('rankProviderTargets orders fastest healthy first and keeps failure last', () => {
+  const target = (name) => ({ provider: { name }, model: 'm' })
+  const targets = [target('slow'), target('fast'), target('broken')]
+  const health = new Map([
+    ['slow', { latencyMs: 900, samples: 5, failures: 0, lastSuccessAt: 1000 }],
+    ['fast', { latencyMs: 120, samples: 5, failures: 0, lastSuccessAt: 1000 }],
+    ['broken', { latencyMs: 100, samples: 5, failures: 3, lastSuccessAt: 1000, lastFailureAt: 2000 }]
+  ])
+  const ranked = rankProviderTargets({
+    targets,
+    health,
+    config: { circuitBreaker: { failureThreshold: 3 } },
+    enabled: true,
+    timestamp: 2500
+  })
+  assert.deepEqual(ranked.map((item) => item.provider.name), ['fast', 'slow', 'broken'])
+})
+
+test('rankProviderTargets honors an open circuit and a live session pin', () => {
+  const target = (name) => ({ provider: { name }, model: 'm' })
+  const targets = [target('a'), target('b')]
+  const health = new Map([
+    ['a', { latencyMs: 100, samples: 4, failures: 0, lastSuccessAt: 1000 }],
+    ['b', { latencyMs: 400, samples: 4, failures: 0, lastSuccessAt: 1000 }]
+  ])
+  const config = {
+    circuitBreaker: { failureThreshold: 3, cooldownMs: 60_000 },
+    scheduler: { cacheAffinity: true, cacheAffinityTtlMs: 600_000 }
+  }
+  const open = new Map([['a', { state: 'open', openUntil: 90_000 }]])
+  assert.deepEqual(
+    rankProviderTargets({ targets, health, circuits: open, config, enabled: true, timestamp: 10_000 }).map((item) => item.provider.name),
+    ['b', 'a']
+  )
+  assert.deepEqual(
+    rankProviderTargets({ targets, health, affinity: { provider: 'b', at: 9_000 }, config, enabled: true, timestamp: 10_000 }).map((item) => item.provider.name),
+    ['b', 'a']
+  )
+})
+
+test('rankProviderTargets only ranks when explicitly enabled', () => {
+  const target = (name) => ({ provider: { name }, model: 'm' })
+  const targets = [target('slow'), target('fast')]
+  const health = new Map([
+    ['slow', { latencyMs: 900, samples: 5, failures: 0, lastSuccessAt: 1000 }],
+    ['fast', { latencyMs: 120, samples: 5, failures: 0, lastSuccessAt: 1000 }]
+  ])
+  assert.deepEqual(
+    rankProviderTargets({ targets, health, config: {}, enabled: true, timestamp: 2000 }).map((item) => item.provider.name),
+    ['fast', 'slow'],
+    'a fastest route ranks its targets'
+  )
+  assert.deepEqual(
+    rankProviderTargets({ targets, health, config: {}, enabled: false, timestamp: 2000 }).map((item) => item.provider.name),
+    ['slow', 'fast'],
+    'an ordered route keeps its listed order'
+  )
+  assert.deepEqual(
+    rankProviderTargets({ targets, health, config: {}, timestamp: 2000 }).map((item) => item.provider.name),
+    ['slow', 'fast'],
+    'ranking is off unless a route opts in'
+  )
+})
+
+test('a fastest route tries the healthiest provider first', async () => {
+  const slow = { name: 'slow', baseUrl: 'https://slow.example.test/v1', protocols: ['openai'], models: [{ id: 'shared-model' }], keys: [] }
+  const fast = { name: 'fast', baseUrl: 'https://fast.example.test/v1', protocols: ['openai'], models: [{ id: 'shared-model' }], keys: [] }
+  const config = testConfig({
+    providers: [slow, fast],
+    routes: [{
+      name: 'shared-model',
+      targets: [
+        { provider: 'slow', model: 'shared-model' },
+        { provider: 'fast', model: 'shared-model' }
+      ],
+      strategy: 'fastest'
+    }]
+  })
+  const calls = []
+  await withSidecar(config, async (url) => {
+    calls.push(String(url))
+    return new Response(JSON.stringify({ id: 'r1', model: 'shared-model', choices: [{ message: { content: 'hi' } }] }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' }
+    })
+  }, async (base, sidecar) => {
+    // Prime both providers the way a manual speed test does.
+    sidecar.recordProbes([
+      { provider: 'slow', ok: true, latencyMs: 900 },
+      { provider: 'fast', ok: true, latencyMs: 100 }
+    ])
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'shared-model', messages: [{ role: 'user', content: 'hi' }] })
+    })
+    assert.equal(res.status, 200)
+    assert.match(calls[0], /fast\.example\.test/, 'the faster provider is tried first')
+    assert.equal(sidecar.logs[0].resolvedProvider, 'fast')
+    const health = sidecar.status().providers.find((provider) => provider.name === 'fast').health
+    assert.equal(health.state, 'healthy')
+    assert.ok(health.latencyMs != null)
+  })
+})
+
+test('an ordered route keeps its listed order despite faster health', async () => {
+  const slow = { name: 'slow', baseUrl: 'https://slow.example.test/v1', protocols: ['openai'], models: [{ id: 'shared-model' }], keys: [] }
+  const fast = { name: 'fast', baseUrl: 'https://fast.example.test/v1', protocols: ['openai'], models: [{ id: 'shared-model' }], keys: [] }
+  const config = testConfig({
+    providers: [slow, fast],
+    routes: [{
+      name: 'shared-model',
+      targets: [
+        { provider: 'slow', model: 'shared-model' },
+        { provider: 'fast', model: 'shared-model' }
+      ],
+      strategy: 'ordered'
+    }]
+  })
+  const calls = []
+  await withSidecar(config, async (url) => {
+    calls.push(String(url))
+    return new Response(JSON.stringify({ id: 'r1', model: 'shared-model', choices: [{ message: { content: 'hi' } }] }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' }
+    })
+  }, async (base, sidecar) => {
+    sidecar.recordProbes([
+      { provider: 'slow', ok: true, latencyMs: 900 },
+      { provider: 'fast', ok: true, latencyMs: 100 }
+    ])
+    await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'shared-model', messages: [{ role: 'user', content: 'hi' }] })
+    })
+    assert.match(calls[0], /slow\.example\.test/, 'the configured order is kept')
+  })
+})
+
 test('normalizes Codex grammar custom tools for a third-party responses provider', async () => {
   const responsesConfig = (supportsCustomToolGrammar) => testConfig({
     providers: [{
@@ -796,7 +1150,6 @@ test('normalizes Codex grammar custom tools for a third-party responses provider
       keys: [],
       ...(supportsCustomToolGrammar ? { supportsCustomToolGrammar: true } : {})
     }],
-    defaultProvider: 'responses',
     defaultModel: 'responses/m'
   })
   const body = {
@@ -968,7 +1321,7 @@ test('streams an Anthropic-shaped response from an OpenAI provider', async () =>
 
 test('conditional rules rewrite the model before forwarding', async () => {
   const config = testConfig({
-    routes: [{
+    policies: [{
       name: 'Claude -> DeepSeek',
       enabled: true,
       condition: { source: 'request.body', field: 'model', operator: 'starts-with', value: 'claude-' },
@@ -989,9 +1342,16 @@ test('conditional rules rewrite the model before forwarding', async () => {
   })
 })
 
-test('model-chain fallback tries the backup provider after a 502', async () => {
+test('a route fails over to the backup provider after a 502', async () => {
   const config = testConfig({
-    defaultFallback: { mode: 'model-chain', models: ['deepseek/deepseek-chat'], retryCount: 0 }
+    routes: [{
+      name: 'claude-backup',
+      targets: [
+        { provider: 'anthropic', model: 'claude-sonnet-4-20250514' },
+        { provider: 'deepseek', model: 'deepseek-chat' }
+      ],
+      strategy: 'ordered'
+    }]
   })
   const urls = []
   await withSidecar(config, async (url) => {
@@ -1004,12 +1364,149 @@ test('model-chain fallback tries the backup provider after a 502', async () => {
     const res = await fetch(`${base}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'anthropic/claude-sonnet-4-20250514', messages: [{ role: 'user', content: 'hi' }] })
+      body: JSON.stringify({ model: 'claude-backup', messages: [{ role: 'user', content: 'hi' }] })
     })
     assert.equal(res.status, 200)
     assert.ok(urls.length >= 2, `expected fallback, got ${urls.length}`)
     assert.equal(sidecar.logs.at(-1).resolvedProvider, 'deepseek')
   })
+})
+
+test('a raw provider/model request does not fail over to another provider', async () => {
+  const config = testConfig()
+  const urls = []
+  await withSidecar(config, async (url) => {
+    urls.push(url)
+    return new Response('bad gateway', { status: 502, headers: { 'content-type': 'text/plain' } })
+  }, async (base) => {
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'anthropic/claude-sonnet-4-20250514', messages: [{ role: 'user', content: 'hi' }] })
+    })
+    assert.equal(res.status, 502)
+    assert.ok(urls.every((url) => url.includes('anthropic.com')), 'only the requested provider is tried')
+  })
+})
+
+test('an unknown chat model returns 404 instead of mapping to a default provider', async () => {
+  const config = testConfig()
+  let called = false
+  await withSidecar(config, async () => {
+    called = true
+    return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } })
+  }, async (base, sidecar) => {
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'not-a-real-model', messages: [{ role: 'user', content: 'hi' }] })
+    })
+    assert.equal(res.status, 404)
+    assert.equal((await res.json()).error.code, 'model_not_found')
+    const prefixed = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'nope/model', messages: [{ role: 'user', content: 'hi' }] })
+    })
+    assert.equal(prefixed.status, 404, 'an unknown provider prefix is not routed to the default provider')
+    assert.equal(called, false, 'no provider is contacted for an unknown model')
+    assert.equal(sidecar.logs.at(-1).status, 404)
+  })
+})
+
+test('a route uses its own retry count per target', async () => {
+  const config = testConfig({
+    retries: 0,
+    routes: [{ name: 'try-twice', targets: [{ provider: 'deepseek', model: 'deepseek-chat' }], strategy: 'ordered', retries: 1 }],
+    baseDelayMs: 1
+  })
+  let calls = 0
+  await withSidecar(config, async () => {
+    calls++
+    if (calls === 1) return new Response('temporary', { status: 502, headers: { 'content-type': 'text/plain' } })
+    return new Response(JSON.stringify({ id: 'r', choices: [{ message: { content: 'ok' } }] }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' }
+    })
+  }, async (base) => {
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'try-twice', messages: [] })
+    })
+    assert.equal(res.status, 200)
+    assert.equal(calls, 2, 'the route retried the same target once')
+  })
+})
+
+test('fetchProviderUsage reads configured connectors instead of dropping them', async () => {
+  const seen = []
+  const provider = {
+    name: 'metered',
+    keys: [{ secretKey: 'metered-key' }],
+    usageFetch: {
+      connectors: [{
+        endpoint: 'https://usage.example.test/balance',
+        mapping: { meters: [{ id: 'usd', kind: 'balance', limit: 10, used: '$.spent', unit: '$.currency' }] }
+      }]
+    }
+  }
+  const result = await fetchProviderUsage(provider, {
+    getSecret: () => 'sk-metered',
+    fetchImpl: async (url, init) => {
+      seen.push({ url, authorization: init.headers.authorization })
+      return new Response(JSON.stringify({ spent: 3, currency: 'CNY' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    }
+  })
+  assert.equal(result.status, 'ok')
+  assert.deepEqual(result.meters[0], {
+    id: 'usd',
+    kind: 'balance',
+    label: 'usd',
+    unit: 'CNY',
+    window: undefined,
+    limit: 10,
+    used: 3,
+    remaining: 7,
+    resetAt: undefined
+  })
+  assert.deepEqual(seen, [{ url: 'https://usage.example.test/balance', authorization: 'Bearer sk-metered' }])
+})
+
+test('fetchProviderUsage targets a specific pool key', async () => {
+  const provider = {
+    name: 'metered',
+    keys: [{ secretKey: 'first-key' }, { secretKey: 'second-key' }],
+    usageFetch: {
+      connectors: [{
+        endpoint: 'https://usage.example.test/balance',
+        mapping: { meters: [{ id: 'usd', kind: 'balance', limit: 10, used: '$.spent' }] }
+      }]
+    }
+  }
+  const asked = []
+  let authorization = ''
+  const result = await fetchProviderUsage(provider, {
+    secretKey: 'second-key',
+    getSecret: (key) => {
+      asked.push(key)
+      return key === 'second-key' ? 'sk-second' : 'sk-first'
+    },
+    fetchImpl: async (url, init) => {
+      authorization = init.headers.authorization
+      return new Response(JSON.stringify({ spent: 2 }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    }
+  })
+  assert.deepEqual(asked, ['second-key'], 'only the requested key is resolved')
+  assert.equal(authorization, 'Bearer sk-second')
+  assert.equal(result.secretKey, 'second-key')
+  assert.equal(result.meters[0].used, 2)
 })
 
 test('health endpoint reports providers', async () => {
@@ -1072,7 +1569,7 @@ test('enforces a client API key request limit', async () => {
 
 test('retries a retryable upstream failure and succeeds', async () => {
   let calls = 0
-  const config = testConfig({ defaultFallback: { mode: 'retry', models: [], retryCount: 2 }, baseDelayMs: 1 })
+  const config = testConfig({ retries: 2, baseDelayMs: 1 })
   await withSidecar(config, async () => {
     calls++
     if (calls === 1) {
@@ -1101,8 +1598,8 @@ function pooledConfig(keys) {
   }
   return normalizeConfig({
     providers: [provider],
-    defaultProvider: 'deepseek',
     defaultFallback: { mode: 'retry', models: [], retryCount: 0 },
+    retries: 0,
     routes: [],
     aliases: {},
     clientKeys: [],
@@ -1150,6 +1647,7 @@ test('credential pool round-robins between keys across requests', async () => {
     { id: 'first', secretKey: 'deepseek-key-1', enabled: true },
     { id: 'second', secretKey: 'deepseek-key-2', enabled: true }
   ])
+  config.scheduler.cacheAffinity = false
   const used = []
   await withSidecar(
     config,
@@ -1168,10 +1666,10 @@ test('credential pool round-robins between keys across requests', async () => {
   )
 })
 
-test('credential pool rotates across priority values too', async () => {
+test('credential pool keeps lower-priority keys idle until the preferred tier is unavailable', async () => {
   const config = pooledConfig([
-    { id: 'first', secretKey: 'deepseek-key-1', enabled: true, priority: 0 },
-    { id: 'second', secretKey: 'deepseek-key-2', enabled: true, priority: 1 }
+    { id: 'preferred', secretKey: 'deepseek-key-1', enabled: true, priority: 0 },
+    { id: 'spillover', secretKey: 'deepseek-key-2', enabled: true, priority: 1 }
   ])
   const used = []
   await withSidecar(
@@ -1184,8 +1682,176 @@ test('credential pool rotates across priority values too', async () => {
       })
     },
     async (base) => {
-      for (let i = 0; i < 2; i++) assert.equal((await proxy(base)).status, 200)
-      assert.deepEqual(used, ['Bearer sk-first', 'Bearer sk-second'])
+      for (let i = 0; i < 3; i++) assert.equal((await proxy(base)).status, 200)
+      assert.deepEqual(used, ['Bearer sk-first', 'Bearer sk-first', 'Bearer sk-first'])
+    },
+    { 'deepseek-key-1': 'sk-first', 'deepseek-key-2': 'sk-second' }
+  )
+
+  const spilled = pooledConfig([
+    { id: 'preferred', secretKey: 'deepseek-key-1', enabled: false, priority: 0 },
+    { id: 'spillover', secretKey: 'deepseek-key-2', enabled: true, priority: 1 }
+  ])
+  used.length = 0
+  await withSidecar(
+    spilled,
+    async (url, init) => {
+      used.push(init.headers.authorization)
+      return new Response(JSON.stringify({ id: 'r1', choices: [{ message: { content: 'ok' } }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    },
+    async (base) => {
+      assert.equal((await proxy(base)).status, 200)
+      assert.deepEqual(used, ['Bearer sk-second'])
+    },
+    { 'deepseek-key-1': 'sk-first', 'deepseek-key-2': 'sk-second' }
+  )
+})
+
+test('normalizeConfig keeps scheduler settings', () => {
+  const config = normalizeConfig(testConfig({
+    scheduler: { priorityTiers: false, utilizationAware: false, allKeysExhausted: 'overflow', exhaustedStatus: 429 }
+  }))
+  assert.equal(config.scheduler.priorityTiers, false)
+  assert.equal(config.scheduler.utilizationAware, false)
+  assert.equal(config.scheduler.allKeysExhausted, 'overflow')
+  assert.equal(config.scheduler.exhaustedStatus, 429)
+})
+
+test('scheduler distributes traffic by weight', () => {
+  const state = createSchedulerState()
+  const candidates = [
+    { id: 'heavy', weight: 3 },
+    { id: 'light', weight: 1 }
+  ]
+  const counts = { heavy: 0, light: 0 }
+  for (let i = 0; i < 400; i++) {
+    const chosen = selectScheduledKey({ providerName: 'weighted', candidates, scheduler: {}, state })
+    counts[chosen.id]++
+  }
+  assert.deepEqual(counts, { heavy: 300, light: 100 })
+})
+
+test('scheduler prefers lower priority tiers and lower utilization', () => {
+  const state = createSchedulerState()
+  const tiers = [
+    { id: 'preferred', priority: 0, weight: 1, utilization: 0.1 },
+    { id: 'spillover', priority: 1, weight: 1, utilization: 0 }
+  ]
+  for (let i = 0; i < 5; i++) {
+    assert.equal(selectScheduledKey({ providerName: 'tiers', candidates: tiers, scheduler: {}, state }).id, 'preferred')
+  }
+  assert.equal(
+    selectScheduledKey({ providerName: 'tiers', candidates: [tiers[1]], scheduler: {}, state }).id,
+    'spillover'
+  )
+
+  const spilled = createSchedulerState()
+  const tiered = [
+    { id: 'main', priority: 0, weight: 1, utilization: 0.95 },
+    { id: 'backup', priority: 1, weight: 1, utilization: 0.1 }
+  ]
+  assert.equal(
+    selectScheduledKey({ providerName: 'tier-spill', candidates: tiered, scheduler: {}, state: spilled }).id,
+    'backup'
+  )
+
+  const headroom = createSchedulerState()
+  const nearLimit = { id: 'near', weight: 10, utilization: 0.95 }
+  const roomy = { id: 'roomy', weight: 1, utilization: 0.1 }
+  for (let i = 0; i < 6; i++) {
+    assert.equal(
+      selectScheduledKey({ providerName: 'headroom', candidates: [nearLimit, roomy], scheduler: {}, state: headroom }).id,
+      'roomy'
+    )
+  }
+})
+
+test('scheduler normalization and Retry-After parsing are bounded', () => {
+  assert.equal(normalizeScheduler({ exhaustedStatus: 429 }).exhaustedStatus, 429)
+  assert.equal(normalizeScheduler({ exhaustedStatus: 500 }).exhaustedStatus, 420)
+  assert.equal(normalizeScheduler({ utilizationThreshold: 5 }).utilizationThreshold, 1)
+  assert.equal(retryAfterMs('2'), 2000)
+  const dateDelay = retryAfterMs(new Date(Date.now() + 5000).toUTCString())
+  assert.ok(dateDelay > 3000 && dateDelay <= 5000, `expected a valid HTTP-date delay, got ${dateDelay}`)
+  assert.equal(retryAfterMs('not-a-date'), 0)
+})
+
+test('deriveAffinityKey prefers explicit headers, then body ids, then a stable prompt hash', () => {
+  const body = { model: 'm', messages: [{ role: 'user', content: 'hi' }] }
+  assert.equal(deriveAffinityKey({ 'x-orca-session-id': 'one', 'x-session-id': 'two' }, body), 'header:x-orca-session-id:one')
+  assert.equal(deriveAffinityKey({ 'x-session-id': 'two' }, body), 'header:x-session-id:two')
+  assert.equal(deriveAffinityKey({}, { ...body, metadata: { user_id: 'user-7' } }), 'body:user-7')
+  const first = deriveAffinityKey({}, body)
+  const reordered = deriveAffinityKey({}, { messages: [{ content: 'hi', role: 'user' }], model: 'm' })
+  assert.equal(first, reordered)
+  assert.notEqual(first, deriveAffinityKey({}, { ...body, messages: [{ role: 'user', content: 'bye' }] }))
+  assert.equal(deriveAffinityKey({}, { model: 'm' }), '')
+})
+
+test('circuit breaker normalization is bounded', () => {
+  assert.equal(normalizeCircuitBreaker({ failureThreshold: 0 }).failureThreshold, 1)
+  assert.equal(normalizeCircuitBreaker({ cooldownMs: 10 }).cooldownMs, 1000)
+  assert.equal(normalizeCircuitBreaker({ enabled: false }).enabled, false)
+})
+
+test('cache affinity keeps a session on the same key, then rebinds a new session', async () => {
+  const config = pooledConfig([
+    { id: 'first', secretKey: 'deepseek-key-1', enabled: true },
+    { id: 'second', secretKey: 'deepseek-key-2', enabled: true }
+  ])
+  const used = []
+  const call = (base, session) => fetch(`${base}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...(session ? { 'x-orca-session-id': session } : {}) },
+    body: JSON.stringify({ model: 'deepseek/deepseek-chat', messages: [{ role: 'user', content: 'hi' }] })
+  })
+  await withSidecar(
+    config,
+    async (url, init) => {
+      used.push(init.headers.authorization)
+      return new Response(JSON.stringify({ id: 'r1', choices: [{ message: { content: 'ok' } }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    },
+    async (base) => {
+      assert.equal((await call(base, 'session-a')).status, 200)
+      assert.equal((await call(base, 'session-a')).status, 200)
+      assert.equal((await call(base, 'session-b')).status, 200)
+      assert.deepEqual(used, ['Bearer sk-first', 'Bearer sk-first', 'Bearer sk-second'])
+    },
+    { 'deepseek-key-1': 'sk-first', 'deepseek-key-2': 'sk-second' }
+  )
+})
+
+test('prompt hashing keeps identical prompts on one key without a session header', async () => {
+  const config = pooledConfig([
+    { id: 'first', secretKey: 'deepseek-key-1', enabled: true },
+    { id: 'second', secretKey: 'deepseek-key-2', enabled: true }
+  ])
+  const used = []
+  const call = (base, prompt) => fetch(`${base}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'deepseek/deepseek-chat', messages: [{ role: 'user', content: prompt }] })
+  })
+  await withSidecar(
+    config,
+    async (url, init) => {
+      used.push(init.headers.authorization)
+      return new Response(JSON.stringify({ id: 'r1', choices: [{ message: { content: 'ok' } }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    },
+    async (base) => {
+      assert.equal((await call(base, 'same prompt')).status, 200)
+      assert.equal((await call(base, 'same prompt')).status, 200)
+      assert.equal((await call(base, 'different prompt')).status, 200)
+      assert.deepEqual(used, ['Bearer sk-first', 'Bearer sk-first', 'Bearer sk-second'])
     },
     { 'deepseek-key-1': 'sk-first', 'deepseek-key-2': 'sk-second' }
   )
@@ -1216,14 +1882,166 @@ test('credential pool skips a key that reached its request limit', async () => {
   )
 })
 
+test('status reports rolling per-key usage and quota meters for the panel', async () => {
+  const config = pooledConfig([
+    { id: 'primary', secretKey: 'deepseek-key-1', enabled: true, limits: { rpm: 10, rpd: 100 } },
+    { id: 'backup', secretKey: 'deepseek-key-2', enabled: false, limits: { rpm: 5 } }
+  ])
+  let currentTime = 1_000_000
+  const sidecar = createSidecar({
+    getConfig: () => config,
+    getSecret: (key) => key === 'deepseek-key-1' ? 'sk-first' : 'sk-second',
+    fetchImpl: async () => new Response(
+      JSON.stringify({ id: 'r1', choices: [{ message: { content: 'ok' } }], usage: { prompt_tokens: 7, completion_tokens: 3 } }),
+      { status: 200, headers: { 'content-type': 'application/json' } }
+    ),
+    onLog: () => {},
+    now: () => currentTime
+  })
+  const addr = await sidecar.start('127.0.0.1', 0)
+  try {
+    assert.equal((await proxy(`http://127.0.0.1:${addr.port}`)).status, 200)
+
+    const primary = sidecar.status().providers[0].keyUsage.find((key) => key.secretKey === 'deepseek-key-1')
+    assert.ok(primary, 'primary key has a usage snapshot')
+    assert.equal(primary.enabled, true)
+    assert.equal(primary.state, 'ready')
+    assert.equal(primary.requests.minute, 1)
+    assert.equal(primary.requests.day, 1)
+    assert.equal(primary.tokens.day, 10)
+    assert.deepEqual(
+      primary.meters.map((meter) => [meter.field, meter.used, meter.limit]),
+      [['rpm', 1, 10], ['rpd', 1, 100]]
+    )
+    assert.equal(primary.utilization, 0.1)
+
+    const backup = sidecar.status().providers[0].keyUsage.find((key) => key.secretKey === 'deepseek-key-2')
+    assert.ok(backup, 'disabled key still has a usage snapshot')
+    assert.equal(backup.enabled, false)
+    assert.equal(backup.state, 'disabled')
+    assert.equal(backup.requests.day, 0)
+
+    currentTime += 61_000
+    const later = sidecar.status().providers[0].keyUsage.find((key) => key.secretKey === 'deepseek-key-1')
+    assert.equal(later.requests.minute, 0, 'the minute window rolls over')
+    assert.equal(later.requests.hour, 1, 'the hourly window still includes the request')
+    assert.equal(later.requests.day, 1, 'the daily window still includes the request')
+  } finally {
+    await sidecar.stop()
+  }
+})
+
+test('a keyed provider retries a transient 5xx without cooling the key', async () => {
+  const config = pooledConfig([{ id: 'only', secretKey: 'deepseek-key-1', enabled: true }])
+  config.retries = 1
+  let calls = 0
+  await withSidecar(
+    config,
+    async () => {
+      calls++
+      if (calls === 1) return new Response('temporary', { status: 502, headers: { 'content-type': 'text/plain' } })
+      return new Response(JSON.stringify({ id: 'r1', choices: [{ message: { content: 'ok' } }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    },
+    async (base) => {
+      assert.equal((await proxy(base)).status, 200)
+      assert.equal(calls, 2)
+    },
+    { 'deepseek-key-1': 'sk-first' }
+  )
+})
+
+test('a single keyed provider honors Retry-After and retries within the same request', async () => {
+  const config = pooledConfig([{ id: 'only', secretKey: 'deepseek-key-1', enabled: true }])
+  config.retries = 1
+  let calls = 0
+  await withSidecar(
+    config,
+    async () => {
+      calls++
+      if (calls === 1) {
+        return new Response('slow down', {
+          status: 429,
+          headers: { 'content-type': 'text/plain', 'retry-after': '0.001' }
+        })
+      }
+      return new Response(JSON.stringify({ id: 'r1', choices: [{ message: { content: 'ok' } }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    },
+    async (base) => {
+      assert.equal((await proxy(base)).status, 200)
+      assert.equal(calls, 2)
+    },
+    { 'deepseek-key-1': 'sk-first' }
+  )
+})
+
+test('returns 420 when every key is over its configured limit', async () => {
+  const config = pooledConfig([
+    { id: 'metered', secretKey: 'deepseek-key-1', enabled: true, limits: { rpm: 1 } }
+  ])
+  let calls = 0
+  await withSidecar(
+    config,
+    async () => {
+      calls++
+      return new Response(
+        JSON.stringify({ id: 'r1', choices: [{ message: { content: 'ok' } }], usage: { prompt_tokens: 1, completion_tokens: 1 } }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      )
+    },
+    async (base, sidecar) => {
+      assert.equal((await proxy(base)).status, 200)
+      const exhausted = await proxy(base)
+      assert.equal(exhausted.status, 420)
+      assert.equal((await exhausted.json()).error.code, 'all_keys_exhausted')
+      assert.equal(calls, 1, 'the exhausted request never reaches upstream')
+      assert.equal(sidecar.logs.at(-1).status, 420)
+    },
+    { 'deepseek-key-1': 'sk-first' }
+  )
+})
+
+test('provider circuit opens after repeated provider failures and allows a half-open probe', async () => {
+  const config = pooledConfig([{ id: 'only', secretKey: 'deepseek-key-1', enabled: true }])
+  config.circuitBreaker = { enabled: true, failureThreshold: 1, cooldownMs: 50 }
+  let calls = 0
+  await withSidecar(
+    config,
+    async () => {
+      calls++
+      if (calls === 1) return new Response('upstream down', { status: 500, headers: { 'content-type': 'text/plain' } })
+      return new Response(JSON.stringify({ id: 'r1', choices: [{ message: { content: 'ok' } }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    },
+    async (base) => {
+      assert.equal((await proxy(base)).status, 500)
+      const open = await proxy(base)
+      assert.equal(open.status, 503)
+      assert.equal((await open.json()).error.code, 'provider_circuit_open')
+      assert.equal(calls, 1, 'circuit-open request does not reach upstream')
+      await new Promise((resolve) => setTimeout(resolve, 1100))
+      assert.equal((await proxy(base)).status, 200)
+      assert.equal(calls, 2, 'half-open probe reaches upstream once')
+    },
+    { 'deepseek-key-1': 'sk-first' }
+  )
+})
+
 test('worker key pool handlers add, update and remove keys without resurrecting them', async () => {
   const store = new Map()
   const secrets = new Map()
   const handlers = new Map()
   const seed = normalizeConfig({
     providers: [{ ...deepseekProvider, keys: [{ id: 'seed', secretKey: 'deepseek-seed', enabled: true }] }],
-    defaultProvider: 'deepseek',
     defaultFallback: { mode: 'retry', models: [], retryCount: 0 },
+    retries: 0,
     routes: [],
     aliases: {},
     clientKeys: [],
@@ -1283,6 +2101,16 @@ test('worker key pool handlers add, update and remove keys without resurrecting 
   assert.equal(added.priority, 2)
   assert.deepEqual(added.limits, { rpm: 10 })
 
+  await call('router.key.update', {
+    provider: 'deepseek',
+    secretKey: 'deepseek-a',
+    id: 'Primary key',
+    value: 'sk-a-updated'
+  })
+  keys = await keysOf()
+  assert.equal(keys.find((key) => key.secretKey === 'deepseek-a').id, 'Primary key')
+  assert.equal(secrets.get('deepseek-a'), 'sk-a-updated')
+
   await call('router.key.update', { provider: 'deepseek', secretKey: 'deepseek-b', enabled: false, priority: 3 })
   keys = await keysOf()
   const updated = keys.find((key) => key.secretKey === 'deepseek-b')
@@ -1315,7 +2143,6 @@ const geminiProvider = {
 
 const geminiConfig = (overrides = {}) => testConfig({
   providers: [geminiProvider],
-  defaultProvider: 'google-gemini',
   defaultFallback: { mode: 'retry', models: [], retryCount: 0 },
   ...overrides
 })
@@ -1435,8 +2262,7 @@ test('streams a Gemini response to an OpenAI client without leaking a stream fla
 
 test('forwards a buffered upstream error instead of faking a stream', async () => {
   const config = testConfig({
-    providers: [{ name: 'openai', baseUrl: 'https://api.openai.com/v1', protocols: ['openai'], models: [{ id: 'gpt-4o' }], keys: [] }],
-    defaultProvider: 'openai'
+    providers: [{ name: 'openai', baseUrl: 'https://api.openai.com/v1', protocols: ['openai'], models: [{ id: 'gpt-4o' }], keys: [] }]
   })
   await withSidecar(config, async () => new Response(
     JSON.stringify({ error: { message: 'upstream rejected the payload' } }),
@@ -1614,10 +2440,10 @@ test('convertOmniRouteConfig converts nodes, connections, combos, and aliases', 
   assert.equal(anthropic.keys[0].priority, 1)
   assert.equal(anthropic.keys[0].limits.rpm, 60)
 
-  assert.equal(result.config.routes.length, 1)
-  assert.equal(result.config.routes[0].name, 'Combo: coding-combo')
-  assert.equal(result.config.routes[0].rewrites[0].value, 'anthropic/claude-3-7-sonnet')
-  assert.deepEqual(result.config.routes[0].fallback.models, ['openai/gpt-4o'])
+  assert.equal(result.config.policies.length, 1)
+  assert.equal(result.config.policies[0].name, 'Combo: coding-combo')
+  assert.equal(result.config.policies[0].rewrites[0].value, 'anthropic/claude-3-7-sonnet')
+  assert.deepEqual(result.config.policies[0].fallback.models, ['openai/gpt-4o'])
 
   assert.equal(result.config.aliases['coding-combo'], 'anthropic/claude-3-7-sonnet')
   assert.equal(result.config.aliases['dev-fast'], 'ollama-node/llama3')
@@ -1702,7 +2528,7 @@ test('provider auth does not forward client gateway credentials upstream', async
 
 test('parses HTTP-date Retry-After values', async () => {
   let calls = 0
-  const config = testConfig({ defaultFallback: { mode: 'retry', models: [], retryCount: 1 }, baseDelayMs: 1 })
+  const config = testConfig({ retries: 1, baseDelayMs: 1 })
   const started = Date.now()
   await withSidecar(config, async () => {
     calls++
@@ -1970,4 +2796,482 @@ test('translates Anthropic thinking to OpenAI reasoning_effort and maps reasonin
   assert.equal(anthropicRes.content[0].thinking, 'step 1: compute 6 * 7')
   assert.equal(anthropicRes.content[1].type, 'text')
   assert.equal(anthropicRes.content[1].text, 'answer is 42')
+})
+
+// ---------------------------------------------------------------------------
+// Opt-in request optimization: compression, context relay, response cache.
+// ---------------------------------------------------------------------------
+
+function postJson(base, body, headers = {}) {
+  return fetch(`${base}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...headers },
+    body: JSON.stringify(body)
+  })
+}
+
+test('compression normalization clamps modes and sizes', () => {
+  assert.deepEqual(normalizeCompression(), {
+    enabled: false,
+    mode: 'lite',
+    minChars: 2000,
+    keepRecentMessages: 4,
+    toolResults: true,
+    systemPrompt: false,
+    toolMaxChars: 4000,
+    messageMaxChars: 2000
+  })
+  const normalized = normalizeCompression({ enabled: true, mode: 'nope', minChars: -1, keepRecentMessages: 500, toolMaxChars: 1 })
+  assert.equal(normalized.mode, 'lite')
+  assert.equal(normalized.minChars, 0)
+  assert.equal(normalized.keepRecentMessages, 100)
+  assert.equal(normalized.toolMaxChars, 200)
+})
+
+test('compression preserves code fences and recent turns while capping old tool output', () => {
+  const code = '```js\nconst x = 1;\n\n\n\nconst y = 2;\n```'
+  const body = {
+    model: 'm',
+    messages: [
+      { role: 'system', content: 'system prompt' },
+      { role: 'user', content: `Please inspect:\n${code}\n${'a'.repeat(400)}` },
+      { role: 'tool', content: 'tool line\n'.repeat(400) },
+      { role: 'user', content: 'recent turn' }
+    ]
+  }
+  const result = compressChatBody(body, {
+    protocol: 'openai',
+    options: { enabled: true, mode: 'standard', minChars: 0, keepRecentMessages: 1, toolMaxChars: 300 }
+  })
+  assert.equal(result.changed, true)
+  assert.ok(result.body.messages[1].content.includes(code), 'code fence is byte-perfect')
+  assert.ok(result.body.messages[2].content.includes('chars omitted by Orca LLM Router'))
+  assert.equal(result.body.messages[3].content, 'recent turn')
+  assert.equal(body.messages[2].content, 'tool line\n'.repeat(400), 'input body is not mutated')
+})
+
+test('aggressive compression shortens old prose but never tool structure', () => {
+  const body = {
+    model: 'm',
+    messages: [
+      { role: 'user', content: `old ${'word '.repeat(400)}` },
+      { role: 'assistant', content: null, tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'read', arguments: '{"path":"a"}' } }] },
+      { role: 'tool', content: `result ${'z'.repeat(400)}` },
+      { role: 'user', content: 'latest' }
+    ]
+  }
+  const result = compressChatBody(body, {
+    protocol: 'openai',
+    options: { enabled: true, mode: 'aggressive', minChars: 0, keepRecentMessages: 1, messageMaxChars: 120, toolMaxChars: 200 }
+  })
+  assert.ok(result.body.messages[0].content.includes('chars omitted'))
+  assert.equal(result.body.messages[1].tool_calls[0].id, 'call_1')
+  assert.ok(result.body.messages[2].content.includes('chars omitted'))
+  assert.equal(result.body.messages[3].content, 'latest')
+})
+
+test('anthropic compression leaves tool_use input and recent turns intact', () => {
+  const body = {
+    model: 'claude',
+    system: 'sys',
+    messages: [
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: `old ${'p'.repeat(500)}` },
+          { type: 'tool_result', tool_use_id: 't1', content: `tool ${'q'.repeat(500)}` }
+        ]
+      },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'read', input: { path: 'a' } }] },
+      { role: 'user', content: [{ type: 'text', text: 'recent' }] }
+    ]
+  }
+  const result = compressChatBody(body, {
+    protocol: 'anthropic',
+    options: { enabled: true, mode: 'aggressive', minChars: 0, keepRecentMessages: 1, messageMaxChars: 120, toolMaxChars: 150 }
+  })
+  const first = result.body.messages[0].content
+  assert.ok(first[0].text.includes('chars omitted'))
+  assert.ok(first[1].content.includes('chars omitted'))
+  assert.deepEqual(result.body.messages[1].content[0].input, { path: 'a' })
+  assert.equal(result.body.messages[2].content[0].text, 'recent')
+})
+
+test('context relay digests old turns and keeps the recent window', () => {
+  assert.equal(normalizeContextRelay().trigger, 'failover')
+  const body = {
+    model: 'm',
+    messages: [
+      { role: 'system', content: `system stays ${'s'.repeat(300)}` },
+      { role: 'user', content: 'first line\nsecond line that is long' },
+      { role: 'tool', content: 'tool output '.repeat(100) },
+      { role: 'user', content: 'recent question' }
+    ]
+  }
+  const result = relayChatBody(body, {
+    protocol: 'openai',
+    options: { enabled: true, keepRecentMessages: 1, digestChars: 40 }
+  })
+  assert.equal(result.changed, true)
+  assert.equal(result.body.messages[0].content, `system stays ${'s'.repeat(300)}`)
+  assert.match(result.body.messages[1].content, /^\[handoff\] first line/)
+  assert.match(result.body.messages[2].content, /^\[handoff tool result:/)
+  assert.equal(result.body.messages[3].content, 'recent question')
+})
+
+test('cache keys ignore the stream flag but include scope, body, and stream options', () => {
+  const scope = 'openai\u0000stream\u0000deepseek\u0000deepseek-chat'
+  const base = { model: 'deepseek-chat', messages: [{ role: 'user', content: 'hi' }], stream_options: { include_usage: true } }
+  const streamed = canonicalCacheKey({ scope, body: { ...base, stream: true } })
+  const buffered = canonicalCacheKey({ scope, body: { ...base, stream: false } })
+  assert.equal(streamed, buffered)
+  assert.notEqual(streamed, canonicalCacheKey({ scope, body: { ...base, stream: false, stream_options: { include_usage: false } } }))
+  assert.notEqual(streamed, canonicalCacheKey({ scope: 'other', body: base }))
+  assert.notEqual(streamed, canonicalCacheKey({ scope, body: { ...base, messages: [{ role: 'user', content: 'bye' }] } }))
+})
+
+test('cosine similarity and cache normalization behave predictably', () => {
+  assert.equal(cosineSimilarity([1, 0], [1, 0]), 1)
+  assert.equal(cosineSimilarity([1, 0], [0, 1]), 0)
+  assert.equal(cosineSimilarity([1], [1, 0]), 0)
+  const cache = normalizeResponseCache({ enabled: true, ttlMs: 1, maxEntries: 0, threshold: 2 })
+  assert.equal(cache.ttlMs, 10_000)
+  assert.equal(cache.maxEntries, 1)
+  assert.equal(cache.threshold, 1)
+})
+
+test('semantic params keys ignore prompt wording but keep generation settings', () => {
+  const base = {
+    model: 'deepseek-chat',
+    messages: [{ role: 'system', content: 'be terse' }, { role: 'user', content: 'explain this code' }],
+    temperature: 0,
+    max_tokens: 128,
+    stop: ['\n\n']
+  }
+  const reworded = {
+    ...base,
+    messages: [{ role: 'system', content: 'be terse' }, { role: 'user', content: 'explain that code' }]
+  }
+  assert.equal(semanticParamsKey(base, 'openai'), semanticParamsKey(reworded, 'openai'))
+  assert.notEqual(semanticParamsKey(base, 'openai'), semanticParamsKey({ ...base, max_tokens: 256 }, 'openai'))
+  assert.notEqual(semanticParamsKey(base, 'openai'), semanticParamsKey({ ...base, temperature: 0.7 }, 'openai'))
+  assert.notEqual(semanticParamsKey(base, 'openai'), semanticParamsKey({ ...base, stop: ['END'] }, 'openai'))
+  assert.notEqual(
+    semanticParamsKey(base, 'openai'),
+    semanticParamsKey({ ...base, messages: [...base.messages, { role: 'assistant', content: 'prior answer' }] }, 'openai')
+  )
+  const withToolCall = {
+    ...base,
+    messages: [...base.messages, { role: 'assistant', tool_calls: [{ id: '1', type: 'function', function: { name: 'lookup', arguments: '{"id":1}' } }] }]
+  }
+  assert.notEqual(
+    semanticParamsKey(withToolCall, 'openai'),
+    semanticParamsKey({
+      ...withToolCall,
+      messages: [...base.messages, { role: 'assistant', tool_calls: [{ id: '1', type: 'function', function: { name: 'lookup', arguments: '{"id":2}' } }] }]
+    }, 'openai')
+  )
+  // A model change is already part of the cache scope; it must not be the only
+  // difference that creates a new params key.
+  assert.equal(semanticParamsKey(base, 'openai'), semanticParamsKey({ ...base, model: 'other' }, 'openai'))
+})
+
+test('cache eligibility skips tools, images, hot requests, and per-request opt-out', () => {
+  const options = normalizeResponseCache({ enabled: true, maxTemperature: 0 })
+  const plain = { protocol: 'openai', headers: {}, options, body: { messages: [{ role: 'user', content: 'hello' }] } }
+  assert.equal(shouldCacheRequest(plain), true)
+  assert.equal(shouldCacheRequest({ ...plain, body: { messages: [{ role: 'user', content: 'hello' }], tools: [{ type: 'function', function: { name: 'x' } }] } }), false)
+  assert.equal(shouldCacheRequest({ ...plain, body: { messages: [{ role: 'tool', content: 'result' }] } }), false)
+  assert.equal(shouldCacheRequest({ ...plain, body: { messages: [{ role: 'assistant', tool_calls: [{ id: '1' }] }] } }), false)
+  assert.equal(shouldCacheRequest({ ...plain, body: { messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,x' } }] }] } }), false)
+  assert.equal(shouldCacheRequest({ ...plain, body: { messages: [{ role: 'user', content: 'hello' }], temperature: 0.7 } }), false)
+  assert.equal(shouldCacheRequest({ ...plain, headers: { 'x-router-cache': 'off' } }), false)
+  assert.equal(shouldCacheRequest({
+    ...plain,
+    protocol: 'gemini',
+    body: { contents: [{ parts: [{ functionCall: { name: 'x' } }] }] }
+  }), false)
+})
+
+test('response cache replays an exact non-streaming response without calling upstream', async () => {
+  const config = pooledConfig([{ id: 'k', secretKey: 'deepseek-key-1', enabled: true }])
+  config.responseCache = normalizeResponseCache({ enabled: true, mode: 'exact', ttlMs: 60_000, maxEntries: 10 })
+  let calls = 0
+  await withSidecar(
+    config,
+    async () => {
+      calls++
+      return new Response(
+        JSON.stringify({ id: 'r1', choices: [{ message: { content: 'cached answer' } }], usage: { prompt_tokens: 4, completion_tokens: 2 } }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      )
+    },
+    async (base, sidecar) => {
+      const body = { model: 'deepseek/deepseek-chat', messages: [{ role: 'user', content: 'same request' }] }
+      const first = await postJson(base, body)
+      const firstText = await first.text()
+      const second = await postJson(base, body)
+      const secondText = await second.text()
+      assert.equal(first.status, 200)
+      assert.equal(second.status, 200)
+      assert.equal(second.headers.get('x-router-cache'), 'hit')
+      assert.equal(secondText, firstText)
+      assert.equal(calls, 1)
+      assert.equal(sidecar.stats.cacheHits, 1)
+      assert.equal(sidecar.stats.cacheSavedTokens, 6)
+      const usage = sidecar.usage({ window: 'today' })
+      assert.equal(usage.cacheHits, 1)
+      assert.equal(usage.cacheSavedTokens, 6)
+      const firstHeaders = await Promise.resolve(first.headers.get('x-router-cache'))
+      assert.notEqual(firstHeaders, 'hit')
+    },
+    { 'deepseek-key-1': 'secret' }
+  )
+})
+
+test('response cache stores and replays raw streaming SSE', async () => {
+  const config = pooledConfig([{ id: 'k', secretKey: 'deepseek-key-1', enabled: true }])
+  config.responseCache = normalizeResponseCache({ enabled: true, mode: 'exact', ttlMs: 60_000, maxEntries: 10 })
+  const sse = [
+    'data: {"id":"r1","choices":[{"delta":{"content":"hello"}}]}\n\n',
+    'data: {"id":"r1","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2}}\n\n',
+    'data: [DONE]\n\n'
+  ].join('')
+  let calls = 0
+  await withSidecar(
+    config,
+    async () => {
+      calls++
+      return new Response(sse, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    },
+    async (base) => {
+      const body = { model: 'deepseek/deepseek-chat', stream: true, messages: [{ role: 'user', content: 'stream me' }] }
+      const first = await postJson(base, body)
+      const firstText = await first.text()
+      const second = await postJson(base, body)
+      const secondText = await second.text()
+      assert.equal(first.status, 200)
+      assert.equal(second.status, 200)
+      assert.equal(second.headers.get('x-router-cache'), 'hit')
+      assert.equal(secondText, firstText)
+      assert.match(secondText, /\[DONE\]/)
+      assert.equal(calls, 1)
+    },
+    { 'deepseek-key-1': 'secret' }
+  )
+})
+
+test('semantic cache mode matches near-identical prompts through an embedding provider', async () => {
+  const config = pooledConfig([{ id: 'k', secretKey: 'deepseek-key-1', enabled: true }])
+  config.responseCache = normalizeResponseCache({
+    enabled: true,
+    mode: 'semantic',
+    ttlMs: 60_000,
+    maxEntries: 10,
+    threshold: 0.9,
+    embeddingProvider: 'deepseek',
+    embeddingModel: 'embed-small'
+  })
+  let chatCalls = 0
+  let embeddingCalls = 0
+  await withSidecar(
+    config,
+    async (url) => {
+      if (String(url).includes('/embeddings')) {
+        embeddingCalls++
+        return new Response(JSON.stringify({ data: [{ embedding: [1, 0, 0] }] }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' }
+        })
+      }
+      chatCalls++
+      return new Response(
+        JSON.stringify({ id: 'r1', choices: [{ message: { content: 'semantic answer' } }], usage: { prompt_tokens: 4, completion_tokens: 2 } }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      )
+    },
+    async (base) => {
+      const firstBody = { model: 'deepseek/deepseek-chat', messages: [{ role: 'user', content: 'explain this code' }] }
+      const first = await postJson(base, firstBody)
+      const firstText = await first.text()
+      const second = await postJson(base, { model: 'deepseek/deepseek-chat', messages: [{ role: 'user', content: 'explain that code' }] })
+      const secondText = await second.text()
+      assert.equal(second.headers.get('x-router-cache'), 'semantic-hit')
+      assert.equal(secondText, firstText)
+      assert.equal(chatCalls, 1)
+      assert.equal(embeddingCalls, 2)
+      // A near-identical prompt with different generation settings must not
+      // reuse the stored answer.
+      const different = await postJson(base, {
+        model: 'deepseek/deepseek-chat',
+        messages: [{ role: 'user', content: 'explain that code' }],
+        max_tokens: 64
+      })
+      assert.notEqual(different.headers.get('x-router-cache'), 'semantic-hit')
+      assert.equal(chatCalls, 2)
+      assert.equal(embeddingCalls, 3)
+      // An exact repeat of the original prompt is reported as an exact hit and
+      // must not call the embedding provider again.
+      const third = await postJson(base, firstBody)
+      assert.equal(third.headers.get('x-router-cache'), 'hit')
+      assert.equal(await third.text(), firstText)
+      assert.equal(embeddingCalls, 3)
+      assert.equal(chatCalls, 2)
+    },
+    { 'deepseek-key-1': 'secret' }
+  )
+})
+
+test('x-router-cache: off bypasses the response cache', async () => {
+  const config = pooledConfig([{ id: 'k', secretKey: 'deepseek-key-1', enabled: true }])
+  config.responseCache = normalizeResponseCache({ enabled: true, mode: 'exact', ttlMs: 60_000, maxEntries: 10 })
+  let calls = 0
+  await withSidecar(
+    config,
+    async () => {
+      calls++
+      return new Response(
+        JSON.stringify({ id: 'r1', choices: [{ message: { content: 'ok' } }], usage: { prompt_tokens: 1, completion_tokens: 1 } }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      )
+    },
+    async (base) => {
+      const body = { model: 'deepseek/deepseek-chat', messages: [{ role: 'user', content: 'bypass' }] }
+      assert.equal((await postJson(base, body)).status, 200)
+      const bypassed = await postJson(base, body, { 'x-router-cache': 'off' })
+      assert.equal(bypassed.status, 200)
+      assert.equal(bypassed.headers.get('x-router-cache'), 'bypass')
+      assert.equal(calls, 2)
+    },
+    { 'deepseek-key-1': 'secret' }
+  )
+})
+
+test('context relay compacts older turns on failover and keeps the recent window', async () => {
+  const primary = {
+    name: 'primary',
+    baseUrl: 'https://primary.test/v1',
+    protocols: ['openai'],
+    models: [{ id: 'm' }],
+    keys: [{ id: 'p', secretKey: 'primary-key' }]
+  }
+  const secondary = {
+    name: 'secondary',
+    baseUrl: 'https://secondary.test/v1',
+    protocols: ['openai'],
+    models: [{ id: 'm' }],
+    keys: [{ id: 's', secretKey: 'secondary-key' }]
+  }
+  const config = testConfig({
+    providers: [primary, secondary],
+    routes: [{
+      name: 'relay',
+      targets: [{ provider: 'primary', model: 'm' }, { provider: 'secondary', model: 'm' }],
+      strategy: 'ordered',
+      retries: 0
+    }],
+    contextRelay: { enabled: true, trigger: 'failover', keepRecentMessages: 1, digestChars: 40 },
+    retries: 0
+  })
+  const bodies = []
+  await withSidecar(
+    config,
+    async (url, init) => {
+      bodies.push(JSON.parse(init.body))
+      if (String(url).includes('primary.test')) {
+        return new Response(JSON.stringify({ error: { message: 'boom' } }), {
+          status: 500,
+          headers: { 'content-type': 'application/json' }
+        })
+      }
+      return new Response(
+        JSON.stringify({ id: 'r1', choices: [{ message: { content: 'ok' } }], usage: { prompt_tokens: 1, completion_tokens: 1 } }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      )
+    },
+    async (base) => {
+      const response = await postJson(base, {
+        model: 'relay',
+        messages: [
+          { role: 'system', content: 'system stays' },
+          { role: 'user', content: 'first line\nsecond line that is long' },
+          { role: 'tool', content: 'tool output '.repeat(80) },
+          { role: 'user', content: 'recent question' }
+        ]
+      })
+      assert.equal(response.status, 200)
+      assert.equal(response.headers.get('x-router-context-relay')?.startsWith('compacted'), true)
+      assert.equal(bodies.length, 2)
+      assert.equal(bodies[0].messages[1].content, 'first line\nsecond line that is long')
+      assert.match(bodies[1].messages[1].content, /^\[handoff\] first line/)
+      assert.match(bodies[1].messages[2].content, /^\[handoff tool result:/)
+      assert.equal(bodies[1].messages[0].content, 'system stays')
+      assert.equal(bodies[1].messages[3].content, 'recent question')
+    },
+    { 'primary-key': 'p-secret', 'secondary-key': 's-secret' }
+  )
+})
+
+test('compression runs before forwarding and honors the per-request off switch', async () => {
+  const config = pooledConfig([{ id: 'k', secretKey: 'deepseek-key-1', enabled: true }])
+  config.compression = normalizeCompression({ enabled: true, mode: 'standard', minChars: 0, keepRecentMessages: 1, toolMaxChars: 200 })
+  const bodies = []
+  await withSidecar(
+    config,
+    async (url, init) => {
+      bodies.push(JSON.parse(init.body))
+      return new Response(
+        JSON.stringify({ id: 'r1', choices: [{ message: { content: 'ok' } }], usage: { prompt_tokens: 1, completion_tokens: 1 } }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      )
+    },
+    async (base) => {
+      const body = {
+        model: 'deepseek/deepseek-chat',
+        messages: [
+          { role: 'tool', content: 'tool line\n'.repeat(100) },
+          { role: 'user', content: 'recent' }
+        ]
+      }
+      const compressed = await postJson(base, body)
+      assert.equal(compressed.status, 200)
+      assert.equal(compressed.headers.get('x-router-compression')?.startsWith('standard'), true)
+      assert.match(bodies[0].messages[0].content, /chars omitted/)
+      const skipped = await postJson(base, body, { 'x-router-compression': 'off' })
+      assert.equal(skipped.status, 200)
+      assert.equal(bodies[1].messages[0].content, 'tool line\n'.repeat(100))
+    },
+    { 'deepseek-key-1': 'secret' }
+  )
+})
+
+test('compression leaves machine-readable JSON tool output untouched', () => {
+  const payload = '{\n  "a": 1,  \n  "b": 2\n}'
+  const body = {
+    model: 'm',
+    messages: [
+      { role: 'tool', content: payload },
+      { role: 'user', content: 'recent' }
+    ]
+  }
+  const result = compressChatBody(body, {
+    protocol: 'openai',
+    options: { enabled: true, mode: 'aggressive', minChars: 0, keepRecentMessages: 1, toolMaxChars: 50 }
+  })
+  assert.equal(result.changed, false)
+  assert.equal(result.body, body)
+  assert.equal(body.messages[0].content, payload)
+})
+
+test('compression leaves a bare Responses input string and instructions alone by default', () => {
+  const input = 'live prompt '.repeat(400)
+  const body = { model: 'm', input, instructions: 'system instructions' }
+  const result = compressChatBody(body, {
+    protocol: 'responses',
+    options: { enabled: true, mode: 'aggressive', minChars: 0, messageMaxChars: 100 }
+  })
+  assert.equal(result.changed, false)
+  assert.equal(result.body, body)
+  assert.equal(body.input, input)
+  assert.equal(body.instructions, 'system instructions')
 })

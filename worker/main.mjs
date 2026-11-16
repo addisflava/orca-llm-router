@@ -52,6 +52,8 @@ let sidecar = null
 let config = null
 let settings = { enabled: true, port: 18080, bindHost: '127.0.0.1', timeoutMs: 600000, retries: 2, baseDelayMs: 200 }
 const secretsCache = new Map()
+const keyUsageCache = new Map()
+const KEY_USAGE_TTL_MS = 60_000
 let boundAddress = null
 let installedAgentsCache = null
 
@@ -127,6 +129,11 @@ export function panelLogEntry(entry) {
       cache: entry.tokens.cache != null ? Number(entry.tokens.cache) : undefined
     } : null,
     cost: entry.cost != null ? Number(entry.cost) : null,
+    compression: entry.compression ?? null,
+    relay: entry.relay ?? null,
+    cache: entry.cache ?? null,
+    cacheSavedTokens: entry.cacheSavedTokens != null ? Number(entry.cacheSavedTokens) : undefined,
+    cacheSavedCost: entry.cacheSavedCost != null ? Number(entry.cacheSavedCost) : undefined,
     error: typeof entry.error === 'string' ? entry.error.slice(0, 256) : undefined
   }
 }
@@ -250,7 +257,13 @@ const CODEX_CONFIG_MARKER_BEGIN = '# BEGIN Orca LLM Router managed profile'
 const CODEX_CONFIG_MARKER_END = '# END Orca LLM Router managed profile'
 const CODEX_PROVIDER_MARKER_BEGIN = '# BEGIN Orca LLM Router managed Codex provider'
 const CODEX_PROVIDER_MARKER_END = '# END Orca LLM Router managed Codex provider'
-const CODEX_MANAGED_TOP_LEVEL = ['model', 'model_provider', 'model_catalog_json', 'model_reasoning_effort']
+// Top-level keys the router captures into the storage backup on first apply:
+// the always-owned routing keys, plus the optional `model` pin and reasoning
+// effort it wrote for older installs. buildCodexManagedConfig strips only the
+// keys it actually writes this time; restoreCodexGlobal strips the
+// always-owned keys and re-inserts the backup, never duplicating.
+const CODEX_CAPTURE_TOP_LEVEL = ['model', 'model_provider', 'model_catalog_json', 'model_reasoning_effort']
+const CODEX_OWNED_TOP_LEVEL = ['model_provider', 'model_catalog_json']
 const CODEX_CONFIG_BACKUP_KEY = 'router.codexConfigBackup'
 let lastCodexCatalogJson = null
 let activeOrca = null
@@ -372,20 +385,26 @@ function stripTopLevelKeys(text, keys) {
 }
 
 // Build the managed Codex config. The profile keys must come before any table,
-// so the profile block is prepended and the provider table appended.
+// so the profile block is prepended and the provider table appended. Only the
+// keys we claim are stripped from the user's text: routing keys always, plus a
+// model pin or reasoning effort only when we were given one. The router never
+// picks Codex's model on its own; a profile model is an explicit opt-in.
 export function buildCodexManagedConfig(text, { base, token, catalogPath, model, reasoningEffort }) {
+  const effort = reasoningEffort
+    ? (['low', 'medium', 'high'].includes(String(reasoningEffort)) ? String(reasoningEffort) : 'high')
+    : ''
+  const owned = [...CODEX_OWNED_TOP_LEVEL, ...(model ? ['model'] : []), ...(effort ? ['model_reasoning_effort'] : [])]
   let clean = stripCodexManagedBlocks(text)
   clean = stripTomlTable(clean, 'model_providers.orca-router')
-  clean = stripTopLevelKeys(clean, CODEX_MANAGED_TOP_LEVEL)
+  clean = stripTopLevelKeys(clean, owned)
   clean = clean.replace(/^\n+/, '').replace(/\n+$/, '')
-  const effort = ['low', 'medium', 'high'].includes(String(reasoningEffort)) ? String(reasoningEffort) : 'high'
   const baseUrl = `${String(base).replace(/\/+$/, '').replace(/\/v1$/, '')}/v1`
   const profile = [
     CODEX_CONFIG_MARKER_BEGIN,
-    `model = ${tomlQuoted(model)}`,
+    ...(model ? [`model = ${tomlQuoted(model)}`] : []),
     'model_provider = "orca-router"',
     `model_catalog_json = ${tomlQuoted(catalogPath)}`,
-    `model_reasoning_effort = ${tomlQuoted(effort)}`,
+    ...(effort ? [`model_reasoning_effort = ${tomlQuoted(effort)}`] : []),
     CODEX_CONFIG_MARKER_END
   ].join('\n')
   const provider = [
@@ -418,7 +437,7 @@ function writeCodexConfigFile(path, text) {
 }
 
 export async function applyCodexGlobal(orca, options) {
-  if (!orca || !options?.model || !options?.catalogPath) return null
+  if (!orca || !options?.catalogPath) return null
   const { path, text: current } = readCodexConfigFile()
   const managed = current.includes(CODEX_CONFIG_MARKER_BEGIN) || current.includes('[model_providers.orca-router]')
   const stored = await storageGet(orca, CODEX_CONFIG_BACKUP_KEY)
@@ -435,7 +454,7 @@ export async function applyCodexGlobal(orca, options) {
     // router was stopped still wins.
     const mergedKeys = {
       ...(backup?.keys ?? {}),
-      ...extractTopLevelKeys(current, CODEX_MANAGED_TOP_LEVEL)
+      ...extractTopLevelKeys(current, CODEX_CAPTURE_TOP_LEVEL)
     }
     const providerTable =
       backup?.providerTable ?? extractTomlTable(current, 'model_providers.orca-router')
@@ -489,10 +508,12 @@ export async function restoreCodexGlobal(orca) {
   if (!managed && !backup) return false
   let next = stripCodexManagedBlocks(current)
   next = stripTomlTable(next, 'model_providers.orca-router')
-  next = stripTopLevelKeys(next, CODEX_MANAGED_TOP_LEVEL)
+  next = stripTopLevelKeys(next, CODEX_OWNED_TOP_LEVEL)
   next = next.replace(/^\n+/, '').replace(/\n+$/, '')
   if (backup) {
-    const keyLines = Object.values(backup.keys ?? {}).filter(Boolean)
+    const entries = Object.entries(backup.keys ?? {}).filter(([, value]) => typeof value === 'string' && value)
+    const present = extractTopLevelKeys(next, entries.map(([key]) => key))
+    const keyLines = entries.filter(([key]) => !(key in present)).map(([, value]) => value)
     if (keyLines.length) next = `${keyLines.join('\n')}\n\n${next}`
     if (backup.providerTable) next = `${next ? `${next}\n\n` : ''}${backup.providerTable}`
   }
@@ -691,6 +712,67 @@ async function refreshSecrets(orca) {
   }
 }
 
+// Older provider entries predate usage scrapers in the preset catalog. Match
+// those by base URL so existing installs get per-key quota without forcing the
+// user to delete and re-add the provider. Never match on display name: a
+// custom proxy could share a preset's label and must not receive its key.
+function usageFetchForProvider(provider) {
+  if (provider.usageFetch) return provider.usageFetch
+  const baseUrl = String(provider.baseUrl ?? provider.endpoints?.[0]?.baseUrl ?? '').replace(/\/+$/, '')
+  if (!baseUrl) return undefined
+  const preset = PROVIDER_PRESETS.find((item) => item.usage && String(item.baseUrl ?? '').replace(/\/+$/, '') === baseUrl)
+  if (!preset) return undefined
+  return { enabled: true, connectors: [{ id: preset.id, type: 'http-json', ...preset.usage }] }
+}
+
+// Provider-reported quota is fetched per credential, not per provider: a plan
+// key can have its own rolling window. The cache keeps the 5-second panel poll
+// from hammering usage endpoints; each key is refreshed at most once a minute.
+async function providerKeyUsage(provider, { force = false } = {}) {
+  const usageFetch = usageFetchForProvider(provider)
+  const connectors = usageFetch?.enabled === false ? [] : (usageFetch?.connectors ?? [])
+  if (!connectors.length) return { provider: provider.name, keys: [] }
+  const meteredProvider = usageFetch === provider.usageFetch ? provider : { ...provider, usageFetch }
+  const now = Date.now()
+  if (keyUsageCache.size > 1000) {
+    for (const [id, entry] of keyUsageCache) if (now - entry.at > KEY_USAGE_TTL_MS) keyUsageCache.delete(id)
+  }
+  const keys = await Promise.all((provider.keys ?? []).filter((key) => key.secretKey).map(async (key) => {
+    const cacheKey = `${provider.name}\u0000${key.secretKey}`
+    const cached = keyUsageCache.get(cacheKey)
+    if (!force && cached && now - cached.at < KEY_USAGE_TTL_MS) return cached.value
+    let value
+    try {
+      const result = await fetchProviderUsage(meteredProvider, {
+        getSecret: (secretKey) => secretsCache.get(secretKey) ?? null,
+        secretKey: key.secretKey
+      })
+      value = {
+        id: key.id,
+        secretKey: key.secretKey,
+        enabled: key.enabled !== false,
+        status: result.status,
+        meters: result.meters,
+        errors: result.errors,
+        fetchedAt: now
+      }
+    } catch (error) {
+      value = {
+        id: key.id,
+        secretKey: key.secretKey,
+        enabled: key.enabled !== false,
+        status: 'error',
+        meters: [],
+        errors: [{ message: String(error?.message ?? error) }],
+        fetchedAt: now
+      }
+    }
+    keyUsageCache.set(cacheKey, { at: now, value })
+    return value
+  }))
+  return { provider: provider.name, keys }
+}
+
 async function refreshSettings(orca) {
   const wasEnabled = settings.enabled
   try {
@@ -786,6 +868,7 @@ function validateConfig(next) {
     if (!provider.baseUrl && !provider.endpoints?.length) return `provider ${provider.name} needs a baseUrl`
   }
   if (!Array.isArray(next?.routes)) return 'routes must be an array'
+  if (!Array.isArray(next?.policies)) return 'policies must be an array'
   if (!Array.isArray(next?.clientKeys)) return 'clientKeys must be an array'
   if (!Array.isArray(next?.agentProfiles)) return 'agentProfiles must be an array'
   if (next.aliases && typeof next.aliases !== 'object') return 'aliases must be an object'
@@ -816,12 +899,29 @@ async function mergeSecretsIntoConfig(next, previous, preserveMissingKeys = true
   }
 }
 
+// Report chains that were just converted into routes. The panel shows
+// the same entries from config.migration; this keeps the worker log useful
+// when a config arrives through import or an older build.
+function logMigrationSummary(previous, next) {
+  const key = (entry) => `${entry.kind}:${entry.from}:${entry.to}`
+  const before = new Set((previous?.migration ?? []).map(key))
+  for (const entry of next?.migration ?? []) {
+    if (before.has(key(entry))) continue
+    console.info(
+      `[llm-router] migrated ${entry.kind} '${entry.from}' to route '${entry.to}'` +
+      ` (${entry.targets?.length ?? 0} target(s))${entry.note ? `: ${entry.note}` : ''}`
+    )
+  }
+}
+
 async function persistConfig(orca, next, options = {}) {
+  const previous = config
   const normalized = normalizeConfig(next)
   await mergeSecretsIntoConfig(normalized, config, options.preserveMissingKeys !== false)
   // Key pools may have been restored above; derive the provider flag from them
   // so a keyed provider is on exactly when one of its keys is on.
   config = jsonSafe(normalizeConfig(normalized))
+  logMigrationSummary(previous, config)
   await orca.storage.set(CONFIG_KEY, config)
   await refreshSecrets(orca)
   // Keep the model list a plain `opencode` terminal sees in sync with provider
@@ -843,6 +943,7 @@ export default async function activate(orca) {
   } else {
     config = jsonSafe(normalizeConfig(structuredClone(DEFAULT_CONFIG)))
   }
+  logMigrationSummary(stored.ok ? stored.value : null, config)
   if (stored.ok) await orca.storage.set(CONFIG_KEY, config).catch(() => {})
   await refreshSettings(orca)
   await refreshSecrets(orca)
@@ -1053,7 +1154,6 @@ export default async function activate(orca) {
     }
     const next = structuredClone(config)
     next.providers.push(provider)
-    if (!next.defaultProvider) next.defaultProvider = provider.name
     await persistConfig(orca, next)
     return { ok: true, provider: provider.name }
   })
@@ -1092,7 +1192,7 @@ export default async function activate(orca) {
     sidecar?.clearKeyCooldown?.(secretKey)
     return { ok: true, id: metadata.id, secretKey }
   })
-  orca.panels.handle('router.key.update', async ({ provider: name, secretKey, id, enabled, priority, weight, limits }) => {
+  orca.panels.handle('router.key.update', async ({ provider: name, secretKey, id, enabled, priority, weight, limits, value }) => {
     const next = structuredClone(config)
     const provider = next.providers.find((item) => item.name === name)
     if (!provider) {
@@ -1107,6 +1207,15 @@ export default async function activate(orca) {
       throw error
     }
     if (typeof enabled === 'boolean') key.enabled = enabled
+    if (typeof id === 'string' && id.trim()) key.id = id.trim()
+    if (typeof value === 'string' && value.trim()) {
+      if (!key.secretKey) {
+        const error = new Error('key has no secret name')
+        error.code = 'invalid_params'
+        throw error
+      }
+      await orca.secrets.set(key.secretKey, value.trim())
+    }
     if (Number.isFinite(Number(priority))) key.priority = Number(priority)
     if (typeof weight !== 'undefined' && Number.isFinite(Number(weight))) key.weight = Number(weight)
     if (limits && typeof limits === 'object' && !Array.isArray(limits)) key.limits = limits
@@ -1169,10 +1278,47 @@ export default async function activate(orca) {
     const models = await fetchModels({ baseUrl: resolvedBaseUrl, protocols: resolvedProtocols, key })
     return { ok: true, models, provider: name ?? null }
   })
-  orca.panels.handle('router.testUsage', async ({ provider: name }) => {
+  orca.panels.handle('router.discoverAllModels', async () => {
+    // Pull model ids from every configured provider in one pass, so the panel
+    // can offer one searchable list across providers. A provider that fails
+    // reports its error and contributes no models; the others are unaffected.
+    const providers = effectiveConfig().providers ?? []
+    const results = await Promise.all(
+      providers.map(async (provider) => {
+        const baseUrl = String(provider.baseUrl ?? provider.endpoints?.[0]?.baseUrl ?? '').trim()
+        if (!baseUrl) return { provider: provider.name, models: [], error: 'no base URL' }
+        const key = (provider.keys ?? []).map((entry) => secretsCache.get(entry.secretKey)).find(Boolean)
+        try {
+          const models = await fetchModels({
+            baseUrl,
+            protocols: provider.protocols ?? provider.capabilities ?? [],
+            key
+          })
+          return { provider: provider.name, models }
+        } catch (cause) {
+          return { provider: provider.name, models: [], error: String(cause?.message ?? cause) }
+        }
+      })
+    )
+    return { ok: true, providers: results }
+  })
+  orca.panels.handle('router.testUsage', async ({ provider: name, secretKey }) => {
     const provider = config.providers.find((item) => item.name === name)
     if (!provider) throw new Error(`unknown provider: ${name}`)
-    return fetchProviderUsage(provider, { getSecret: (secretKey) => secretsCache.get(secretKey) ?? null })
+    const usageFetch = usageFetchForProvider(provider)
+    const meteredProvider = usageFetch === provider.usageFetch ? provider : { ...provider, usageFetch }
+    return fetchProviderUsage(meteredProvider, { getSecret: (key) => secretsCache.get(key) ?? null, secretKey })
+  })
+  orca.panels.handle('router.keyUsage', async ({ provider: name, refresh } = {}) => {
+    const providers = (config?.providers ?? []).filter((provider) => !name || provider.name === name)
+    const results = await Promise.all(providers.map(async (provider) => {
+      try {
+        return await providerKeyUsage(provider, { force: refresh === true })
+      } catch {
+        return { provider: provider.name, keys: [] }
+      }
+    }))
+    return { providers: results.filter((result) => result.keys.length) }
   })
 
   // (debug handler removed)
@@ -1346,6 +1492,9 @@ async function testProviders(only) {
       results.push({ provider: provider.name, ok: false, status: null, message: 'no response', latencyMs: Date.now() - started })
     }
   }
+  // Feed the same samples real traffic records, so a manual speed test can
+  // prime health-aware failover for a provider that has been idle.
+  sidecar?.recordProbes?.(results)
   return { results }
 }
 

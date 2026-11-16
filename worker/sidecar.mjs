@@ -4,7 +4,8 @@
 // limits, gateway client API keys, request logging and usage accounting.
 //
 // Config shape (persisted by worker/main.mjs in Orca storage 'router.config'):
-//   token, providers[] (or legacy upstreams[]), routes[] (rules), aliases{},
+//   token, providers[] (or legacy upstreams[]), routes[] (the failover unit),
+//   policies[] (global request matchers), aliases{},
 //   defaultFallback, clientKeys[], agentProfiles[], timeoutMs, retries,
 //   baseDelayMs, logBodyCapture, exposeRoutingHeaders
 //
@@ -12,10 +13,13 @@
 //   { name, baseUrl?, endpoints?: [{baseUrl, protocols}], protocols: [...],
 //     models: [{id, description?}], keys: [{id, secretKey, enabled?, priority?,
 //     weight?, limits?, forwardClientAuth?}], enabled?, pricing?, usageFetch? }
-// Rule shape:
+// Route shape:
+//   { name, targets: [{provider, model}], strategy?:'ordered'|'fastest',
+//     enabled?, retries? }
+// Policy shape:
 //   { id?, name, enabled?, condition?: {source, field, operator, value},
 //     rewrites?: [{key, operation?, value?, match?}], model?,
-//     fallback?: {mode:'off'|'retry'|'model-chain', models?, retryCount?} }
+//     fallback?: {mode:'off'|'retry'|'model-chain'|'provider-chain', models?, retryCount?} }
 
 import { createServer } from 'node:http'
 import { createDecipheriv, scryptSync, createHash } from 'node:crypto'
@@ -23,14 +27,24 @@ import { DatabaseSync } from 'node:sqlite'
 import { existsSync, readFileSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { homedir } from 'node:os'
+import { createSchedulerState, normalizeCircuitBreaker, normalizeProviderHealth, normalizeScheduler, rankProviderTargets, retryAfterMs, selectScheduledKey } from './scheduler.mjs'
+import { COMPRESSION_MODES, bodyCharLength, compressChatBody, normalizeCompression, normalizeContextRelay, relayChatBody } from './transforms.mjs'
+import { canonicalCacheKey, createResponseCache, extractPromptText, normalizeResponseCache, semanticParamsKey, shouldCacheRequest } from './cache.mjs'
 
 export const SIDECAR_MAX_BODY_BYTES = 64 * 1024 * 1024 // 64 MiB, the Orca cap
 const RETRYABLE_STATUSES = new Set([408, 409, 429, 500, 502, 503, 504])
+const PROVIDER_FAILURE_STATUSES = new Set([408, 409, 500, 502, 503, 504])
 // A key-level failure: retry the same target with the next key in the pool.
 const KEY_ROTATE_STATUSES = new Set([401, 403, 429])
 // How long a key is skipped after it fails, so later requests keep rotating.
 const KEY_COOLDOWN_MS = { 401: 300_000, 403: 300_000, 429: 60_000, 408: 30_000, 409: 30_000, 500: 30_000, 502: 30_000, 503: 30_000, 504: 30_000 }
 const MAX_KEY_ATTEMPTS = 8
+const MAX_KEY_COOLDOWN_MS = 60 * 60 * 1000
+const KEY_LIMIT_WINDOWS = [
+  ['rpm', 60_000, 'requests'], ['rph', 3_600_000, 'requests'], ['rpd', 86_400_000, 'requests'],
+  ['tpm', 60_000, 'tokens'], ['tph', 3_600_000, 'tokens'], ['tpd', 86_400_000, 'tokens'],
+  ['ipm', 60_000, 'images'], ['iph', 3_600_000, 'images'], ['ipd', 86_400_000, 'images']
+]
 const DOWNSTREAM_FALLBACK_STATUSES = (s) => s >= 400 && s < 600
 
 // ---------------------------------------------------------------------------
@@ -115,7 +129,7 @@ export function providerFromPreset(presetId, { name, apiKeySecretKey } = {}) {
   if (!preset) return null
   const protocols = [...new Set((preset.capabilities ?? []).map(mapLegacyProtocol))]
   const endpoints = [{ baseUrl: preset.baseUrl, protocols }]
-  const keys = apiKeySecretKey ? [{ id: `${preset.id}-key-1`, secretKey: apiKeySecretKey, enabled: true, priority: 0, weight: 1 }] : []
+  const keys = apiKeySecretKey ? [{ id: 'key-1', secretKey: apiKeySecretKey, enabled: true, priority: 0, weight: 1 }] : []
   return {
     name: name || preset.id,
     displayName: preset.name,
@@ -134,12 +148,16 @@ export function providerFromPreset(presetId, { name, apiKeySecretKey } = {}) {
 // Config defaults and normalization (including legacy upstreams -> providers).
 // ---------------------------------------------------------------------------
 export const DEFAULT_CONFIG = {
-  version: 2,
+  version: 3,
   token: 'orca-router',
   providers: [],
+  // A route is a model name agents send, backed by one or more
+  // provider/model targets. It is the normal failover unit; `aliases` stays
+  // for imported single-target aliases and older configs.
   routes: [],
   aliases: {},
-  defaultProvider: '',
+  // Global policies: ordered request matchers that rewrite or redirect.
+  policies: [],
   defaultModel: '',
   defaultFallback: { mode: 'retry', models: [], retryCount: 2 },
   clientKeys: [],
@@ -149,6 +167,56 @@ export const DEFAULT_CONFIG = {
   timeoutMs: 600000,
   retries: 2,
   baseDelayMs: 200,
+  scheduler: {
+    strategy: 'priority-weighted',
+    priorityTiers: true,
+    utilizationAware: true,
+    utilizationThreshold: 0.8,
+    allKeysExhausted: 'error',
+    exhaustedStatus: 420,
+    cacheAffinity: true,
+    cacheAffinityTtlMs: 600_000
+  },
+  circuitBreaker: {
+    enabled: true,
+    failureThreshold: 3,
+    cooldownMs: 60_000
+  },
+  providerHealth: {
+    enabled: false,
+    smoothing: 0.3,
+    staleMs: 300_000
+  },
+  // Opt-in request optimization. All three are off by default so existing
+  // configs keep byte-identical routing and upstream payloads.
+  compression: {
+    enabled: false,
+    mode: 'lite',
+    minChars: 2000,
+    keepRecentMessages: 4,
+    toolResults: true,
+    systemPrompt: false,
+    toolMaxChars: 4000,
+    messageMaxChars: 2000
+  },
+  contextRelay: {
+    enabled: false,
+    trigger: 'failover',
+    maxChars: 24_000,
+    keepRecentMessages: 8,
+    digestChars: 200
+  },
+  responseCache: {
+    enabled: false,
+    mode: 'exact',
+    ttlMs: 300_000,
+    maxEntries: 200,
+    threshold: 0.95,
+    embeddingProvider: '',
+    embeddingModel: '',
+    skipTools: true,
+    maxTemperature: 0
+  },
   logBodyCapture: 'errors',
   exposeRoutingHeaders: false,
   allowUnauthenticatedRemote: false
@@ -158,6 +226,191 @@ const LOG_BODY_LIMIT = 4096
 const MAX_WINDOW_ENTRIES = 5000
 
 const slug = (value) => String(value ?? '').trim().toLowerCase().replace(/[^a-z0-9-_]+/g, '-')
+
+// Route names are selectors agents send verbatim, so they keep their
+// case and punctuation. Only provider names are slugged.
+function normalizeRoutes(input) {
+  const routes = []
+  const seen = new Set()
+  for (const raw of Array.isArray(input) ? input : []) {
+    if (!raw || typeof raw !== 'object') continue
+    const name = String(raw.name ?? '').trim()
+    if (!name || seen.has(name)) continue
+    const targets = []
+    for (const target of Array.isArray(raw.targets) ? raw.targets : []) {
+      if (!target || typeof target !== 'object') continue
+      const provider = slug(target.provider ?? '')
+      const model = String(target.model ?? '').trim()
+      if (!provider && !model) continue
+      targets.push({ provider, model })
+    }
+    if (!targets.length) continue
+    seen.add(name)
+    routes.push({
+      name,
+      targets,
+      strategy: raw.strategy === 'ordered' ? 'ordered' : 'fastest',
+      enabled: raw.enabled !== false,
+      retries: normalizeRetries(raw.retries, 2)
+    })
+  }
+  return routes
+}
+
+// Turn a legacy `aliases` entry into a one-target route. It is marked
+// `ordered` so an upgraded config keeps its old single-target behavior even
+// when health ranking is enabled.
+function legacyAliasRoute(name, target, providers) {
+  const text = String(target ?? '').trim()
+  if (!text) return null
+  const slash = text.indexOf('/')
+  if (slash > 0) {
+    const provider = providers.find((item) => item.name === slug(text.slice(0, slash)))
+    if (provider) {
+      return {
+        name,
+        targets: [{ provider: provider.name, model: text.slice(slash + 1) }],
+        strategy: 'ordered',
+        enabled: true,
+        retries: 2
+      }
+    }
+  }
+  const named = providers.find((item) => item.name === slug(text))
+  if (named) {
+    return { name, targets: [{ provider: named.name, model: '' }], strategy: 'ordered', enabled: true, retries: 2 }
+  }
+  return { name, targets: [{ provider: '', model: text }], strategy: 'ordered', enabled: true, retries: 2 }
+}
+
+function mergeLegacyAliases(routes, aliases, providers) {
+  const names = new Set(routes.map((route) => route.name))
+  const merged = [...routes]
+  for (const [name, target] of Object.entries(aliases ?? {})) {
+    if (names.has(name)) continue
+    const route = legacyAliasRoute(name, target, providers)
+    if (!route) continue
+    names.add(name)
+    merged.push(route)
+  }
+  return merged
+}
+
+const LEGACY_CHAIN_MODES = new Set(['model-chain', 'provider-chain'])
+
+function migrationTarget(providers, aliases, entry) {
+  const text = String(entry ?? '').trim()
+  if (!text) return null
+  const mapped = aliases[text] ?? text
+  const slash = mapped.indexOf('/')
+  if (slash > 0) {
+    const provider = providers.find((item) => item.name === slug(mapped.slice(0, slash)))
+    return provider ? { provider: provider.name, model: mapped.slice(slash + 1) } : null
+  }
+  const owner = providers.find((item) => (item.models ?? []).some((model) => model.id === mapped))
+  if (owner) return { provider: owner.name, model: mapped }
+  const named = providers.find((item) => item.name === slug(mapped))
+  if (named) return { provider: named.name, model: '' }
+  return { provider: '', model: mapped }
+}
+
+function dedupeTargets(targets) {
+  const seen = new Set()
+  const out = []
+  for (const target of targets) {
+    if (!target) continue
+    const key = `${target.provider}/${target.model}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(target)
+  }
+  return out
+}
+
+function normalizeRetries(value, fallback = 2) {
+  const count = Number(value)
+  return Number.isFinite(count) ? Math.max(0, Math.min(20, Math.floor(count))) : fallback
+}
+
+// Turn a legacy custom chain (a raw provider/model list on a policy or the
+// global default) into a route. Idempotent: a chain that already names a
+// route, or a global policy reset to retry, is left alone.
+function migrateLegacyChains({ policies, routes, aliases, providers, defaultFallback, retries, previous }) {
+  const list = [...routes]
+  const known = new Set(list.map((route) => route.name))
+  const created = []
+  const uniqueName = (base) => {
+    let name = base
+    let suffix = 2
+    while (known.has(name)) name = `${base}-${suffix++}`
+    known.add(name)
+    return name
+  }
+  const backupsFor = (models) => dedupeTargets(
+    models
+      .filter((entry) => typeof entry === 'string')
+      .map((entry) => migrationTarget(providers, aliases, entry))
+  )
+  const migratedPolicies = policies.map((policy) => {
+    const fallback = policy.fallback
+    if (!fallback || !LEGACY_CHAIN_MODES.has(fallback.mode)) return policy
+    const models = Array.isArray(fallback.models) ? fallback.models : []
+    if (!models.length) return policy
+    const routeRefs = models.filter((entry) => known.has(entry))
+    const rawEntries = models.filter((entry) => !known.has(entry))
+    // Only routes: this is the simplified form, not a raw chain.
+    if (!rawEntries.length) return policy
+    const backups = backupsFor(rawEntries)
+    if (!backups.length) {
+      return routeRefs.length
+        ? { ...policy, fallback: { mode: 'provider-chain', models: routeRefs, retryCount: fallback.retryCount } }
+        : policy
+    }
+    const name = uniqueName(`${slug(policy.name || policy.id || 'policy')}-backups`)
+    list.push({ name, targets: backups, strategy: 'ordered', enabled: true, retries: normalizeRetries(fallback.retryCount, retries) })
+    created.push({ kind: 'rule-chain', from: policy.name || policy.id || 'policy', to: name, targets: backups })
+    return { ...policy, fallback: { mode: 'provider-chain', models: [...routeRefs, name], retryCount: fallback.retryCount } }
+  })
+
+  let globalFallback = defaultFallback
+  if (globalFallback && LEGACY_CHAIN_MODES.has(globalFallback.mode)) {
+    const models = Array.isArray(globalFallback.models) ? globalFallback.models : []
+    const routeRefs = models.filter((entry) => known.has(entry))
+    const rawEntries = models.filter((entry) => !known.has(entry))
+    let to = routeRefs[0] ?? ''
+    let targets = []
+    if (rawEntries.length) {
+      const backups = backupsFor(rawEntries)
+      if (backups.length) {
+        to = uniqueName('default-failover')
+        list.push({ name: to, targets: backups, strategy: 'ordered', enabled: true, retries: normalizeRetries(globalFallback.retryCount, retries) })
+        targets = backups
+      }
+    }
+    if (to) {
+      created.push({
+        kind: 'global-chain',
+        from: 'Global default fallback',
+        to,
+        targets,
+        note: 'No longer applies automatically; point a model name at this route to use it.'
+      })
+    }
+    // A non-route request is now a single target with plain retries.
+    globalFallback = { mode: 'retry', models: [], retryCount: Number(globalFallback.retryCount ?? retries ?? 2) }
+  }
+
+  const seen = new Set((previous ?? []).map((item) => `${item.kind}:${item.from}:${item.to}`))
+  const additions = created
+    .filter((item) => !seen.has(`${item.kind}:${item.from}:${item.to}`))
+    .map((item) => ({ at: Date.now(), ...item }))
+  return {
+    policies: migratedPolicies,
+    routes: list,
+    defaultFallback: globalFallback,
+    migration: [...(previous ?? []), ...additions].slice(-50)
+  }
+}
 
 function normalizeModelEntry(model) {
   if (typeof model === 'string') return { id: model }
@@ -170,7 +423,7 @@ export function normalizeProvider(provider) {
   const baseUrl = provider.baseUrl ?? endpoints?.[0]?.baseUrl ?? ''
   const protocols = provider.protocols ?? provider.capabilities ?? []
   const keys = (provider.keys ?? []).map((key, index) => ({
-    id: key.id ?? `${slug(provider.name)}-key-${index + 1}`,
+    id: key.id ?? `key-${index + 1}`,
     secretKey: key.secretKey,
     enabled: key.enabled !== false,
     priority: Number(key.priority ?? 0),
@@ -239,37 +492,67 @@ export function normalizeConfig(input) {
   } else if (Array.isArray(providers)) {
     providers = providers.map(normalizeProvider)
   }
-  const rawRoutes = source.routes ?? []
-  const routes = rawRoutes
-    .map((rule, index) => rule?.match && !rule.condition ? migrateOneLegacyRoute(rule, index) : rule)
-    .filter((rule) => {
-      const fallbackModels = rule?.fallback?.models ?? []
-      const legacyReference = rule?.id?.startsWith('legacy-') && (rule?.name === 'omniroute/*' || rule?.name === '*' || fallbackModels.some((item) => item === 'ccr' || item === 'omniroute'))
+  // Version gate: v3 stores `routes` (the failover unit) and `policies`
+  // (global request matchers). Legacy configs (version < 3) used `routes`
+  // for the policies and `resolvers`/`modelGroups` for the routes.
+  const isV3 = Number(source.version ?? 0) >= 3
+  const rawPolicies = isV3
+    ? (Array.isArray(source.policies) ? source.policies : [])
+    : (source.routes ?? [])
+  const rawRoutes = isV3
+    ? (Array.isArray(source.routes) ? source.routes : [])
+    : (Array.isArray(source.resolvers)
+      ? source.resolvers
+      : Array.isArray(source.modelGroups) ? source.modelGroups : [])
+  const policies = rawPolicies
+    .map((policy, index) => policy?.match && !policy.condition ? migrateOneLegacyRoute(policy, index) : policy)
+    .filter((policy) => {
+      const fallbackModels = policy?.fallback?.models ?? []
+      const legacyReference = policy?.id?.startsWith('legacy-') && (policy?.name === 'omniroute/*' || policy?.name === '*' || fallbackModels.some((item) => item === 'ccr' || item === 'omniroute'))
       return !legacyReference
     })
+  const aliases = source.aliases && typeof source.aliases === 'object' ? source.aliases : {}
+  const routes = mergeLegacyAliases(normalizeRoutes(rawRoutes), aliases, providers ?? [])
+  const normalizedPolicies = policies.map((policy, index) => ({
+    id: policy.id ?? `policy-${index + 1}`,
+    name: policy.name ?? `Policy ${index + 1}`,
+    enabled: policy.enabled !== false,
+    condition: policy.condition ?? null,
+    rewrites: policy.rewrites ?? (policy.rewrite ? [policy.rewrite] : []),
+    fallback: policy.fallback,
+    model: policy.model
+  }))
+  const migrated = migrateLegacyChains({
+    policies: normalizedPolicies,
+    routes,
+    aliases,
+    providers: providers ?? [],
+    defaultFallback: source.defaultFallback ?? { mode: 'retry', models: [], retryCount: Number(source.retries ?? 2) },
+    retries: Number(source.retries ?? 2),
+    previous: Array.isArray(source.migration) ? source.migration : []
+  })
   return {
     ...structuredClone(DEFAULT_CONFIG),
-    version: 2,
+    version: 3,
     token: source.token ?? DEFAULT_CONFIG.token,
-    defaultProvider: source.defaultProvider ?? DEFAULT_CONFIG.defaultProvider,
     defaultModel: typeof source.defaultModel === 'string' ? source.defaultModel : DEFAULT_CONFIG.defaultModel,
     providers: providers ?? [],
-    routes: routes.map((rule, index) => ({
-      id: rule.id ?? `rule-${index + 1}`,
-      name: rule.name ?? `Rule ${index + 1}`,
-      enabled: rule.enabled !== false,
-      condition: rule.condition ?? null,
-      rewrites: rule.rewrites ?? (rule.rewrite ? [rule.rewrite] : []),
-      fallback: rule.fallback,
-      model: rule.model
-    })),
-    aliases: source.aliases ?? {},
-    defaultFallback: source.defaultFallback ?? { mode: 'retry', models: [], retryCount: Number(source.retries ?? 2) },
+    routes: migrated.routes,
+    aliases,
+    policies: migrated.policies,
+    defaultFallback: migrated.defaultFallback,
+    migration: migrated.migration,
     clientKeys: source.clientKeys ?? [],
     agentProfiles: source.agentProfiles ?? DEFAULT_CONFIG.agentProfiles,
     timeoutMs: Number(source.timeoutMs ?? 600000),
     retries: Number(source.retries ?? 2),
     baseDelayMs: Number(source.baseDelayMs ?? 200),
+    scheduler: normalizeScheduler(source.scheduler ?? DEFAULT_CONFIG.scheduler),
+    circuitBreaker: normalizeCircuitBreaker(source.circuitBreaker ?? DEFAULT_CONFIG.circuitBreaker),
+    providerHealth: normalizeProviderHealth(source.providerHealth ?? DEFAULT_CONFIG.providerHealth),
+    compression: normalizeCompression(source.compression ?? DEFAULT_CONFIG.compression),
+    contextRelay: normalizeContextRelay(source.contextRelay ?? DEFAULT_CONFIG.contextRelay),
+    responseCache: normalizeResponseCache(source.responseCache ?? DEFAULT_CONFIG.responseCache),
     modelDescriptions: source.modelDescriptions ?? {},
     logBodyCapture: ['all', 'errors', 'none'].includes(source.logBodyCapture) ? source.logBodyCapture : 'errors',
     allowUnauthenticatedRemote: source.allowUnauthenticatedRemote === true,
@@ -381,7 +664,7 @@ export function convertClaudeCodeRouterConfig(ccr) {
     }
   })
   const router = ccr?.Router ?? ccr?.router ?? {}
-  const routes = (router.rules ?? router.routes ?? []).map((rule, index) => ({
+  const policies = (router.rules ?? router.routes ?? []).map((rule, index) => ({
     id: rule.id ?? `imported-rule-${index + 1}`,
     name: rule.name ?? `imported rule ${index + 1}`,
     enabled: rule.enabled !== false,
@@ -424,12 +707,12 @@ export function convertClaudeCodeRouterConfig(ccr) {
 
   return {
     config: {
-      version: 2,
+      version: 3,
       token: DEFAULT_CONFIG.token,
       providers,
-      routes,
+      routes: [],
       aliases,
-      defaultProvider: providers[0]?.name ?? '',
+      policies,
       defaultFallback: router.fallback ?? { mode: 'retry', models: [], retryCount: 2 },
       clientKeys,
       agentProfiles: agentProfiles.length ? agentProfiles : DEFAULT_CONFIG.agentProfiles,
@@ -582,8 +865,8 @@ export function convertOmniRouteConfig(omni, options = {}) {
     }
   }
 
-  // 5. Combos -> Routes + Aliases
-  const routes = []
+  // 5. Combos -> Policies + Aliases
+  const policies = []
   for (const [index, combo] of rawCombos.entries()) {
     let comboData = combo.data
     if (typeof comboData === 'string') {
@@ -600,7 +883,7 @@ export function convertOmniRouteConfig(omni, options = {}) {
       if (!aliases[comboName]) {
         aliases[comboName] = primaryModel
       }
-      routes.push({
+      policies.push({
         id: `imported-combo-${slug(comboName)}`,
         name: `Combo: ${comboName}`,
         enabled: true,
@@ -636,12 +919,12 @@ export function convertOmniRouteConfig(omni, options = {}) {
 
   return {
     config: {
-      version: 2,
+      version: 3,
       token: DEFAULT_CONFIG.token,
       providers,
-      routes,
+      routes: [],
       aliases,
-      defaultProvider: providers[0]?.name ?? '',
+      policies,
       defaultFallback: { mode: 'retry', models: [], retryCount: 2 },
       clientKeys,
       agentProfiles: DEFAULT_CONFIG.agentProfiles,
@@ -692,13 +975,14 @@ export function mergeRouterConfigs(baseConfig, incomingConfig, baseSecrets = [],
     }
   }
 
-  // Merge routes
-  if (!Array.isArray(mergedConfig.routes)) mergedConfig.routes = []
-  const existingRouteIds = new Set(mergedConfig.routes.map((r) => r.id))
-  for (const r of incomingConfig.routes ?? []) {
-    if (!existingRouteIds.has(r.id)) {
-      mergedConfig.routes.push(structuredClone(r))
-      existingRouteIds.add(r.id)
+  // Merge policies (keyed by id)
+  if (!Array.isArray(mergedConfig.policies)) mergedConfig.policies = []
+  const existingPolicyIds = new Set(mergedConfig.policies.map((p) => p.id))
+  const incomingPolicies = incomingConfig.policies ?? incomingConfig.routes ?? []
+  for (const p of incomingPolicies) {
+    if (!existingPolicyIds.has(p.id)) {
+      mergedConfig.policies.push(structuredClone(p))
+      existingPolicyIds.add(p.id)
     }
   }
 
@@ -706,6 +990,16 @@ export function mergeRouterConfigs(baseConfig, incomingConfig, baseSecrets = [],
   mergedConfig.aliases = {
     ...(mergedConfig.aliases ?? {}),
     ...(incomingConfig.aliases ?? {})
+  }
+
+  // Merge routes by name; an existing route wins.
+  if (!Array.isArray(mergedConfig.routes)) mergedConfig.routes = []
+  const incomingRoutes = incomingConfig.routes ?? incomingConfig.resolvers ?? incomingConfig.modelGroups ?? []
+  const existingRouteNames = new Set(mergedConfig.routes.map((route) => route.name))
+  for (const route of incomingRoutes) {
+    if (!route?.name || existingRouteNames.has(route.name)) continue
+    mergedConfig.routes.push(structuredClone(route))
+    existingRouteNames.add(route.name)
   }
 
   // Merge clientKeys
@@ -732,10 +1026,6 @@ export function mergeRouterConfigs(baseConfig, incomingConfig, baseSecrets = [],
         if (p.smallFastModel) existingProfile.smallFastModel = p.smallFastModel
       }
     }
-  }
-
-  if (!mergedConfig.defaultProvider && incomingConfig.defaultProvider) {
-    mergedConfig.defaultProvider = incomingConfig.defaultProvider
   }
 
   const mergedSecrets = Array.from(secretsMap.entries()).map(([secretKey, value]) => ({ secretKey, value }))
@@ -871,7 +1161,7 @@ export function detectAndConvertConfig(input, options = {}) {
     return { type: 'ccr', ...convertClaudeCodeRouterConfig(input) }
   }
 
-  if (input.version === 2 || (Array.isArray(input.providers) && Array.isArray(input.routes))) {
+  if (Number(input.version ?? 0) >= 2 || (Array.isArray(input.providers) && (Array.isArray(input.routes) || Array.isArray(input.policies)))) {
     return { type: 'native', config: normalizeConfig(input), secrets: [] }
   }
 
@@ -1606,37 +1896,50 @@ function findModelOwner(normalized, bareModel) {
   return null
 }
 
-export function splitModelPrefix(model, config) {
-  const normalized = normalizeConfig(config)
-  const name = String(model ?? '')
-  const alias = normalized.aliases[name]
-  const source = alias ?? name
-  const slash = source.indexOf('/')
-  if (slash > 0) {
-    const candidate = providerByName(normalized, source.slice(0, slash))
-    if (candidate) return { provider: candidate, model: source.slice(slash + 1) }
-  }
-  const owner = findModelOwner(normalized, source)
-  if (owner) return { provider: owner, model: source }
-  const defaultProvider = providerByName(normalized, normalized.defaultProvider)
-  return { provider: defaultProvider ?? providersFor(normalized)[0] ?? null, model: source }
+function findRoute(normalized, name) {
+  const text = String(name ?? '').trim()
+  if (!text) return null
+  return (normalized.routes ?? []).find((route) => route.name === text && route.enabled !== false) ?? null
 }
 
-export function resolveProviderTarget(config, selector, fallbackModel = '') {
-  const normalized = normalizeConfig(config)
+function resolveSelector(normalized, selector, fallbackModel = '') {
   if (!selector) return null
   const text = normalized.aliases[selector] ?? selector
   const slash = text.indexOf('/')
   if (slash > 0) {
     const provider = providerByName(normalized, text.slice(0, slash))
     if (provider) return { provider, model: text.slice(slash + 1) }
+    return null
   }
   const owner = findModelOwner(normalized, text)
   if (owner) return { provider: owner, model: text }
   const named = providerByName(normalized, text)
   if (named) return { provider: named, model: fallbackModel }
-  const provider = providerByName(normalized, normalized.defaultProvider) ?? providersFor(normalized)[0]
-  return provider ? { provider, model: text } : null
+  return null
+}
+
+function resolveRouteTarget(normalized, target, fallbackModel = '') {
+  if (!target) return null
+  const provider = target.provider ? providerByName(normalized, target.provider) : null
+  if (provider) return { provider, model: target.model || fallbackModel }
+  if (target.model) return resolveSelector(normalized, target.model, fallbackModel)
+  return null
+}
+
+function resolveProviderTargetNormalized(normalized, selector, fallbackModel = '') {
+  const route = findRoute(normalized, selector)
+  if (route) {
+    for (const target of route.targets) {
+      const resolved = resolveRouteTarget(normalized, target, fallbackModel)
+      if (resolved) return resolved
+    }
+    return null
+  }
+  return resolveSelector(normalized, selector, fallbackModel)
+}
+
+export function resolveProviderTarget(config, selector, fallbackModel = '') {
+  return resolveProviderTargetNormalized(normalizeConfig(config), selector, fallbackModel)
 }
 
 export function agentProfileFor(normalized, agentId) {
@@ -1663,11 +1966,10 @@ export function resolveAgentProfile(config, agentId) {
 
 // Environment Orca should hand an agent process so its requests reach the local
 // gateway. Agents route by default; a profile that is explicitly disabled is
-// the only thing that opts an agent out. The scope only decides how the model
-// is chosen when a profile still carries one (imported CCR configs):
-//   system-default -> use the profile model, else the router/agent default
-//   router-only    -> keep the agent's own model unless the profile pins one
-//   custom         -> same as router-only (kept for imported CCR configs)
+// the only thing that opts an agent out. The router never chooses a model on
+// the agent's behalf: the only pin it emits is an explicit profile model
+// (carried by imported CCR configs). Without one, the agent keeps its own
+// default or last-used model and the gateway routes (or 404s) that name.
 // Profile `env` is merged last so an explicit override always wins.
 export function buildAgentLaunchEnv(config, agentId, { base, token, eventEnv = {} } = {}) {
   const normalized = normalizeConfig(config)
@@ -1676,10 +1978,7 @@ export function buildAgentLaunchEnv(config, agentId, { base, token, eventEnv = {
     return { env: eventEnv, model: '', profile, scope: 'router-only', routed: false }
   }
   const scope = profile?.scope === 'system-default' ? 'system-default' : 'router-only'
-  const fallbackModel = scope === 'system-default'
-    ? (normalized.defaultModel || eventEnv.ANTHROPIC_MODEL || eventEnv.OPENAI_MODEL || '')
-    : ''
-  const model = profile?.model || fallbackModel
+  const model = profile?.model || ''
   const small = profile?.smallFastModel || ''
   const noProxy = mergeNoProxy(eventEnv.NO_PROXY ?? eventEnv.no_proxy)
   const claudeAgent = /claude/i.test(String(agentId ?? ''))
@@ -1721,10 +2020,13 @@ function routerModelEntries(normalized, agentId) {
   for (const provider of providersFor(normalized)) {
     for (const model of provider.models ?? []) add(`${provider.name}/${model.id}`, model.description ?? '')
   }
+  for (const route of normalized.routes ?? []) {
+    if (route.enabled !== false) add(route.name, 'Route')
+  }
   for (const alias of Object.keys(normalized.aliases ?? {})) add(alias)
-  // A profile/default model wins when it names a model we can actually route.
-  // Otherwise start on the default provider's first model, mirroring the
-  // gateway's own fallback, and fall back to the first published selector.
+  // The router never picks a startup model on the agent's behalf. The only
+  // pin it emits is an explicit profile model (normalized to a routable
+  // selector); otherwise agents keep their own default/last-used model.
   const resolveSelector = (candidate) => {
     const text = String(candidate ?? '')
     if (!text) return ''
@@ -1739,10 +2041,7 @@ function routerModelEntries(normalized, agentId) {
     }
     return ''
   }
-  const defaultProvider = providerByName(normalized, normalized.defaultProvider) ?? providersFor(normalized)[0]
-  const firstModel = defaultProvider?.models?.[0]
-  const model = resolveSelector(profile?.model) || resolveSelector(normalized.defaultModel)
-    || (firstModel ? `${defaultProvider.name}/${firstModel.id}` : entries[0]?.selector ?? '')
+  const model = resolveSelector(profile?.model)
   return { entries, model }
 }
 
@@ -1752,6 +2051,8 @@ function routerModelEntries(normalized, agentId) {
 // every selector back through the router (`provider/model` ids are resolved by
 // the gateway). A keyed provider's model map is authoritative: disabled
 // providers are omitted, exactly like the gateway's /v1/models response.
+// The document pins `model`/`small_model` only when an agent profile explicitly
+// carries one; otherwise OpenCode starts on its last-used model.
 export function buildOpenCodeConfig(config, { base, token, agentId = '' } = {}) {
   const normalized = normalizeConfig(config)
   const { entries, model } = routerModelEntries(normalized, agentId)
@@ -1853,9 +2154,15 @@ export function mergeOpenCodeConfig(existing, generated, legacyProviders = ['cla
   const published = generated?.provider?.['orca-router']
   if (!published) return document
   const models = published.models ?? {}
-  const defaultRef = generated.model ?? ''
-  const defaultSelector = defaultRef.startsWith('orca-router/') ? defaultRef.slice('orca-router/'.length) : ''
-  const selectorFor = (modelId) => (models[modelId] ? modelId : defaultSelector)
+  const pinnedSelector = String(generated.model ?? '').startsWith('orca-router/')
+    ? String(generated.model).slice('orca-router/'.length)
+    : ''
+  // Unknown legacy ids are repointed at the explicit profile pin, or the
+  // first published selector, so they still resolve after the CCR switch.
+  // This is migration cleanup, not a pin: the document's own model keys are
+  // only rewritten when they referenced the legacy provider.
+  const fallbackSelector = pinnedSelector || Object.keys(models)[0] || ''
+  const selectorFor = (modelId) => (models[modelId] ? modelId : fallbackSelector)
   const provider = { ...(document.provider ?? {}) }
   for (const legacy of legacyProviders) delete provider[legacy]
   provider['orca-router'] = published
@@ -1886,8 +2193,9 @@ export function mergeOpenCodeConfig(existing, generated, legacyProviders = ['cla
     }
   }
   walk(document)
-  if (!document.model && defaultRef) document.model = defaultRef
-  if (!document.small_model && defaultRef) document.small_model = defaultRef
+  // Never invent a model for the user. An existing model key is kept (after
+  // legacy repo pointing); an absent one is left absent so OpenCode starts on
+  // the last-used model.
   return document
 }
 
@@ -1904,46 +2212,68 @@ function mergeNoProxy(value) {
   return hosts.join(',')
 }
 
-function buildChainFromFallback(config, primarySelector, fallback) {
+export function buildChainFromFallback(normalized, primarySelector, fallback) {
   const chain = []
   const seen = new Set()
   const addTarget = (target) => {
-    if (!target?.provider) return
+    if (!target?.provider || !target.model) return
     const key = `${target.provider.name}/${target.model}`
     if (seen.has(key)) return
     seen.add(key)
     chain.push(target)
   }
-  const primary = resolveProviderTarget(config, primarySelector)
+  const primaryRoute = findRoute(normalized, primarySelector)
+  const primary = primaryRoute ? null : resolveSelector(normalized, primarySelector)
   addTarget(primary)
-  const bare = primary?.model ?? primarySelector
+  let bare = primary?.model
+  if (!bare && primaryRoute) {
+    bare = primaryRoute.targets
+      .map((target) => resolveRouteTarget(normalized, target, ''))
+      .find((target) => target?.model)?.model
+  }
+  if (primaryRoute) {
+    for (const target of primaryRoute.targets) addTarget(resolveRouteTarget(normalized, target, bare ?? ''))
+  }
+  // A fallback entry is either a route name or a raw `provider/model` target.
+  // A route contributes all of its targets; a raw entry resolves to one.
+  const reuse = bare ?? (primaryRoute ? '' : primarySelector)
   for (const entry of fallback?.models ?? []) {
-    if (typeof entry === 'string' && !entry.includes('/')) {
-      const named = providerByName(config, entry)
-      if (named) { addTarget({ provider: named, model: bare }); continue }
+    if (typeof entry !== 'string') continue
+    const route = findRoute(normalized, entry)
+    if (route) {
+      for (const target of route.targets) addTarget(resolveRouteTarget(normalized, target, reuse))
+      continue
     }
-    addTarget(resolveProviderTarget(config, entry, bare))
+    addTarget(resolveSelector(normalized, entry, reuse))
   }
   return chain
+}
+
+function fallbackRouteFor(normalized, fallback) {
+  for (const entry of fallback?.models ?? []) {
+    if (typeof entry !== 'string') continue
+    const route = findRoute(normalized, entry)
+    if (route) return route
+  }
+  return null
 }
 
 export function resolveChain(config, model) {
   const normalized = normalizeConfig(config)
-  const chain = buildChainFromFallback(normalized, model, normalized.defaultFallback)
-  return chain
+  return buildChainFromFallback(normalized, model, normalized.defaultFallback)
 }
 
-function applyRulesForModel(config, body, headers) {
-  let matchedRule = null
-  for (const rule of config.routes) {
-    if (rule.enabled === false) continue
-    if (!evaluateCondition(rule.condition, { headers, body })) continue
-    matchedRule = rule
-    if (rule.model && body.model == null) body.model = rule.model
-    applyRewrites(body, headers, rule.rewrites)
+function applyPolicies(config, body, headers) {
+  let matchedPolicy = null
+  for (const policy of config.policies) {
+    if (policy.enabled === false) continue
+    if (!evaluateCondition(policy.condition, { headers, body })) continue
+    matchedPolicy = policy
+    if (policy.model && body.model == null) body.model = policy.model
+    applyRewrites(body, headers, policy.rewrites)
     break
   }
-  return matchedRule
+  return matchedPolicy
 }
 
 // ---------------------------------------------------------------------------
@@ -1996,13 +2326,8 @@ function recordTokensInWindow(entries, entry, maxWindowMs) {
 
 function keyWithinLimits(key, state, now, estimatedTokens, imageCount) {
   const limits = key.limits ?? {}
-  const windows = [
-    ['rpm', 60_000, 'requests'], ['rph', 3_600_000, 'requests'], ['rpd', 86_400_000, 'requests'],
-    ['tpm', 60_000, 'tokens'], ['tph', 3_600_000, 'tokens'], ['tpd', 86_400_000, 'tokens'],
-    ['ipm', 60_000, 'images'], ['iph', 3_600_000, 'images'], ['ipd', 86_400_000, 'images']
-  ]
-  for (const [field, windowMs, kind] of windows) {
-    const limit = limits[field]
+  for (const [field, windowMs, kind] of KEY_LIMIT_WINDOWS) {
+    const limit = Number(limits[field])
     if (!limit) continue
     const used = kind === 'requests' ? rateWindowCount(state.requests, windowMs, now)
       : kind === 'tokens' ? tokensInWindow(state.tokens, windowMs, now)
@@ -2013,6 +2338,76 @@ function keyWithinLimits(key, state, now, estimatedTokens, imageCount) {
   if (limits.maxRequests && rateWindowCount(state.requests, Number(limits.windowMs ?? 86_400_000), now) >= Number(limits.maxRequests)) return false
   if (limits.maxTokens && tokensInWindow(state.tokens, Number(limits.quotaWindowMs ?? 86_400_000), now) + estimatedTokens > Number(limits.maxTokens)) return false
   return true
+}
+
+// Fraction of the tightest configured limit a key has consumed. Utilisation is
+// used only as a scheduling preference; keyWithinLimits remains the hard gate.
+function keyUtilization(key, state, now, estimatedTokens, imageCount) {
+  const limits = key.limits ?? {}
+  let utilization = 0
+  for (const [field, windowMs, kind] of KEY_LIMIT_WINDOWS) {
+    const limit = Number(limits[field])
+    if (!limit || limit <= 0) continue
+    const used = kind === 'requests' ? rateWindowCount(state.requests, windowMs, now)
+      : kind === 'tokens' ? tokensInWindow(state.tokens, windowMs, now)
+      : rateWindowCount(state.images, windowMs, now)
+    const needed = kind === 'tokens' ? estimatedTokens : kind === 'images' ? imageCount : 0
+    utilization = Math.max(utilization, (used + needed) / limit)
+  }
+  if (limits.maxRequests) {
+    const limit = Number(limits.maxRequests)
+    if (limit > 0) utilization = Math.max(utilization, rateWindowCount(state.requests, Number(limits.windowMs ?? 86_400_000), now) / limit)
+  }
+  if (limits.maxTokens) {
+    const limit = Number(limits.maxTokens)
+    if (limit > 0) utilization = Math.max(utilization, (tokensInWindow(state.tokens, Number(limits.quotaWindowMs ?? 86_400_000), now) + estimatedTokens) / limit)
+  }
+  return utilization
+}
+
+// A read-only snapshot for the panel: rolling request/token/image totals plus
+// one meter per configured limit. Meters stay in the declared window order so
+// a bar does not jump between windows while utilization is tied.
+export function keyUsageSnapshot(key, state, now = Date.now()) {
+  const source = state ?? {}
+  const requests = source.requests ?? []
+  const tokens = source.tokens ?? []
+  const images = source.images ?? []
+  const summary = (kind) => ({
+    minute: kind === 'tokens' ? tokensInWindow(tokens, 60_000, now)
+      : rateWindowCount(kind === 'requests' ? requests : images, 60_000, now),
+    hour: kind === 'tokens' ? tokensInWindow(tokens, 3_600_000, now)
+      : rateWindowCount(kind === 'requests' ? requests : images, 3_600_000, now),
+    day: kind === 'tokens' ? tokensInWindow(tokens, 86_400_000, now)
+      : rateWindowCount(kind === 'requests' ? requests : images, 86_400_000, now)
+  })
+  const limits = key?.limits ?? {}
+  const meters = []
+  const addMeter = (field, kind, windowMs) => {
+    const limit = Number(limits[field])
+    if (!Number.isFinite(limit) || limit <= 0) return
+    const used = kind === 'tokens' ? tokensInWindow(tokens, windowMs, now)
+      : rateWindowCount(kind === 'requests' ? requests : images, windowMs, now)
+    meters.push({
+      field,
+      kind,
+      windowMs,
+      used,
+      limit,
+      remaining: Math.max(0, limit - used),
+      utilization: used / limit
+    })
+  }
+  for (const [field, windowMs, kind] of KEY_LIMIT_WINDOWS) addMeter(field, kind, windowMs)
+  addMeter('maxRequests', 'requests', Number(limits.windowMs ?? 86_400_000))
+  addMeter('maxTokens', 'tokens', Number(limits.quotaWindowMs ?? 86_400_000))
+  return {
+    requests: summary('requests'),
+    tokens: summary('tokens'),
+    images: summary('images'),
+    meters,
+    utilization: meters.reduce((max, meter) => Math.max(max, meter.utilization), 0)
+  }
 }
 
 function countImages(body) {
@@ -2121,6 +2516,63 @@ function isChatPath(path) {
     || /^\/v1beta\/models\/[^/]+:(generateContent|streamGenerateContent)$/.test(path)
 }
 
+// Session headers are checked in priority order. `x-orca-session-id` is the
+// explicit contract; the others let common agents keep cache affinity without
+// any client changes.
+const AFFINITY_HEADERS = [
+  'x-orca-session-id',
+  'x-session-id',
+  'x-claude-session-id',
+  'x-claude-code-session-id',
+  'x-opencode-session-id',
+  'x-codex-session-id',
+  'x-agent-session-id'
+]
+
+function headerValue(headers, name) {
+  if (!headers || typeof headers !== 'object') return undefined
+  const value = headers[name] ?? headers[name.toLowerCase()] ?? headers[name.toUpperCase()]
+  return Array.isArray(value) ? value[0] : value
+}
+
+function stableStringify(value) {
+  if (value === undefined) return 'null'
+  if (value === null || typeof value !== 'object') return JSON.stringify(value)
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`
+  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`
+}
+
+// Resolve the stable cache-affinity token for a request. Explicit session
+// headers win, then body identifiers, then a hash of the stable prompt prefix.
+// The caller combines this with provider/model so a different model never
+// reuses the old binding.
+export function deriveAffinityKey(headers = {}, body = null) {
+  for (const name of AFFINITY_HEADERS) {
+    const value = headerValue(headers, name)
+    if (value != null && String(value).trim()) return `header:${name}:${String(value).trim()}`
+  }
+  const identifiers = [
+    body?.metadata?.user_id,
+    body?.metadata?.userId,
+    body?.metadata?.session_id,
+    body?.user,
+    body?.user_id,
+    body?.conversation_id
+  ]
+  for (const value of identifiers) {
+    if (typeof value === 'string' && value.trim()) return `body:${value.trim()}`
+  }
+  if (!body || typeof body !== 'object') return ''
+  const prompt = {
+    model: body.model,
+    system: body.system ?? body.instructions ?? body.systemInstruction,
+    messages: body.messages ?? body.input ?? body.contents,
+    tools: body.tools
+  }
+  if (prompt.messages == null && prompt.system == null) return ''
+  return `prompt:${createHash('sha256').update(stableStringify(prompt)).digest('hex')}`
+}
+
 export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Date.now }) {
   const fetchFn = fetchImpl ?? globalThis.fetch
   const logs = []
@@ -2128,8 +2580,18 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
   let bound = null
   const keyStates = new Map() // credential secretKey/id -> {requests:[], tokens:[], images:[]}
   const keyCooldowns = new Map() // credential identity -> timestamp it becomes usable again
-  const keyCursors = new Map() // provider name -> next round-robin index
-  const stats = { requests: 0, errors: 0, inputTokens: 0, outputTokens: 0, cost: 0, latencyMsTotal: 0, byProvider: {}, byModel: {} }
+  const schedulerState = createSchedulerState()
+  const providerCircuits = new Map() // provider name -> { failures, state, openUntil, probeInFlight }
+  const providerHealth = new Map() // provider name -> { latencyMs, samples, failures, successes, lastSuccessAt, lastFailureAt }
+  const providerAffinity = new Map() // affinity token -> { provider, at }
+  const affinityBindings = new Map() // provider\0model\0affinity -> { keyId, expiresAt }
+  const responseCache = createResponseCache({ now })
+  const pruneProviderAffinity = (ttl) => {
+    if (providerAffinity.size <= 2000) return
+    const cutoff = now() - ttl
+    for (const [token, value] of providerAffinity) if (value.at < cutoff) providerAffinity.delete(token)
+  }
+  const stats = { requests: 0, errors: 0, inputTokens: 0, outputTokens: 0, cost: 0, latencyMsTotal: 0, byProvider: {}, byModel: {}, cacheHits: 0, cacheSavedTokens: 0, cacheSavedCost: 0, compressionSavedChars: 0, relayEvents: 0 }
 
   const log = (entry, { config, status } = {}) => {
     const captureMode = config?.logBodyCapture ?? 'errors'
@@ -2191,6 +2653,117 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     if (cost != null) stats.cost += cost
   }
 
+  const circuitFor = (providerName) => {
+    let circuit = providerCircuits.get(providerName)
+    if (!circuit) {
+      circuit = { failures: 0, state: 'closed', openUntil: 0, probeInFlight: false }
+      providerCircuits.set(providerName, circuit)
+    }
+    return circuit
+  }
+
+  const providerCircuitAllows = (provider, config) => {
+    const rules = normalizeCircuitBreaker(config.circuitBreaker)
+    if (!rules.enabled) return { allowed: true }
+    const circuit = circuitFor(provider.name)
+    const timestamp = now()
+    if (circuit.state === 'open') {
+      if (timestamp < circuit.openUntil) {
+        return { allowed: false, retryAfterMs: circuit.openUntil - timestamp }
+      }
+      circuit.state = 'half-open'
+      circuit.probeInFlight = false
+    }
+    if (circuit.state === 'half-open') {
+      if (circuit.probeInFlight) return { allowed: false, retryAfterMs: 1000 }
+      circuit.probeInFlight = true
+      return { allowed: true, probe: true }
+    }
+    return { allowed: true }
+  }
+
+  const healthFor = (providerName) => {
+    let entry = providerHealth.get(providerName)
+    if (!entry) {
+      entry = { latencyMs: null, samples: 0, failures: 0, successes: 0, lastSuccessAt: 0, lastFailureAt: 0 }
+      providerHealth.set(providerName, entry)
+    }
+    return entry
+  }
+
+  // Time-to-first-byte samples feed the provider ranking. The EWMA reacts to a
+  // provider slowing down without letting one slow request reorder the chain.
+  const recordHealthSample = (provider, outcome, config, latencyMs) => {
+    if (outcome !== 'success' && outcome !== 'failure') return
+    const entry = healthFor(provider.name)
+    if (outcome === 'success') {
+      const sample = Number(latencyMs)
+      if (Number.isFinite(sample) && sample >= 0) {
+        const smoothing = normalizeProviderHealth(config?.providerHealth).smoothing
+        entry.latencyMs = entry.samples === 0 ? sample : entry.latencyMs * (1 - smoothing) + sample * smoothing
+        entry.samples += 1
+      }
+      entry.successes += 1
+      entry.failures = 0
+      entry.lastSuccessAt = now()
+      return
+    }
+    entry.failures += 1
+    entry.lastFailureAt = now()
+  }
+
+  // Provider-level failures open the circuit. A successful HTTP response from
+  // the provider - including a 4xx caused by the request or a key - proves the
+  // endpoint is reachable, so it closes the circuit without resetting key state.
+  const recordProviderOutcome = (provider, outcome, config, latencyMs) => {
+    recordHealthSample(provider, outcome, config, latencyMs)
+    const rules = normalizeCircuitBreaker(config.circuitBreaker)
+    if (!rules.enabled) return
+    const circuit = circuitFor(provider.name)
+    if (outcome === 'success') {
+      circuit.failures = 0
+      circuit.state = 'closed'
+      circuit.openUntil = 0
+      circuit.probeInFlight = false
+      return
+    }
+    if (outcome === 'neutral') {
+      circuit.probeInFlight = false
+      return
+    }
+    if (outcome !== 'failure') return
+    circuit.probeInFlight = false
+    circuit.failures += 1
+    if (circuit.state === 'half-open' || circuit.failures >= rules.failureThreshold) {
+      circuit.state = 'open'
+      circuit.openUntil = now() + rules.cooldownMs
+      circuit.probeInFlight = false
+    }
+  }
+
+  // What the panel shows for a provider: measured speed plus the same health
+  // signals the ranking uses, so the displayed state explains the order.
+  const providerHealthView = (providerName, timestamp) => {
+    const entry = providerHealth.get(providerName)
+    const circuit = providerCircuits.get(providerName)
+    const config = configRef()
+    const rules = normalizeCircuitBreaker(config.circuitBreaker)
+    const options = normalizeProviderHealth(config.providerHealth)
+    const open = circuit?.state === 'open' && circuit.openUntil > timestamp
+    const failedSinceSuccess = Boolean(entry && entry.lastFailureAt > (entry.lastSuccessAt ?? 0))
+    const degraded = Boolean(entry && failedSinceSuccess && entry.failures >= rules.failureThreshold)
+    const stale = Boolean(entry && entry.samples > 0 && entry.lastSuccessAt && timestamp - entry.lastSuccessAt > options.staleMs)
+    const state = open ? 'open' : degraded ? 'degraded' : stale ? 'stale' : entry && entry.samples > 0 ? 'healthy' : 'unknown'
+    return {
+      state,
+      latencyMs: entry && entry.samples > 0 ? Math.round(entry.latencyMs) : null,
+      samples: entry?.samples ?? 0,
+      failures: entry?.failures ?? 0,
+      lastSuccessAt: entry?.lastSuccessAt || undefined,
+      lastFailureAt: entry?.lastFailureAt || undefined
+    }
+  }
+
   const keyState = (id) => {
     if (keyStates.size > 4000) {
       const t = now()
@@ -2207,27 +2780,94 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
 
   const keyIdentity = (key) => key?.secretKey ?? key?.id ?? ''
 
-  const pickKey = (provider, config, estimatedTokens, imageCount) => {
+  const pickKey = (provider, config, estimatedTokens, imageCount, { allowCooling = false, model = '', affinity = '' } = {}) => {
     const timestamp = now()
+    const scheduler = normalizeScheduler(config.scheduler)
+    const bindingKey = scheduler.cacheAffinity && affinity
+      ? `${provider.name}\u0000${model}\u0000${affinity}`
+      : ''
+    const rememberAffinity = (key) => {
+      if (!bindingKey || !key) return
+      if (affinityBindings.size > 5000) {
+        for (const [id, binding] of affinityBindings) if (binding.expiresAt <= timestamp) affinityBindings.delete(id)
+      }
+      affinityBindings.set(bindingKey, {
+        keyId: keyIdentity(key),
+        expiresAt: timestamp + scheduler.cacheAffinityTtlMs
+      })
+    }
     const keys = (provider.keys ?? []).filter((key) => key.enabled !== false)
-    if (!keys.length) return null
-    // Keys that recently failed are skipped so later calls keep rotating. When
-    // every key is cooling we fall back to the full pool rather than failing.
-    const cooled = keys.filter((key) => (keyCooldowns.get(keyIdentity(key)) ?? 0) <= timestamp)
-    const candidates = cooled.length ? cooled : keys
-    const usable = candidates.filter((key) => keyWithinLimits(key, keyState(keyIdentity(key)), timestamp, estimatedTokens, imageCount))
-    const pool = usable.length ? usable : candidates
-    const sorted = [...pool].sort((a, b) => (a.priority ?? 0) - (b.priority ?? 0) || (b.weight ?? 1) - (a.weight ?? 1))
-    // Round-robin across the whole usable pool; priority only orders the cycle.
-    const cursor = keyCursors.get(provider.name) ?? 0
-    const chosen = sorted[cursor % sorted.length]
-    keyCursors.set(provider.name, (cursor + 1) % sorted.length)
-    return chosen
+    // A provider with no configured keys is keyless/pass-through, not exhausted.
+    if (!keys.length) return { key: null, keyless: true }
+    const cooling = keys.filter((key) => (keyCooldowns.get(keyIdentity(key)) ?? 0) <= timestamp)
+    // A retry inside the same request may reuse a key that was just cooled by a
+    // 429, after the retry delay. A fresh request still starts from the healthy
+    // pool and gets the explicit exhausted response if there is none.
+    const available = allowCooling && !cooling.length ? keys : cooling
+    const usable = available.filter((key) => keyWithinLimits(key, keyState(keyIdentity(key)), timestamp, estimatedTokens, imageCount))
+    if (!usable.length) {
+      // Legacy "overflow" mode keeps the previous behaviour of using a key
+      // anyway when every key is cooling or over limit. The default is a hard
+      // stop so an explicit exhausted response is visible to the client.
+      if (scheduler.allKeysExhausted === 'overflow') {
+        const candidates = available.length ? available : keys
+        const within = candidates.filter((key) => keyWithinLimits(key, keyState(keyIdentity(key)), timestamp, estimatedTokens, imageCount))
+        const pool = within.length ? within : candidates
+        const chosen = selectScheduledKey({
+          providerName: provider.name,
+          candidates: pool.map((key) => ({
+            key,
+            id: keyIdentity(key),
+            priority: key.priority ?? 0,
+            weight: key.weight ?? 1,
+            utilization: keyUtilization(key, keyState(keyIdentity(key)), timestamp, estimatedTokens, imageCount)
+          })),
+          scheduler: { ...scheduler, priorityTiers: false, utilizationAware: false },
+          state: schedulerState
+        })
+        rememberAffinity(chosen?.key)
+        return { key: chosen?.key ?? null, overflow: true }
+      }
+      const limited = available.length > 0 && available.every(
+        (key) => !keyWithinLimits(key, keyState(keyIdentity(key)), timestamp, estimatedTokens, imageCount)
+      )
+      return { key: null, exhausted: true, reason: limited ? 'limited' : 'cooling' }
+    }
+    if (bindingKey) {
+      const binding = affinityBindings.get(bindingKey)
+      if (binding) {
+        const bound = binding.expiresAt > timestamp
+          ? usable.find((key) => keyIdentity(key) === binding.keyId)
+          : null
+        if (bound) {
+          binding.expiresAt = timestamp + scheduler.cacheAffinityTtlMs
+          return { key: bound, affinity: true }
+        }
+        affinityBindings.delete(bindingKey)
+      }
+    }
+    const chosen = selectScheduledKey({
+      providerName: provider.name,
+      candidates: usable.map((key) => ({
+        key,
+        id: keyIdentity(key),
+        priority: key.priority ?? 0,
+        weight: key.weight ?? 1,
+        utilization: keyUtilization(key, keyState(keyIdentity(key)), timestamp, estimatedTokens, imageCount)
+      })),
+      scheduler,
+      state: schedulerState
+    })
+    rememberAffinity(chosen?.key)
+    return { key: chosen?.key ?? null, exhausted: !chosen, reason: chosen ? '' : 'unavailable' }
   }
 
-  const markKeyFailure = (key, status) => {
+  const markKeyFailure = (key, status, retryAfter) => {
     if (!key) return
-    const cooldown = KEY_COOLDOWN_MS[status]
+    const headerCooldown = retryAfterMs(retryAfter, now())
+    const cooldown = headerCooldown > 0
+      ? Math.min(MAX_KEY_COOLDOWN_MS, Math.max(1000, headerCooldown))
+      : KEY_COOLDOWN_MS[status]
     if (!cooldown) return
     if (keyCooldowns.size > 2000) {
       const t = now()
@@ -2286,6 +2926,73 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
       return provider.endpoints[0]?.baseUrl ?? provider.baseUrl
     }
     return provider.baseUrl
+  }
+
+  // Semantic cache embeddings: one explicit provider/model chosen in the panel,
+  // called through the same key pool and header rules as chat traffic. Any
+  // failure simply bypasses the semantic layer; exact caching still works.
+  async function embedCacheText(text, options, config) {
+    if (!text || !options.embeddingProvider || !options.embeddingModel) return null
+    const provider = providersFor(config).find((item) => item.name === options.embeddingProvider)
+    if (!provider) return null
+    const protocols = provider.protocols ?? []
+    if (!protocols.includes('openai') && !protocols.includes('passthrough')) return null
+    const selection = pickKey(provider, config, 0, 0, { model: options.embeddingModel })
+    if (selection.exhausted) return null
+    const incoming = { headers: {} }
+    const headers = buildHeaders(provider, selection.key, incoming, 'openai')
+    headers['content-type'] = 'application/json'
+    try {
+      const response = await fetchFn(joinUpstreamUrl(endpointFor(provider, 'openai'), '/embeddings'), {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ model: options.embeddingModel, input: text }),
+        signal: AbortSignal.timeout(20_000)
+      })
+      if (!response.ok) return null
+      const payload = await response.json()
+      const vector = payload?.data?.[0]?.embedding ?? payload?.embedding
+      return Array.isArray(vector) && vector.length ? vector : null
+    } catch {
+      return null
+    }
+  }
+
+  // Capture what the gateway sends back so a successful response can be
+  // replayed later. Oversized bodies are simply not cached.
+  function createResponseCapture(res, limit) {
+    let body = ''
+    let contentType = 'application/json'
+    let overflow = false
+    const append = (chunk) => {
+      if (chunk == null || overflow) return
+      const text = Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk)
+      if (body.length + text.length > limit) {
+        overflow = true
+        body = ''
+        return
+      }
+      body += text
+    }
+    return {
+      res: {
+        writeHead(status, headers) {
+          if (headers && typeof headers === 'object') {
+            contentType = headers['content-type'] ?? headers['Content-Type'] ?? contentType
+          }
+          return res.writeHead(status, headers)
+        },
+        write(chunk, ...rest) {
+          append(chunk)
+          return res.write(chunk, ...rest)
+        },
+        end(chunk, ...rest) {
+          append(chunk)
+          return res.end(chunk, ...rest)
+        }
+      },
+      result: () => (overflow || !body ? null : { body, contentType })
+    }
   }
 
   const targetProtocol = (provider, pathProtocol) => {
@@ -2456,7 +3163,7 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     return Number.isFinite(n) && n > 0 ? Math.floor(n) : 1
   }
 
-  async function forwardOnce(target, clientProtocol, path, body, incoming, { rawBody, wantsStreamHint } = {}) {
+  async function forwardOnce(target, clientProtocol, path, body, incoming, { rawBody, wantsStreamHint, allowCooling = false, affinityKey = '' } = {}) {
     const config = configRef()
     const provider = target.provider
     const responseProtocol = targetProtocol(provider, clientProtocol)
@@ -2514,7 +3221,8 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     }
     const estimated = estimateTokens(upstreamBody)
     const imageCount = countImages(upstreamBody)
-    const key = pickKey(provider, config, estimated, imageCount)
+    const selection = pickKey(provider, config, estimated, imageCount, { allowCooling, model: target.model, affinity: affinityKey })
+    const key = selection.key
     const headers = buildHeaders(provider, key, incoming, responseProtocol)
     // Never leak the client's gateway auth to providers.
     delete headers['x-auth-api-key']
@@ -2524,8 +3232,15 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
       if (!secret && !key.forwardClientAuth) {
         return { error: { status: 502, message: `no usable credential for provider '${provider.name}' (missing secret for selected key)` } }
       }
-    } else if (hasConfiguredSecrets) {
-      return { error: { status: 429, message: `no usable credential for provider '${provider.name}' (keys limited or cooling down)` } }
+    } else if (hasConfiguredSecrets && selection.exhausted) {
+      const scheduler = normalizeScheduler(config.scheduler)
+      return {
+        error: {
+          status: scheduler.exhaustedStatus,
+          code: 'all_keys_exhausted',
+          message: `no usable credential for provider '${provider.name}' (${selection.reason === 'cooling' ? 'all keys are cooling down' : 'all keys are over their limits'})`
+        }
+      }
     }
     // Providers with no configured keys are treated as keyless/pass-through at
     // the provider side; client gateway auth is still never forwarded upstream.
@@ -2583,6 +3298,9 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     const wantsStream = body?.stream === true || geminiClientMatch?.[2] === 'streamGenerateContent'
     const clientImageCount = imageGenerationCount(path, body)
     const chatRequest = isChatPath(path) || Boolean(body && (body.model || body.messages || body.input || body.contents || body.instructions || body.system))
+    // Optimization applies only to actual generation endpoints, never to
+    // auxiliary chat-shaped calls such as /v1/messages/count_tokens.
+    const optimizableChat = isChatPath(path)
 
     const auth = clientAuth(config, req.headers, clientImageCount)
     if (!auth.ok) {
@@ -2596,15 +3314,23 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     if (workingBody && !workingBody.model && requestedModel) workingBody.model = requestedModel
     const headers = {}
     for (const [name, value] of Object.entries(req.headers)) headers[String(name).toLowerCase()] = Array.isArray(value) ? value[0] : value
-    const matchedRule = workingBody ? applyRulesForModel(config, workingBody, headers) : null
+    const affinityKey = deriveAffinityKey(headers, workingBody)
+    const matchedPolicy = workingBody ? applyPolicies(config, workingBody, headers) : null
     const effectiveModel = workingBody?.model ?? requestedModel
-    const fallback = matchedRule?.fallback ?? config.defaultFallback
-    const chain = chatRequest ? buildChainFromFallback(config, effectiveModel, fallback) : []
+    // A route is the failover unit: when the request names one, its targets
+    // form the chain and the route's strategy decides health ranking. A policy
+    // can still add retries or extra targets after the route.
+    const matchedRoute = chatRequest ? findRoute(config, effectiveModel) : null
+    // A policy may point at a route or a raw provider/model target. A raw
+    // provider/model primary is never given extra failover targets: it is a
+    // single target with retries.
+    const policyFallback = matchedPolicy?.fallback ?? null
+    const chain = chatRequest ? buildChainFromFallback(config, effectiveModel, policyFallback) : []
     if (!chain.length) {
       if (!chatRequest) {
         // Passthrough for non-chat endpoints (embeddings, audio, unknown paths):
-        // route via default provider when configured, preserving body/stream.
-        const passthroughProvider = providerByName(config, config.defaultProvider) ?? providersFor(config)[0]
+        // route via the first enabled provider, preserving body/stream.
+        const passthroughProvider = providersFor(config)[0]
         if (passthroughProvider) chain.push({ provider: passthroughProvider, model: effectiveModel || requestedModel })
       }
     }
@@ -2621,33 +3347,211 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
       return entry && undefined
     }
 
-    const retryCount = fallback?.mode === 'retry' ? Number(fallback.retryCount ?? config.retries ?? 2) : fallback?.mode === 'model-chain' ? Number(fallback.retryCount ?? 0) : 0
+    // Health ranking only reorders a route's targets. A raw
+    // provider/model request has one target, so there is nothing to rank.
+    const chainRoute = matchedRoute ?? fallbackRouteFor(config, policyFallback)
+    const rankByHealth = chainRoute ? chainRoute.strategy !== 'ordered' : false
+    const orderedChain = rankProviderTargets({
+      targets: chain,
+      health: providerHealth,
+      circuits: providerCircuits,
+      affinity: providerAffinity.get(affinityKey),
+      config,
+      enabled: rankByHealth,
+      timestamp: now()
+    })
+    if (orderedChain.length && affinityKey && rankByHealth) {
+      const scheduler = normalizeScheduler(config.scheduler)
+      if (scheduler.cacheAffinity) {
+        providerAffinity.set(affinityKey, { provider: orderedChain[0].provider.name, at: now() })
+        pruneProviderAffinity(scheduler.cacheAffinityTtlMs)
+      }
+    }
+
+    // --- Opt-in request optimization -------------------------------------
+    // Compression runs on the post-rule body. Context relay is applied per
+    // attempt when the chain moves to another target. The response cache is
+    // keyed by the exact transformed request and the first resolved target.
+    const compressionOptions = normalizeCompression(config.compression)
+    const relayOptions = normalizeContextRelay(config.contextRelay)
+    const cacheOptions = normalizeResponseCache(config.responseCache)
+    let routedBody = workingBody
+    let compressionInfo = null
+    if (optimizableChat && workingBody && compressionOptions.enabled) {
+      const requestedMode = String(headers['x-router-compression'] ?? '').toLowerCase()
+      const mode = requestedMode === 'off'
+        ? null
+        : COMPRESSION_MODES.includes(requestedMode) ? requestedMode : compressionOptions.mode
+      if (mode && bodyCharLength(workingBody) >= compressionOptions.minChars) {
+        const result = compressChatBody(workingBody, {
+          protocol: clientProtocol,
+          options: { ...compressionOptions, mode }
+        })
+        if (result.changed) {
+          routedBody = result.body
+          compressionInfo = { mode, before: result.before, after: result.after, saved: result.before - result.after }
+          stats.compressionSavedChars += compressionInfo.saved
+        }
+      }
+    }
+
+    let cachePlan = null
+    let cacheVector = null
+    if (optimizableChat && req.method === 'POST' && routedBody && orderedChain.length
+      && shouldCacheRequest({ protocol: clientProtocol, body: routedBody, headers, options: cacheOptions })) {
+      const cacheTarget = orderedChain[0]
+      const scopeParts = [clientProtocol, wantsStream ? 'stream' : 'json', cacheTarget.provider.name, cacheTarget.model]
+      if (cacheOptions.mode === 'semantic') scopeParts.push(`embed:${cacheOptions.embeddingProvider}/${cacheOptions.embeddingModel}`)
+      const scope = scopeParts.join('\u0000')
+      cachePlan = {
+        scope,
+        key: canonicalCacheKey({ scope, body: routedBody }),
+        target: cacheTarget,
+        paramsKey: cacheOptions.mode === 'semantic' ? semanticParamsKey(routedBody, clientProtocol) : null,
+        promptText: cacheOptions.mode === 'semantic' ? extractPromptText(routedBody, clientProtocol) : ''
+      }
+    }
+    let cached = cachePlan ? responseCache.get(cachePlan.key) : null
+    let cacheHitKind = cached ? 'hit' : null
+    const cacheBypassed = !cachePlan && cacheOptions.enabled
+      && String(headers['x-router-cache'] ?? '').toLowerCase() === 'off'
+    if (cachePlan && !cached && cacheOptions.mode === 'semantic' && cachePlan.promptText) {
+      cacheVector = await embedCacheText(cachePlan.promptText, cacheOptions, config)
+      if (cacheVector) {
+        cached = responseCache.findSemantic(cachePlan.scope, cacheVector, cacheOptions.threshold, cacheOptions.maxEntries, cachePlan.paramsKey)
+        if (cached) cacheHitKind = 'semantic-hit'
+      }
+    }
+    if (cached) {
+      const responseHeaders = {
+        'content-type': cached.response.contentType || 'application/json',
+        'x-router-cache': cacheHitKind
+      }
+      if (compressionInfo) responseHeaders['x-router-compression'] = `${compressionInfo.mode}; saved=${compressionInfo.saved}`
+      if (config.exposeRoutingHeaders) {
+        responseHeaders['x-router-provider'] = cachePlan.target.provider.name
+        responseHeaders['x-router-model'] = String(cachePlan.target.model ?? '')
+        responseHeaders['x-router-attempts'] = '0'
+      }
+      res.writeHead(cached.response.status, responseHeaders)
+      res.end(cached.response.body)
+      log({
+        upstream: cachePlan.target.provider.name,
+        resolvedProvider: cachePlan.target.provider.name,
+        resolvedModel: cachePlan.target.model,
+        model: cachePlan.target.model,
+        requestModel: requestedModel,
+        protocol: clientProtocol,
+        status: cached.response.status,
+        latencyMs: 0,
+        attempts: [],
+        failures: [],
+        cache: cacheHitKind,
+        cacheSavedTokens: (cached.tokens?.input ?? 0) + (cached.tokens?.output ?? 0),
+        cacheSavedCost: Number(cached.cost ?? 0),
+        tokens: cached.tokens ?? null,
+        cost: 0,
+        requestBody: routedBody,
+        requestHeaders: redactValue(req.headers)
+      }, { config, status: cached.response.status })
+      if (auth.state) recordClientUsage(auth.state, cached.tokens ?? null, clientImageCount)
+      stats.cacheHits++
+      if (cached.tokens) stats.cacheSavedTokens += (cached.tokens.input ?? 0) + (cached.tokens.output ?? 0)
+      stats.cacheSavedCost += Number(cached.cost ?? 0)
+      return
+    }
+
+    let relayBody = null
+    let relayInfo = null
+    let relayUsed = false
+    const relayOverBudget = Boolean(optimizableChat && relayOptions.enabled && routedBody && bodyCharLength(routedBody) > relayOptions.maxChars)
+
+    const retryCount = matchedRoute
+      ? Number(matchedRoute.retries ?? config.retries ?? 2)
+      : Number(config.retries ?? 2)
     const attemptsPerTarget = retryCount + 1
     const attempts = []
     const failures = []
     const delaysMs = []
     let lastErrorBody = null
     let lastStatus = 502
+    let sawExhausted = false
+    let sawCircuitOpen = false
+    let circuitRetryAfterMs = 0
+    let madeAttempt = false
+    let exhaustedReason = ''
     const startedTotal = now()
 
-    for (let chainIndex = 0; chainIndex < chain.length; chainIndex++) {
-      const target = chain[chainIndex]
+    for (let chainIndex = 0; chainIndex < orderedChain.length; chainIndex++) {
+      const target = orderedChain[chainIndex]
+      // A handoff digest is only needed when the request actually moves to
+      // another target (or when explicitly configured to always compact).
+      const relayNow = Boolean(optimizableChat && relayOptions.enabled && routedBody && (
+        relayOptions.trigger === 'always'
+        || (chainIndex > 0 && (relayOptions.trigger === 'failover' || relayOptions.trigger === 'both'))
+        || (relayOptions.trigger === 'both' && relayOverBudget)
+      ))
+      let attemptBody = routedBody
+      if (relayNow) {
+        if (!relayBody) {
+          const result = relayChatBody(routedBody, { protocol: clientProtocol, options: relayOptions })
+          relayBody = result.changed ? result.body : routedBody
+          if (result.changed) {
+            relayInfo = { before: result.before, after: result.after, relayed: result.relayed }
+            stats.relayEvents++
+          }
+        }
+        if (relayBody !== routedBody) {
+          attemptBody = relayBody
+          relayUsed = true
+        }
+      }
       // Rotate through the pool even when fallback retries are off: each key
       // gets a try on key-level failures (auth errors, rate limits).
       const enabledKeyCount = (target.provider.keys ?? []).filter((key) => key.enabled !== false).length
       const targetAttempts = Math.max(attemptsPerTarget, Math.min(enabledKeyCount, MAX_KEY_ATTEMPTS))
       for (let attempt = 0; attempt < targetAttempts; attempt++) {
+        const circuit = providerCircuitAllows(target.provider, config)
+        if (!circuit.allowed) {
+          sawCircuitOpen = true
+          if (circuit.retryAfterMs) {
+            circuitRetryAfterMs = circuitRetryAfterMs
+              ? Math.min(circuitRetryAfterMs, circuit.retryAfterMs)
+              : circuit.retryAfterMs
+          }
+          attempts.push(`${target.provider.name}#circuit_open`)
+          failures.push({
+            provider: target.provider.name,
+            status: 503,
+            error: 'provider circuit is open',
+            code: 'provider_circuit_open'
+          })
+          lastStatus = 503
+          break
+        }
         const started = now()
         try {
           const forwarded = await forwardOnce(
             { provider: target.provider, model: target.model },
-            clientProtocol, path, workingBody, req,
-            { rawBody, wantsStreamHint: wantsStream }
+            clientProtocol, path, attemptBody, req,
+            { rawBody, wantsStreamHint: wantsStream, allowCooling: attempt > 0 && lastStatus === 429, affinityKey }
           )
           if (forwarded?.error) {
-            attempts.push(`${target.provider.name}#${forwarded.error.status ?? 502}`)
-            failures.push({ provider: target.provider.name, status: forwarded.error.status ?? 502, error: forwarded.error.message })
-            lastStatus = forwarded.error.status ?? 502
+            const errorStatus = forwarded.error.status ?? 502
+            attempts.push(`${target.provider.name}#${errorStatus}`)
+            if (forwarded.error.code === 'all_keys_exhausted') {
+              recordProviderOutcome(target.provider, 'neutral', config)
+              sawExhausted = true
+              exhaustedReason = forwarded.error.message
+              failures.push({ provider: target.provider.name, status: errorStatus, error: forwarded.error.message, code: forwarded.error.code })
+              // No credential can be tried for this target. A model/provider
+              // chain may still have a target, but retrying this one is useless.
+              break
+            }
+            recordProviderOutcome(target.provider, 'neutral', config)
+            failures.push({ provider: target.provider.name, status: errorStatus, error: forwarded.error.message })
+            madeAttempt = true
+            lastStatus = errorStatus
             lastErrorBody = JSON.stringify({ error: { message: forwarded.error.message } })
             if (attempt < targetAttempts - 1) {
               const delay = (config.baseDelayMs ?? 200) * 2 ** attempt
@@ -2658,14 +3562,24 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
             break
           }
           const { upstreamRes, responseProtocol, forwardedModel, key, bufferForStream } = forwarded
+          madeAttempt = true
           const status = upstreamRes.status
+          // Time to response headers is the speed sample; consuming the body is
+          // deliberately excluded so large responses do not look slow.
+          recordProviderOutcome(target.provider, PROVIDER_FAILURE_STATUSES.has(status) ? 'failure' : 'success', config, now() - started)
           const moreAttemptsHere = attempt < targetAttempts - 1
-          const moreChain = chainIndex < chain.length - 1
+          const moreChain = chainIndex < orderedChain.length - 1
           const retryable = RETRYABLE_STATUSES.has(status)
           const keyRotatable = KEY_ROTATE_STATUSES.has(status) && moreAttemptsHere
-          const canFallback = fallback?.mode === 'model-chain' && DOWNSTREAM_FALLBACK_STATUSES(status)
+          const canFallback = !!chainRoute && DOWNSTREAM_FALLBACK_STATUSES(status)
+          // A 429 Retry-After is useful even when this was the final attempt:
+          // the credential should stay cooling for the interval the provider
+          // asked for so the next request does not hit it again. Provider-level
+          // 5xx responses are retried without cooling the key itself.
+          if (KEY_ROTATE_STATUSES.has(status)) {
+            markKeyFailure(key, status, upstreamRes.headers.get('retry-after'))
+          }
           if ((retryable || keyRotatable || canFallback) && (moreAttemptsHere || moreChain) && status !== 200) {
-            markKeyFailure(key, status)
             const failure = `${target.provider.name}#${status}`
             attempts.push(failure)
             failures.push({ provider: target.provider.name, status, credential: keyIdentity(key) || undefined })
@@ -2681,6 +3595,14 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
             break
           }
           if (status < 400) clearKeyFailure(key)
+          // Only the first resolved target owns the cache scope. A response
+          // that needed failover or relay is served, never stored.
+          const servedFirstTarget = cachePlan
+            && target.provider.name === cachePlan.target.provider.name
+            && String(target.model ?? '') === String(cachePlan.target.model ?? '')
+          const cacheStatus = cachePlan
+            ? (!relayUsed && servedFirstTarget ? 'miss' : 'bypass')
+            : cacheBypassed ? 'bypass' : null
           const entry = log({
             upstream: target.provider.name,
             resolvedProvider: target.provider.name,
@@ -2697,20 +3619,48 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
             bytes: rawBody.length,
             tokens: null,
             cost: null,
-            ruleId: matchedRule?.id ?? null,
-            requestBody: workingBody,
+            policyId: matchedPolicy?.id ?? null,
+            compression: compressionInfo,
+            relay: relayUsed ? relayInfo : null,
+            cache: cacheStatus,
+            requestBody: attemptBody,
             requestHeaders: redactValue(req.headers)
           }, { config, status })
-          const routingHeaders = config.exposeRoutingHeaders ? {
-            'x-router-provider': target.provider.name,
-            'x-router-model': String(forwardedModel ?? ''),
-            ...(matchedRule?.id ? { 'x-router-rule': matchedRule.id } : {}),
-            'x-router-attempts': String(attempts.length + 1)
-          } : null
-          await streamResponse(upstreamRes, responseProtocol, clientProtocol, res, forwardedModel, bufferForStream, target.provider, key, entry, { config, routingHeaders, chatRequest, wantsStream: forwarded.wantsStream })
+          const routingHeaders = {
+            ...(config.exposeRoutingHeaders ? {
+              'x-router-provider': target.provider.name,
+              'x-router-model': String(forwardedModel ?? ''),
+              ...(matchedPolicy?.id ? { 'x-router-policy': matchedPolicy.id } : {}),
+              'x-router-attempts': String(attempts.length + 1)
+            } : {}),
+            ...(compressionInfo ? { 'x-router-compression': `${compressionInfo.mode}; saved=${compressionInfo.saved}` } : {}),
+            ...(relayUsed && relayInfo ? { 'x-router-context-relay': `compacted; saved=${relayInfo.before - relayInfo.after}` } : {}),
+            ...(cacheStatus ? { 'x-router-cache': cacheStatus } : {})
+          }
+          const capture = cachePlan && cacheStatus === 'miss' ? createResponseCapture(res, 1_048_576) : null
+          await streamResponse(upstreamRes, responseProtocol, clientProtocol, capture ? capture.res : res, forwardedModel, bufferForStream, target.provider, key, entry, { config, routingHeaders, chatRequest, wantsStream: forwarded.wantsStream })
+          if (capture && status < 400) {
+            const captured = capture.result()
+            if (captured) {
+              responseCache.set({
+                key: cachePlan.key,
+                scope: cachePlan.scope,
+                paramsKey: cachePlan.paramsKey,
+                promptText: cachePlan.promptText,
+                vector: cacheVector,
+                response: { status, contentType: captured.contentType, body: captured.body },
+                tokens: entry.tokens ?? null,
+                cost: Number(entry.cost ?? 0),
+                createdAt: now(),
+                expiresAt: now() + cacheOptions.ttlMs
+              }, cacheOptions.maxEntries)
+            }
+          }
           if (auth.state) recordClientUsage(auth.state, entry.tokens, clientImageCount)
           return
         } catch (error) {
+          madeAttempt = true
+          recordProviderOutcome(target.provider, 'failure', config)
           attempts.push(`${target.provider.name}#${error?.name ?? 'error'}`)
           failures.push({ provider: target.provider.name, error: String(error?.message ?? error) })
           lastStatus = 502
@@ -2724,22 +3674,82 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
       }
     }
 
-    log({ upstream: null, resolvedProvider: null, resolvedModel: effectiveModel, protocol: clientProtocol, status: lastStatus, latencyMs: now() - startedTotal, attempts, failures, error: lastErrorBody ? 'upstream failed' : 'all providers failed', requestBody: workingBody, requestHeaders: redactValue(req.headers), responseBody: lastErrorBody }, { config, status: lastStatus })
-    res.writeHead(lastStatus, { 'content-type': 'application/json', 'x-router-fallback-attempts': String(attempts.length), 'x-router-fallback-failures': failures.length ? JSON.stringify(failures) : '', 'x-router-fallback-delays-ms': delaysMs.join(',') })
-    res.end(JSON.stringify({ error: { message: lastErrorBody ? safeJsonPreview(lastErrorBody) : `all providers failed (${attempts.join(', ')})`, attempts } }))
+    const scheduler = normalizeScheduler(config.scheduler)
+    const allCircuitOpen = sawCircuitOpen && !madeAttempt
+    const allExhausted = sawExhausted && !madeAttempt && !allCircuitOpen
+    const finalStatus = allExhausted ? scheduler.exhaustedStatus : allCircuitOpen ? 503 : lastStatus
+    const finalError = allExhausted
+      ? JSON.stringify({
+          error: {
+            type: 'router_exhausted',
+            code: 'all_keys_exhausted',
+            message: exhaustedReason || 'all configured credentials are cooling down or over their limits'
+          }
+        })
+      : allCircuitOpen
+        ? JSON.stringify({
+            error: {
+              type: 'router_unavailable',
+              code: 'provider_circuit_open',
+              message: 'every candidate provider is temporarily circuit-open'
+            }
+          })
+        : lastErrorBody
+    log({ upstream: null, resolvedProvider: null, resolvedModel: effectiveModel, protocol: clientProtocol, status: finalStatus, latencyMs: now() - startedTotal, attempts, failures, error: allExhausted ? 'all keys exhausted' : allCircuitOpen ? 'all providers circuit-open' : lastErrorBody ? 'upstream failed' : 'all providers failed', compression: compressionInfo, relay: relayUsed ? relayInfo : null, cache: cachePlan ? (relayUsed ? 'bypass' : 'miss') : null, requestBody: routedBody, requestHeaders: redactValue(req.headers), responseBody: finalError }, { config, status: finalStatus })
+    const responseHeaders = {
+      'content-type': 'application/json',
+      'x-router-fallback-attempts': String(attempts.length),
+      'x-router-fallback-failures': failures.length ? JSON.stringify(failures) : '',
+      'x-router-fallback-delays-ms': delaysMs.join(',')
+    }
+    if (allExhausted) {
+      const retryAfter = retryAfterForChain(orderedChain)
+      if (retryAfter) responseHeaders['retry-after'] = String(retryAfter)
+    } else if (allCircuitOpen && circuitRetryAfterMs > 0) {
+      responseHeaders['retry-after'] = String(Math.max(1, Math.ceil(circuitRetryAfterMs / 1000)))
+    }
+    res.writeHead(finalStatus, responseHeaders)
+    if (allCircuitOpen) {
+      res.end(JSON.stringify({
+        error: {
+          type: 'router_unavailable',
+          code: 'provider_circuit_open',
+          message: 'every candidate provider is temporarily circuit-open',
+          attempts
+        }
+      }))
+      return
+    }
+    if (allExhausted) {
+      res.end(JSON.stringify({
+        error: {
+          type: 'router_exhausted',
+          code: 'all_keys_exhausted',
+          message: exhaustedReason || 'all configured credentials are cooling down or over their limits',
+          attempts
+        }
+      }))
+      return
+    }
+    res.end(JSON.stringify({ error: { message: finalError ? safeJsonPreview(finalError) : `all providers failed (${attempts.join(', ')})`, attempts } }))
   }
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
-  function retryDelayMs(retryAfter, base, attempt) {
-    if (retryAfter) {
-      const seconds = Number(retryAfter)
-      if (Number.isFinite(seconds) && seconds > 0) return Math.min(30_000, seconds * 1000)
-      const dateMs = Date.parse(String(retryAfter))
-      if (Number.isFinite(dateMs)) {
-        const delta = dateMs - now()
-        if (delta > 0) return Math.min(30_000, delta)
+  function retryAfterForChain(chain) {
+    const timestamp = now()
+    let earliest = Infinity
+    for (const target of chain) {
+      for (const key of target.provider?.keys ?? []) {
+        if (key.enabled === false) continue
+        const until = keyCooldowns.get(keyIdentity(key)) ?? 0
+        if (until > timestamp) earliest = Math.min(earliest, until)
       }
     }
+    return Number.isFinite(earliest) ? Math.max(1, Math.ceil((earliest - timestamp) / 1000)) : undefined
+  }
+  function retryDelayMs(retryAfter, base, attempt) {
+    const headerDelay = retryAfterMs(retryAfter, now())
+    if (headerDelay > 0) return Math.min(30_000, headerDelay)
     return Math.min(30_000, (base ?? 200) * 2 ** attempt)
   }
   function safeJsonPreview(text) {
@@ -2941,6 +3951,7 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     },
     status() {
       const config = configRef()
+      const timestamp = now()
       return {
         running: Boolean(server && bound),
         host: bound?.host ?? config.bindHost ?? '127.0.0.1',
@@ -2951,7 +3962,22 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
           baseUrl: p.baseUrl,
           protocols: p.protocols ?? [],
           models: (p.models ?? []).map((m) => m.id),
-          keyCount: (p.keys ?? []).length
+          keyCount: (p.keys ?? []).length,
+          health: providerHealthView(p.name, timestamp),
+          keyUsage: (p.keys ?? []).map((key) => {
+            const until = keyCooldowns.get(keyIdentity(key)) ?? 0
+            const usage = keyUsageSnapshot(key, keyStates.get(keyIdentity(key)), timestamp)
+            const enabled = key.enabled !== false
+            const limited = usage.meters.some((meter) => meter.used >= meter.limit)
+            return {
+              id: key.id,
+              secretKey: key.secretKey,
+              enabled,
+              cooldownUntil: until > timestamp ? until : undefined,
+              state: !enabled ? 'disabled' : until > timestamp ? 'cooling' : limited ? 'limited' : 'ready',
+              ...usage
+            }
+          })
         })),
         upstreams: config.providers.map((p) => ({
           name: p.name,
@@ -2959,10 +3985,7 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
           protocols: p.protocols ?? [],
           keyCount: (p.keys ?? []).length
         })),
-        routes: config.routes,
-        rules: config.routes,
-        defaultProvider: config.defaultProvider ?? '',
-        defaultUpstream: config.defaultProvider ?? '',
+        policies: config.policies,
         aliases: config.aliases ?? {},
         clientKeys: (config.clientKeys ?? []).map((key) => ({ id: key.id, name: key.name, expiresAt: key.expiresAt, limits: key.limits, enabled: key.enabled !== false })),
         agentProfiles: config.agentProfiles ?? []
@@ -2970,6 +3993,20 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     },
     clearKeyCooldown(identity) {
       if (identity) keyCooldowns.delete(identity)
+    },
+    // The panel's speed test feeds the same samples real traffic produces, so a
+    // manual test can prime the ranking for a provider that has been idle.
+    recordProbes(results = []) {
+      const config = configRef()
+      for (const result of results) {
+        const provider = config.providers.find((item) => item.name === result?.provider)
+        if (!provider) continue
+        // A 401/403 still proves the endpoint is up; only a real transport or
+        // 5xx failure counts against health, matching live traffic.
+        const reachable = result.ok || result.status === 401 || result.status === 403
+        recordHealthSample(provider, reachable ? 'success' : 'failure', config, result.latencyMs)
+      }
+      return { ok: true }
     },
     usage({ window = 'today', now: at = now() } = {}) {
       const since = window === '24h' ? at - 86_400_000 : window === '7d' ? at - 7 * 86_400_000 : window === '30d' ? at - 30 * 86_400_000 : new Date(at).setHours(0, 0, 0, 0)
@@ -2988,6 +4025,11 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
           totalTokens: stats.inputTokens + stats.outputTokens,
           cost: stats.cost,
           avgLatencyMs: stats.requests ? stats.latencyMsTotal / stats.requests : 0,
+          cacheHits: stats.cacheHits,
+          cacheSavedTokens: stats.cacheSavedTokens,
+          cacheSavedCost: stats.cacheSavedCost,
+          compressionSavedChars: stats.compressionSavedChars,
+          relayEvents: stats.relayEvents,
           byProvider: Object.entries(stats.byProvider).map(([provider, count]) => ({ provider, count })),
           byModel: Object.entries(stats.byModel).map(([model, count]) => ({ model, count })).sort((a, b) => b.count - a.count),
           totals: { ...stats },
@@ -2997,6 +4039,11 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
       const sum = (key, field) => recent.filter((entry) => entry.status < 400).reduce((total, entry) => total + (entry[key]?.[field] ?? 0), 0)
       const successful = recent.filter((entry) => entry.status < 400).length
       const latencyTotal = recent.reduce((total, entry) => total + (entry.latencyMs ?? 0), 0)
+      const cacheHits = recent.filter((entry) => entry.cache === 'hit' || entry.cache === 'semantic-hit').length
+      const cacheSavedTokens = recent.reduce((total, entry) => total + (entry.cacheSavedTokens ?? 0), 0)
+      const cacheSavedCost = recent.reduce((total, entry) => total + (entry.cacheSavedCost ?? 0), 0)
+      const compressionSavedChars = recent.reduce((total, entry) => total + (entry.compression?.saved ?? 0), 0)
+      const relayEvents = recent.filter((entry) => entry.relay).length
       return {
         window,
         since,
@@ -3008,6 +4055,11 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
         totalTokens: sum('tokens', 'input') + sum('tokens', 'output'),
         cost: recent.reduce((total, entry) => total + (entry.cost ?? 0), 0),
         avgLatencyMs: recent.length ? latencyTotal / recent.length : 0,
+        cacheHits,
+        cacheSavedTokens,
+        cacheSavedCost,
+        compressionSavedChars,
+        relayEvents,
         byProvider: Object.entries(recent.reduce((acc, entry) => { if (entry.resolvedProvider) acc[entry.resolvedProvider] = (acc[entry.resolvedProvider] ?? 0) + 1; return acc }, {})).map(([provider, count]) => ({ provider, count })),
         byModel: Object.entries(recent.reduce((acc, entry) => { if (entry.resolvedModel) acc[entry.resolvedModel] = (acc[entry.resolvedModel] ?? 0) + 1; return acc }, {})).map(([model, count]) => ({ model, count })).sort((a, b) => b.count - a.count),
         totals: { ...stats }
@@ -3056,15 +4108,21 @@ function evalMeterExpression(expression, payload) {
   return Number.isFinite(number) && value !== undefined ? number : undefined
 }
 
-export async function fetchProviderUsage(provider, { getSecret, fetchImpl } = {}) {
-  const connectors = provider.usageFetch?.connectors ?? provider.usageFetch?.enabled === false ? [] : []
-  if (provider.usageFetch?.enabled === false || !connectors.length) return { provider: provider.name, status: 'unsupported', meters: [], errors: [{ message: 'usage fetch not configured' }] }
+export async function fetchProviderUsage(provider, { getSecret, fetchImpl, secretKey } = {}) {
+  const connectors = provider.usageFetch?.enabled === false ? [] : (provider.usageFetch?.connectors ?? [])
+  if (provider.usageFetch?.enabled === false || !connectors.length) return { provider: provider.name, secretKey, status: 'unsupported', meters: [], errors: [{ message: 'usage fetch not configured' }] }
   const fetchFn = fetchImpl ?? globalThis.fetch
   const meters = []
   const errors = []
   for (const connector of connectors) {
     try {
-      const key = (provider.keys ?? []).map((entry) => getSecret?.(entry.secretKey)).find(Boolean)
+      const key = secretKey
+        ? getSecret?.(secretKey)
+        : (provider.keys ?? []).map((entry) => getSecret?.(entry.secretKey)).find(Boolean)
+      if (connector.auth !== 'none' && !key) {
+        errors.push({ message: 'no credential available' })
+        continue
+      }
       const headers = { ...(connector.headers ?? {}) }
       if (connector.auth !== 'none' && key) headers.authorization = `Bearer ${key}`
       const res = await fetchFn(connector.endpoint, {
@@ -3079,11 +4137,14 @@ export async function fetchProviderUsage(provider, { getSecret, fetchImpl } = {}
         continue
       }
       for (const meter of connector.mapping?.meters ?? []) {
+        const rawUnit = typeof meter.unit === 'string' && meter.unit.startsWith('$.')
+          ? jsonPathValue(meter.unit, payload)
+          : meter.unit
         const mapped = {
           id: meter.id,
           kind: meter.kind ?? 'balance',
           label: meter.label ?? meter.id,
-          unit: meter.unit ?? '',
+          unit: typeof rawUnit === 'string' ? rawUnit : '',
           window: meter.window,
           limit: evalMeterExpression(meter.limit, payload),
           used: evalMeterExpression(meter.used, payload),
@@ -3097,7 +4158,7 @@ export async function fetchProviderUsage(provider, { getSecret, fetchImpl } = {}
       errors.push({ message: String(error?.message ?? error) })
     }
   }
-  return { provider: provider.name, status: errors.length && !meters.length ? 'error' : 'ok', meters, errors }
+  return { provider: provider.name, secretKey, status: errors.length && !meters.length ? 'error' : 'ok', meters, errors }
 }
 
 export async function discoverProviderModels(provider, { getSecret, fetchImpl } = {}) {

@@ -119,14 +119,14 @@ writeFileSync(configPath, JSON.stringify(config, null, 2))
 writeFileSync(secretsPath, JSON.stringify(secrets, null, 2))
 
 const aliasCount = Object.keys(config.aliases || {}).length
-const ruleCount = (config.routes || []).length
+const policyCount = (config.policies || []).length
 const keyCount = (config.clientKeys || []).length
 const profileCount = (config.agentProfiles || []).length
 
 console.log(`\nSuccessfully converted from ${sourceDescription}:`)
 console.log(`  • Providers:      ${config.providers.length}`)
 console.log(`  • Aliases:        ${aliasCount}`)
-console.log(`  • Routing Rules:  ${ruleCount}`)
+console.log(`  • Policies:       ${policyCount}`)
 console.log(`  • Client Keys:    ${keyCount}`)
 console.log(`  • Agent Profiles: ${profileCount}`)
 console.log(`  • Secrets:        ${secrets.length}`)

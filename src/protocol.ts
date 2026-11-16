@@ -12,10 +12,7 @@ declare module 'orca' {
         port: number
         providers: ProviderView[]
         upstreams: ProviderView[]
-        routes: RouteRule[]
-        rules: RouteRule[]
-        defaultProvider: string
-        defaultUpstream: string
+        policies: RequestPolicy[]
         aliases: Record<string, string>
         clientKeys: { id: string; name: string; expiresAt?: string; limits?: Record<string, unknown>; enabled: boolean }[]
         agentProfiles: AgentProfile[]
@@ -48,6 +45,11 @@ declare module 'orca' {
         totalTokens: number
         cost: number
         avgLatencyMs: number
+        cacheHits?: number
+        cacheSavedTokens?: number
+        cacheSavedCost?: number
+        compressionSavedChars?: number
+        relayEvents?: number
         byProvider: { provider: string; count: number }[]
         byModel: { model: string; count: number }[]
         totals: Record<string, unknown>
@@ -93,6 +95,7 @@ declare module 'orca' {
         provider: string
         secretKey: string
         id?: string
+        value?: string
         enabled?: boolean
         priority?: number
         weight?: number
@@ -110,9 +113,17 @@ declare module 'orca' {
       input: { provider?: string; baseUrl?: string; protocols?: string[]; secretKey?: string; value?: string }
       output: { ok: true; models: string[]; provider: string | null }
     }
+    'router.discoverAllModels': {
+      input: Record<string, never>
+      output: { ok: true; providers: { provider: string; models: string[]; error?: string }[] }
+    }
     'router.testUsage': {
-      input: { provider: string }
+      input: { provider: string; secretKey?: string }
       output: { provider: string; status: string; meters: unknown[]; errors: { message: string }[] }
+    }
+    'router.keyUsage': {
+      input: { provider?: string; refresh?: boolean }
+      output: { providers: ProviderKeyUsageReport[] }
     }
   }
   interface PluginPanelEvents {
@@ -146,6 +157,65 @@ export interface ProviderPreset {
   usage?: { endpoint: string; auth: string; mapping: { meters: unknown[] } }
 }
 
+export interface KeyUsageMeter {
+  field: string
+  kind: 'requests' | 'tokens' | 'images'
+  windowMs: number
+  used: number
+  limit: number
+  remaining: number
+  utilization: number
+}
+
+export interface ProviderUsageMeter {
+  id?: string
+  kind?: string
+  label?: string
+  unit?: string
+  window?: string
+  limit?: number | null
+  used?: number | null
+  remaining?: number | null
+  resetAt?: string
+}
+
+export interface KeyProviderUsage {
+  id?: string
+  secretKey: string
+  enabled: boolean
+  status: string
+  meters: ProviderUsageMeter[]
+  errors: { message: string }[]
+  fetchedAt: number
+}
+
+export interface ProviderKeyUsageReport {
+  provider: string
+  keys: KeyProviderUsage[]
+}
+
+export interface ProviderKeyUsage {
+  id?: string
+  secretKey: string
+  enabled: boolean
+  cooldownUntil?: number
+  state: 'ready' | 'cooling' | 'limited' | 'disabled'
+  requests: { minute: number; hour: number; day: number }
+  tokens: { minute: number; hour: number; day: number }
+  images: { minute: number; hour: number; day: number }
+  meters: KeyUsageMeter[]
+  utilization: number
+}
+
+export interface ProviderHealthView {
+  state: 'healthy' | 'degraded' | 'stale' | 'open' | 'unknown'
+  latencyMs: number | null
+  samples: number
+  failures: number
+  lastSuccessAt?: number
+  lastFailureAt?: number
+}
+
 export interface ProviderView {
   name: string
   displayName?: string
@@ -153,16 +223,18 @@ export interface ProviderView {
   protocols: string[]
   models?: string[]
   keyCount: number
+  keyUsage?: ProviderKeyUsage[]
+  health?: ProviderHealthView
 }
 
-export interface RouteCondition {
+export interface PolicyCondition {
   source: 'request.body' | 'request.header' | 'request.headers'
   field: string
   operator: string
   value: string
 }
 
-export interface RouteRewrite {
+export interface PolicyRewrite {
   key: string
   operation?: 'set' | 'delete' | 'array-append' | 'array-prepend' | 'array-remove' | 'array-replace'
   value?: unknown
@@ -170,17 +242,55 @@ export interface RouteRewrite {
 }
 
 export interface FallbackPolicy {
-  mode: 'off' | 'retry' | 'model-chain'
+  mode: 'off' | 'retry' | 'model-chain' | 'provider-chain'
   models?: string[]
   retryCount?: number
 }
 
-export interface RouteRule {
+/**
+ * One provider/model target in a route. An empty provider keeps the
+ * legacy alias form (a bare model id or alias), resolved by the worker.
+ */
+export interface ModelTarget {
+  provider: string
+  model: string
+}
+
+/**
+ * A route is a model name agents send, backed by one or more
+ * provider/model targets. `fastest` orders the targets by measured health and
+ * speed; `ordered` uses the listed order. This is the only failover unit.
+ */
+export interface ModelRoute {
+  name: string
+  targets: ModelTarget[]
+  strategy?: 'ordered' | 'fastest'
+  enabled?: boolean
+  /** Attempts per target (plus the first). Defaults to the router retry count. */
+  retries?: number
+}
+
+/** One legacy custom chain auto-migrated into a route. */
+export interface MigrationEntry {
+  at: number
+  kind: 'rule-chain' | 'global-chain'
+  from: string
+  to: string
+  targets: ModelTarget[]
+  note?: string
+}
+
+/**
+ * A global policy matches a request and rewrites it, points it at a model, or
+ * attaches a fallback chain. Policies run top to bottom and the first match
+ * wins.
+ */
+export interface RequestPolicy {
   id?: string
   name: string
   enabled?: boolean
-  condition?: RouteCondition | null
-  rewrites?: RouteRewrite[]
+  condition?: PolicyCondition | null
+  rewrites?: PolicyRewrite[]
   model?: string
   fallback?: FallbackPolicy
   // Legacy fields accepted on import.
@@ -210,23 +320,96 @@ export interface AgentRoute {
   enabled: boolean
 }
 
+export interface SchedulerConfig {
+  strategy?: 'priority-weighted' | 'round-robin'
+  priorityTiers?: boolean
+  utilizationAware?: boolean
+  utilizationThreshold?: number
+  allKeysExhausted?: 'error' | 'overflow'
+  exhaustedStatus?: 420 | 429
+  cacheAffinity?: boolean
+  cacheAffinityTtlMs?: number
+}
+
+export interface CircuitBreakerConfig {
+  enabled?: boolean
+  failureThreshold?: number
+  cooldownMs?: number
+}
+
+/**
+ * Tuning for the per-route health ranking and its latency samples. A `fastest`
+ * route ranks by measured health and speed; an `ordered` route does not.
+ */
+export interface ProviderHealthConfig {
+  /** EWMA weight for a new latency sample, 0.1 (slow) to 0.9 (fast). */
+  smoothing?: number
+  /** A provider with no successful sample for this long is treated as stale. */
+  staleMs?: number
+}
+
 export interface RouterConfig {
   version?: number
   token: string
   providers: ProviderConfig[]
-  routes: RouteRule[]
+  /** Routes (the failover unit). Model names agents send map to these. */
+  routes: ModelRoute[]
   aliases: Record<string, string>
-  defaultProvider?: string
+  /** Global policies. Legacy `routes` (v2) is accepted at runtime and normalized here. */
+  policies: RequestPolicy[]
   defaultModel?: string
-  defaultFallback: FallbackPolicy
+  /** Legacy global policy. Kept for import compatibility; no longer drives failover. */
+  defaultFallback?: FallbackPolicy
   clientKeys: { id: string; name: string; secretKey?: string; expiresAt?: string; limits?: Record<string, unknown>; enabled?: boolean }[]
   agentProfiles: AgentProfile[]
+  scheduler?: SchedulerConfig
+  circuitBreaker?: CircuitBreakerConfig
+  providerHealth?: ProviderHealthConfig
+  /** Opt-in prompt compression. Off by default. */
+  compression?: CompressionConfig
+  /** Opt-in failover handoff digest. Off by default. */
+  contextRelay?: ContextRelayConfig
+  /** Opt-in local response cache, exact or embedding-backed semantic. */
+  responseCache?: ResponseCacheConfig
+  /** Legacy custom chains converted into routes. */
+  migration?: MigrationEntry[]
   timeoutMs?: number
   retries?: number
   baseDelayMs?: number
   logBodyCapture?: 'all' | 'errors' | 'none'
   exposeRoutingHeaders?: boolean
   allowUnauthenticatedRemote?: boolean
+}
+
+export interface CompressionConfig {
+  enabled?: boolean
+  mode?: 'lite' | 'standard' | 'aggressive'
+  minChars?: number
+  keepRecentMessages?: number
+  toolResults?: boolean
+  systemPrompt?: boolean
+  toolMaxChars?: number
+  messageMaxChars?: number
+}
+
+export interface ContextRelayConfig {
+  enabled?: boolean
+  trigger?: 'failover' | 'always' | 'both'
+  maxChars?: number
+  keepRecentMessages?: number
+  digestChars?: number
+}
+
+export interface ResponseCacheConfig {
+  enabled?: boolean
+  mode?: 'exact' | 'semantic'
+  ttlMs?: number
+  maxEntries?: number
+  threshold?: number
+  embeddingProvider?: string
+  embeddingModel?: string
+  skipTools?: boolean
+  maxTemperature?: number
 }
 
 export interface ProviderConfig {
@@ -254,10 +437,15 @@ export interface LogEntry {
   status: number
   latencyMs: number | null
   attempts: string[]
-  failures?: { provider: string; status?: number; error?: string }[]
+  failures?: { provider: string; status?: number; error?: string; code?: string }[]
   delaysMs?: number[]
   bytes?: number
   tokens?: { input: number; output: number; cache?: number } | null
   cost?: number | null
   error?: string
+  compression?: { mode: string; before: number; after: number; saved: number } | null
+  relay?: { before: number; after: number; relayed: number } | null
+  cache?: 'hit' | 'semantic-hit' | 'miss' | 'bypass' | null
+  cacheSavedTokens?: number
+  cacheSavedCost?: number
 }
