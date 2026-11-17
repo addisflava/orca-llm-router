@@ -144,6 +144,19 @@ export function providerFromPreset(presetId, { name, apiKeySecretKey } = {}) {
   }
 }
 
+// Older provider entries predate usage scrapers in the preset catalog. Match
+// those by base URL so existing installs get per-key quota without forcing the
+// user to delete and re-add the provider. Never match on display name: a
+// custom proxy could share a preset's label and must not receive its key.
+export function resolveUsageFetch(provider) {
+  if (provider?.usageFetch) return provider.usageFetch
+  const baseUrl = String(provider?.baseUrl ?? provider?.endpoints?.[0]?.baseUrl ?? '').replace(/\/+$/, '')
+  if (!baseUrl) return undefined
+  const preset = PROVIDER_PRESETS.find((item) => item.usage && String(item.baseUrl ?? '').replace(/\/+$/, '') === baseUrl)
+  if (!preset) return undefined
+  return { enabled: true, connectors: [{ id: preset.id, type: 'http-json', ...preset.usage }] }
+}
+
 // ---------------------------------------------------------------------------
 // Config defaults and normalization (including legacy upstreams -> providers).
 // ---------------------------------------------------------------------------
@@ -3898,9 +3911,11 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     if (tail) observe(tail)
     res.end()
     if (captured) entry.responseBody = safeCaptureBody(captured)
-    if (streamTokens) {
-      applyUsage(entry, streamTokens, computeCost(pricing, streamTokens))
-      recordKeyUsage(key, streamTokens.input + streamTokens.output || null, 0)
+    if (upstreamRes.status < 400) {
+      if (streamTokens) applyUsage(entry, streamTokens, computeCost(pricing, streamTokens))
+      // Count the request even when the stream carried no usage block: many
+      // OpenAI-compatible providers only send usage when the client opts in.
+      recordKeyUsage(key, streamTokens ? streamTokens.input + streamTokens.output || null : null, 0)
     }
   }
 
@@ -3964,6 +3979,7 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
           models: (p.models ?? []).map((m) => m.id),
           keyCount: (p.keys ?? []).length,
           health: providerHealthView(p.name, timestamp),
+          usageSource: Boolean((resolveUsageFetch(p)?.connectors ?? []).length),
           keyUsage: (p.keys ?? []).map((key) => {
             const until = keyCooldowns.get(keyIdentity(key)) ?? 0
             const usage = keyUsageSnapshot(key, keyStates.get(keyIdentity(key)), timestamp)
@@ -4159,6 +4175,131 @@ export async function fetchProviderUsage(provider, { getSecret, fetchImpl, secre
     }
   }
   return { provider: provider.name, secretKey, status: errors.length && !meters.length ? 'error' : 'ok', meters, errors }
+}
+
+// Optional usage discovery: when a provider has no configured connector, try a
+// short list of well-known balance endpoints with the provider key. Only an
+// exact response-shape match is accepted, so an unrelated JSON body never turns
+// into a fabricated quota. Runs only on an explicit panel click.
+const USAGE_PROBE_SPECS = [
+  {
+    id: 'openrouter',
+    path: '/credits',
+    detect: (payload) => typeof payload?.data?.total_credits === 'number' || typeof payload?.data?.total_usage === 'number',
+    meters: [{ id: 'balance', kind: 'balance', label: 'Balance', limit: '$.data.total_credits', used: '$.data.total_usage', unit: 'USD' }]
+  },
+  {
+    id: 'deepseek',
+    path: '/user/balance',
+    detect: (payload) => Array.isArray(payload?.balance_infos) && payload.balance_infos.some((entry) => entry && entry.total_balance != null),
+    meters: [{ id: 'balance', kind: 'balance', label: 'Balance', remaining: '$.balance_infos[0].total_balance', unit: '$.balance_infos[0].currency' }]
+  },
+  {
+    id: 'opencode',
+    path: '/usage',
+    detect: (payload) => typeof payload?.usage?.rolling?.percent === 'number',
+    meters: [
+      { id: 'rolling_5h', kind: 'quota', label: '5h limit', limit: 100, used: '$.usage.rolling.percent', remaining: '100 - $.usage.rolling.percent', unit: '%', window: '5h' },
+      { id: 'rolling_weekly', kind: 'quota', label: 'Weekly limit', limit: 100, used: '$.usage.weekly.percent', remaining: '100 - $.usage.weekly.percent', unit: '%', window: 'weekly' },
+      { id: 'rolling_monthly', kind: 'quota', label: 'Monthly limit', limit: 100, used: '$.usage.monthly.percent', remaining: '100 - $.usage.monthly.percent', unit: '%', window: 'monthly' }
+    ]
+  },
+  {
+    id: 'moonshot',
+    path: '/users/me/balance',
+    detect: (payload) => typeof payload?.data?.available_balance === 'number',
+    meters: [{ id: 'balance', kind: 'balance', label: 'Balance', remaining: '$.data.available_balance', unit: 'CNY' }]
+  },
+  {
+    id: 'siliconflow',
+    path: '/user/info',
+    detect: (payload) => typeof payload?.data?.totalBalance === 'number',
+    meters: [{ id: 'balance', kind: 'balance', label: 'Balance', remaining: '$.data.totalBalance', unit: 'CNY' }]
+  },
+  {
+    id: 'mistral',
+    path: '/billing/subscription',
+    detect: (payload) => typeof payload?.credit_balance === 'number' || typeof payload?.monthly_budget === 'number',
+    meters: [
+      { id: 'credit_balance', kind: 'balance', label: 'Credit balance', remaining: '$.credit_balance', unit: 'EUR' },
+      { id: 'monthly_budget', kind: 'quota', label: 'Monthly budget', limit: '$.monthly_budget', unit: 'EUR', window: 'monthly' }
+    ]
+  },
+  {
+    id: 'openai-billing',
+    path: '/dashboard/billing/credit_grants',
+    detect: (payload) => typeof payload?.total_available === 'number' || typeof payload?.total_granted === 'number',
+    meters: [{ id: 'balance', kind: 'balance', label: 'Credits', limit: '$.total_granted', used: '$.total_used', remaining: '$.total_available', unit: 'USD' }]
+  },
+  {
+    id: 'oneapi',
+    origin: true,
+    path: '/api/user/self',
+    detect: (payload) => typeof payload?.data?.quota === 'number',
+    meters: [{ id: 'quota', kind: 'balance', label: 'Quota', used: '$.data.used_quota', remaining: '$.data.quota', unit: 'credits' }]
+  }
+]
+
+const USAGE_PROBE_BUDGET_MS = 15_000
+
+export async function probeProviderUsage(provider, { getSecret, fetchImpl, secretKey } = {}) {
+  const poolEntry = secretKey
+    ? { secretKey }
+    : (provider?.keys ?? []).find((entry) => entry?.secretKey && getSecret?.(entry.secretKey))
+  const resolvedKey = poolEntry?.secretKey
+  const key = resolvedKey ? getSecret?.(resolvedKey) : null
+  if (!key) return { ok: false, reason: 'no-keys', meters: [], errors: [], tried: [] }
+  const base = String(provider?.baseUrl ?? provider?.endpoints?.[0]?.baseUrl ?? '').replace(/\/+$/, '')
+  const bases = [...new Set([base, base.replace(/\/v1$/, '')])].filter(Boolean)
+  let origin = ''
+  try { origin = new URL(base).origin } catch { origin = '' }
+  const fetchFn = fetchImpl ?? globalThis.fetch
+  const startedAt = Date.now()
+  const tried = []
+  for (const spec of USAGE_PROBE_SPECS) {
+    if (Date.now() - startedAt > USAGE_PROBE_BUDGET_MS) break
+    for (const candidate of spec.origin ? [origin] : bases) {
+      if (!candidate) continue
+      const url = `${candidate}${spec.path}`
+      if (tried.some((entry) => entry.url === url)) continue
+      let payload = null
+      try {
+        const res = await fetchFn(url, {
+          headers: { authorization: `Bearer ${key}` },
+          signal: AbortSignal.timeout(5000)
+        })
+        tried.push({ url, status: res.status })
+        if (!res.ok) continue
+        payload = await res.json().catch(() => null)
+      } catch (error) {
+        tried.push({ url, status: String(error?.message ?? error) })
+        continue
+      }
+      if (!payload || !spec.detect(payload)) continue
+      const connector = {
+        id: `probe-${spec.id}`,
+        type: 'http-json',
+        endpoint: url,
+        auth: 'provider-api-key',
+        mapping: { meters: spec.meters }
+      }
+      const applied = await fetchProviderUsage(
+        { ...provider, usageFetch: { enabled: true, connectors: [connector] } },
+        { getSecret: () => key, fetchImpl, secretKey: resolvedKey }
+      )
+      return {
+        ok: applied.meters.length > 0,
+        reason: applied.meters.length > 0 ? undefined : 'probe-failed',
+        endpoint: url,
+        connector,
+        meters: applied.meters,
+        errors: applied.errors,
+        secretKey: resolvedKey,
+        tried
+      }
+    }
+  }
+  return { ok: false, reason: 'not-found', meters: [], errors: [], secretKey: resolvedKey, tried }
 }
 
 export async function discoverProviderModels(provider, { getSecret, fetchImpl } = {}) {

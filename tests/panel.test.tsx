@@ -130,6 +130,75 @@ test('model picker filters fetched models and adds only the selected ones', asyn
   await app.unmount()
 })
 
+test('provider editor exposes every endpoint and protocol, including gemini', async () => {
+  const gatewayStatus = {
+    ...status,
+    providers: [
+      {
+        name: 'gateway',
+        displayName: 'Gateway',
+        baseUrl: 'https://gateway.test/v1',
+        protocols: ['openai', 'anthropic', 'gemini'],
+        models: ['model-a'],
+        keyCount: 0
+      }
+    ]
+  }
+  const gatewayConfig: RouterConfig = {
+    ...config,
+    providers: [
+      {
+        name: 'gateway',
+        displayName: 'Gateway',
+        baseUrl: 'https://gateway.test/v1',
+        protocols: ['openai', 'anthropic', 'gemini'],
+        models: [{ id: 'model-a' }],
+        keys: [],
+        endpoints: [
+          { baseUrl: 'https://gateway.test/v1', protocols: ['openai'] },
+          { baseUrl: 'https://gateway.test', protocols: ['anthropic'] },
+          { baseUrl: 'https://gateway.test', protocols: ['gemini'] }
+        ]
+      }
+    ]
+  }
+  let saved: RouterConfig | null = null
+  const host = mockHost({
+    requests: {
+      'router.status': gatewayStatus as never,
+      'router.config.get': () => ({ config: saved ?? gatewayConfig }),
+      'router.usage': usage,
+      'router.presets': { presets: [] },
+      'router.config.save': (input) => {
+        saved = input.config
+        return { ok: true }
+      }
+    }
+  })
+  const app = await mount(panel, { host, persisted: { plugin: { tab: 'providers' } } })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  await app.settled()
+
+  await app.press(app.findAll({ text: 'Edit' })[0])
+  await app.settled()
+  assert.ok(app.find({ label: 'Base URL 1' }), 'the first endpoint is editable')
+  assert.ok(app.find({ label: 'Base URL 2' }), 'a second endpoint is editable')
+  assert.ok(app.find({ label: 'Gemini' }), 'the gemini protocol is exposed')
+  await app.type({ label: 'Base URL 2' }, 'https://gateway.test/api', { replace: true })
+  await app.press({ text: 'Save changes' })
+  await app.settled()
+
+  assert.ok(saved, 'the edit is persisted')
+  const provider = saved.providers[0]
+  assert.deepEqual(
+    provider.endpoints?.map((endpoint) => endpoint.baseUrl),
+    ['https://gateway.test/v1', 'https://gateway.test/api'],
+    'endpoint URLs are saved in order'
+  )
+  assert.deepEqual(provider.protocols, ['openai', 'anthropic', 'gemini'], 'every protocol survives the edit')
+  await app.unmount()
+})
+
 test('search all models writes the picked models into every provider', async () => {
   const multiConfig: RouterConfig = {
     ...config,
@@ -190,7 +259,7 @@ test('search all models writes the picked models into every provider', async () 
   await new Promise((resolve) => setTimeout(resolve, 20))
   await app.settled()
 
-  await app.press({ text: 'Fetch all models from all providers' })
+  await app.press({ text: 'Fetch all models' })
   assert.ok(app.find({ text: 'Search all providers' }), 'the cross-provider list opens')
   assert.equal(app.valueOf({ label: 'existing-model' }), true, 'saved models start selected')
   assert.equal(app.valueOf({ label: 'gpt-5' }), true, 'saved models on another provider start selected')
@@ -412,6 +481,137 @@ test('provider key rows show rolling usage and the tightest quota meter', async 
     await app.type(apiKeyField, '-updated')
     assert.equal(app.valueOf(apiKeyField), 'sk-ant-existing-updated', 'the loaded secret can be edited')
     assert.equal(app.find({ text: 'Edit key' }), null, 'the edit action hides while the field is open')
+  } finally {
+    await app.unmount()
+  }
+})
+
+test('the provider Usage button probes, shows a detected quota, and can save it', async () => {
+  const keyedConfig: RouterConfig = {
+    ...config,
+    providers: [{ ...config.providers[0], keys: [{ id: 'primary', secretKey: 'KEY_1' }] }]
+  }
+  let saved: { provider?: string; usageFetch?: any } | null = null
+  const connector = {
+    id: 'probe-openrouter',
+    type: 'http-json',
+    endpoint: 'https://api.anthropic.com/v1/credits',
+    auth: 'provider-api-key',
+    mapping: {
+      meters: [{
+        id: 'balance',
+        kind: 'balance',
+        label: 'Balance',
+        limit: '$.data.total_credits',
+        used: '$.data.total_usage',
+        unit: 'USD'
+      }]
+    }
+  }
+  const reported = {
+    provider: 'anthropic',
+    keys: [{
+      id: 'primary',
+      secretKey: 'KEY_1',
+      enabled: true,
+      status: 'ok',
+      fetchedAt: Date.now(),
+      errors: [],
+      meters: [{ id: 'balance', kind: 'balance', label: 'Balance', unit: 'USD', remaining: 12 }]
+    }]
+  }
+  const host = mockHost({
+    requests: {
+      'router.status': { ...status, providers: [{ ...status.providers[0], keyCount: 1 }] } as never,
+      'router.config.get': { config: keyedConfig },
+      'router.usage': usage,
+      'router.presets': { presets: [] },
+      'router.keyUsage': () => ({
+        providers: [saved ? reported : { provider: 'anthropic', keys: [], reason: 'no-endpoint' }]
+      }),
+      'router.usageProbe': {
+        provider: 'anthropic',
+        ok: true,
+        endpoint: connector.endpoint,
+        secretKey: 'KEY_1',
+        connector,
+        meters: [{ id: 'balance', kind: 'balance', label: 'Balance', unit: 'USD', remaining: 12 }],
+        errors: [],
+        tried: [{ url: connector.endpoint, status: 200 }]
+      },
+      'router.provider.usage': (input: { provider?: string; usageFetch?: any }) => {
+        saved = input
+        return { ok: true }
+      }
+    }
+  })
+  const app = await mount(panel, { host, persisted: { plugin: { tab: 'providers' } } })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  await app.settled()
+
+  try {
+    assert.equal(app.find({ text: 'Balance' }), null, 'no provider quota before the click')
+    await app.press({ text: 'Fetch usage' })
+    await app.settled()
+    assert.ok(app.find({ text: 'Balance' }), 'the probe result is shown inline')
+    assert.ok(app.find({ text: 'Save usage source' }), 'the detected source can be saved')
+    await app.press({ text: 'Save usage source' })
+    await app.settled()
+    assert.ok(saved, 'the detected connector is persisted')
+    assert.equal(saved.usageFetch.connectors[0].endpoint, connector.endpoint)
+    assert.ok(app.find({ text: 'Usage source saved' }), 'the save is confirmed')
+  } finally {
+    await app.unmount()
+  }
+})
+
+test('the Usage button explains a failed probe and the editor saves a custom source', async () => {
+  const keyedConfig: RouterConfig = {
+    ...config,
+    providers: [{ ...config.providers[0], keys: [{ id: 'primary', secretKey: 'KEY_1' }] }]
+  }
+  let saved: { provider?: string; usageFetch?: any } | null = null
+  const host = mockHost({
+    requests: {
+      'router.status': { ...status, providers: [{ ...status.providers[0], keyCount: 1 }] } as never,
+      'router.config.get': { config: keyedConfig },
+      'router.usage': usage,
+      'router.presets': { presets: [] },
+      'router.keyUsage': { providers: [{ provider: 'anthropic', keys: [], reason: 'no-endpoint' }] },
+      'router.usageProbe': {
+        provider: 'anthropic',
+        ok: false,
+        reason: 'not-found',
+        tried: [{ url: 'https://api.anthropic.com/v1/credits', status: 404 }]
+      },
+      'router.provider.usage': (input: { provider?: string; usageFetch?: any }) => {
+        saved = input
+        return { ok: true }
+      }
+    }
+  })
+  const app = await mount(panel, { host, persisted: { plugin: { tab: 'providers' } } })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  await app.settled()
+
+  try {
+    await app.press({ text: 'Fetch usage' })
+    await app.settled()
+    assert.ok(app.find({ text: 'No usage source found after trying 1 endpoint.' }), 'the probe result is explained')
+    await app.press({ text: 'Set up' })
+    await app.settled()
+    assert.ok(app.find({ text: 'Usage source' }), 'the usage source editor opens')
+    await app.type({ label: 'Usage endpoint' }, 'https://api.example.test/v1/credits', { replace: true })
+    await app.type(
+      { label: 'Meters JSON' },
+      '[{"id":"balance","label":"Balance","remaining":"$.data.balance","unit":"USD"}]',
+      { replace: true }
+    )
+    await app.press({ text: 'Save usage source' })
+    await app.settled()
+    assert.ok(saved, 'the custom connector is persisted')
+    assert.equal(saved.usageFetch.connectors[0].endpoint, 'https://api.example.test/v1/credits')
+    assert.equal(saved.usageFetch.connectors[0].mapping.meters[0].remaining, '$.data.balance')
   } finally {
     await app.unmount()
   }

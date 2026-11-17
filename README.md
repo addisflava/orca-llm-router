@@ -4,7 +4,7 @@
 [![Orca: >=1.4.248](https://img.shields.io/badge/Orca-%3E%3D1.4.248-6366f1.svg)](https://onorca.dev)
 [![Node: >=22](https://img.shields.io/badge/Node-%3E%3D22-green.svg)](package.json)
 
-![Orca LLM Router — one local endpoint for every coding agent in Orca](assets/cover.jpg)
+![LLM Router for Orca — one local endpoint for every coding agent in Orca](assets/cover.jpg)
 
 **Use all your subscriptions and API credits from any provider, coding plan, and local model on any agent in Orca — in one place, without leaving Orca.**
 
@@ -42,9 +42,9 @@ One stable local endpoint (`127.0.0.1:18080`) for every coding agent you run in 
 - **Opt-in Prompt Compression**: Conservatively trims ANSI escapes, trailing whitespace, repeated blank lines, and old tool output before forwarding. Code fences, inline code, URLs, tool-call structure, system prompts, and recent turns are preserved by default. Off until enabled.
 - **Context Relay on Failover**: When a request moves to another target, older turns become deterministic one-line handoff digests. No extra model call, no summarization latency; the next provider still receives the recent turns in full.
 - **Exact & Semantic Response Cache**: Replay an identical successful response without touching a provider. Exact mode hashes the canonical request; semantic mode adds embeddings from an OpenAI-compatible provider and a configurable similarity threshold. Scoped by protocol, stream mode, and resolved target; tools are skipped by default, images are never cached, and requests above the temperature limit are ignored.
-- **Per-Key Usage & Limits**: Rolling per-key counters (rpm/rph/rpd, tpm/tph/tpd), provider-reported plan windows where a scraper exists, and at-a-glance usage bars — so you can see which key has headroom before traffic fails.
+- **Per-Key Usage & Limits**: Rolling per-key counters (rpm/rph/rpd, tpm/tph/tpd), provider-reported plan windows where a scraper exists, and at-a-glance usage bars — so you can see which key has headroom before traffic fails. Providers without a built-in scraper get a one-click **Fetch usage** probe of common balance endpoints, plus a hand-editable usage connector (endpoint, auth, meter JSON paths) inside the provider's Edit form.
 - **1-Click Migration from Legacy Routers**: Import providers, keys, models, aliases, routing rules, and agent profiles from Claude Code Router (`~/.claude-code-router`) or OmniRoute (including AES-256-GCM `enc:v1:...` credential decryption).
-- **Cross-Provider Model Search**: Pull every configured provider's model catalog in one click (**Providers → Fetch all models from all providers**), filter across all of them at once, and save the ones you pick straight into each provider. In a route's target editor, **Fetch all models from all providers** merges the models that aren't saved yet into the same target list, marked *new*; picking one saves it to its provider when you save the route.
+- **Cross-Provider Model Search**: Pull every configured provider's model catalog in one click (**Providers → Fetch all models**), filter across all of them at once, and save the ones you pick straight into each provider. In a route's target editor, **Fetch all models from all providers** merges the models that aren't saved yet into the same target list, marked *new*; picking one saves it to its provider when you save the route.
 - **Local-First Privacy & Security**: Runs entirely on your machine on localhost. Provider credentials live in Orca's encrypted `secrets:own` vault — never in config files, logs, or upstream requests. Client gateway tokens are never leaked to providers. Zero telemetry.
 - **Orca-Native Agent Integration**: No overwriting `~/.claude/settings.json` or global dotfiles — a per-session launch hook injects isolated environments, OpenCode gets a standalone gateway config, and Codex gets a dynamically injected model catalog.
 

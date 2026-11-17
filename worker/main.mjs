@@ -35,6 +35,8 @@ import {
   detectAndConvertConfig,
   detectLocalRouterConfigs,
   fetchProviderUsage,
+  probeProviderUsage,
+  resolveUsageFetch,
   normalizeConfig,
   buildAgentLaunchEnv,
   buildOpenCodeConfig,
@@ -712,32 +714,21 @@ async function refreshSecrets(orca) {
   }
 }
 
-// Older provider entries predate usage scrapers in the preset catalog. Match
-// those by base URL so existing installs get per-key quota without forcing the
-// user to delete and re-add the provider. Never match on display name: a
-// custom proxy could share a preset's label and must not receive its key.
-function usageFetchForProvider(provider) {
-  if (provider.usageFetch) return provider.usageFetch
-  const baseUrl = String(provider.baseUrl ?? provider.endpoints?.[0]?.baseUrl ?? '').replace(/\/+$/, '')
-  if (!baseUrl) return undefined
-  const preset = PROVIDER_PRESETS.find((item) => item.usage && String(item.baseUrl ?? '').replace(/\/+$/, '') === baseUrl)
-  if (!preset) return undefined
-  return { enabled: true, connectors: [{ id: preset.id, type: 'http-json', ...preset.usage }] }
-}
-
 // Provider-reported quota is fetched per credential, not per provider: a plan
 // key can have its own rolling window. The cache keeps the 5-second panel poll
 // from hammering usage endpoints; each key is refreshed at most once a minute.
 async function providerKeyUsage(provider, { force = false } = {}) {
-  const usageFetch = usageFetchForProvider(provider)
+  const usageFetch = resolveUsageFetch(provider)
   const connectors = usageFetch?.enabled === false ? [] : (usageFetch?.connectors ?? [])
-  if (!connectors.length) return { provider: provider.name, keys: [] }
+  if (!connectors.length) return { provider: provider.name, keys: [], reason: 'no-endpoint' }
+  const pool = (provider.keys ?? []).filter((key) => key.secretKey)
+  if (!pool.length) return { provider: provider.name, keys: [], reason: 'no-keys' }
   const meteredProvider = usageFetch === provider.usageFetch ? provider : { ...provider, usageFetch }
   const now = Date.now()
   if (keyUsageCache.size > 1000) {
     for (const [id, entry] of keyUsageCache) if (now - entry.at > KEY_USAGE_TTL_MS) keyUsageCache.delete(id)
   }
-  const keys = await Promise.all((provider.keys ?? []).filter((key) => key.secretKey).map(async (key) => {
+  const keys = await Promise.all(pool.map(async (key) => {
     const cacheKey = `${provider.name}\u0000${key.secretKey}`
     const cached = keyUsageCache.get(cacheKey)
     if (!force && cached && now - cached.at < KEY_USAGE_TTL_MS) return cached.value
@@ -771,6 +762,51 @@ async function providerKeyUsage(provider, { force = false } = {}) {
     return value
   }))
   return { provider: provider.name, keys }
+}
+
+function normalizeUsageMeter(meter, index) {
+  if (!meter || typeof meter !== 'object') return null
+  const mapped = {
+    id: String(meter.id ?? `meter-${index + 1}`),
+    kind: meter.kind === 'quota' ? 'quota' : 'balance',
+    label: String(meter.label ?? meter.id ?? 'Usage'),
+    ...(meter.limit != null ? { limit: meter.limit } : {}),
+    ...(meter.used != null ? { used: meter.used } : {}),
+    ...(meter.remaining != null ? { remaining: meter.remaining } : {}),
+    ...(meter.unit != null ? { unit: String(meter.unit) } : {}),
+    ...(meter.window != null ? { window: String(meter.window) } : {}),
+    ...(meter.resetAt != null ? { resetAt: String(meter.resetAt) } : {})
+  }
+  if (mapped.limit == null && mapped.used == null && mapped.remaining == null) return null
+  return mapped
+}
+
+// Panel saves only: accept the connector shape the panel builds, trim it, and
+// drop anything the usage reader cannot use.
+function normalizeUsageFetchInput(value) {
+  if (!value || typeof value !== 'object') return undefined
+  const connectors = (Array.isArray(value.connectors) ? value.connectors : [])
+    .map((connector, index) => {
+      const endpoint = String(connector?.endpoint ?? '').trim()
+      if (!/^https?:\/\//i.test(endpoint)) return null
+      const meters = (Array.isArray(connector?.mapping?.meters) ? connector.mapping.meters : [])
+        .map((meter, meterIndex) => normalizeUsageMeter(meter, meterIndex))
+        .filter(Boolean)
+      if (!meters.length) return null
+      return {
+        id: String(connector.id ?? `connector-${index + 1}`),
+        type: connector.type ?? 'http-json',
+        endpoint,
+        auth: connector.auth === 'none' ? 'none' : 'provider-api-key',
+        method: connector.method ?? 'GET',
+        ...(connector.headers && typeof connector.headers === 'object' ? { headers: connector.headers } : {}),
+        ...(connector.body != null ? { body: connector.body } : {}),
+        mapping: { meters }
+      }
+    })
+    .filter(Boolean)
+  if (!connectors.length) return undefined
+  return { enabled: value.enabled !== false, connectors }
 }
 
 async function refreshSettings(orca) {
@@ -1305,7 +1341,7 @@ export default async function activate(orca) {
   orca.panels.handle('router.testUsage', async ({ provider: name, secretKey }) => {
     const provider = config.providers.find((item) => item.name === name)
     if (!provider) throw new Error(`unknown provider: ${name}`)
-    const usageFetch = usageFetchForProvider(provider)
+    const usageFetch = resolveUsageFetch(provider)
     const meteredProvider = usageFetch === provider.usageFetch ? provider : { ...provider, usageFetch }
     return fetchProviderUsage(meteredProvider, { getSecret: (key) => secretsCache.get(key) ?? null, secretKey })
   })
@@ -1315,10 +1351,40 @@ export default async function activate(orca) {
       try {
         return await providerKeyUsage(provider, { force: refresh === true })
       } catch {
-        return { provider: provider.name, keys: [] }
+        return { provider: provider.name, keys: [], reason: 'error' }
       }
     }))
-    return { providers: results.filter((result) => result.keys.length) }
+    return { providers: results }
+  })
+  orca.panels.handle('router.usageProbe', async ({ provider: name } = {}) => {
+    const provider = (config?.providers ?? []).find((item) => item.name === name)
+    if (!provider) {
+      const error = new Error(`unknown provider: ${name}`)
+      error.code = 'invalid_params'
+      throw error
+    }
+    const result = await probeProviderUsage(provider, {
+      getSecret: (secretKey) => secretsCache.get(secretKey) ?? null
+    })
+    return { provider: name, ...result }
+  })
+  orca.panels.handle('router.provider.usage', async ({ provider: name, usageFetch } = {}) => {
+    const next = structuredClone(config)
+    const provider = next.providers.find((item) => item.name === name)
+    if (!provider) {
+      const error = new Error(`unknown provider: ${name}`)
+      error.code = 'invalid_params'
+      throw error
+    }
+    const normalized = normalizeUsageFetchInput(usageFetch)
+    if (normalized) provider.usageFetch = normalized
+    else delete provider.usageFetch
+    await persistConfig(orca, next)
+    // Drop cached per-key readings so the next click reads the new endpoint.
+    for (const id of [...keyUsageCache.keys()]) {
+      if (id.startsWith(`${name}\u0000`)) keyUsageCache.delete(id)
+    }
+    return { ok: true }
   })
 
   // (debug handler removed)

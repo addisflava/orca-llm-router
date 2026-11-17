@@ -4,7 +4,7 @@
   "execution": "trusted-worker",
   "id": "llm-router",
   "name": "LLM Router for Orca",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Use all your subscriptions and API credits from any provider and coding plan on any agent in Orca, in one place, without leaving Orca. Features multi-key credential pools with smooth weighted rotation, priority tiers, and routing different providers behind a single model name with seamless fallback.",
   "author": {
     "name": "addisflava"
@@ -14,7 +14,7 @@
   "icon": "assets/icon.png",
   "cover": {
     "path": "assets/cover.jpg",
-    "alt": "Orca LLM Router gateway overview banner showing intelligent multi-provider routing"
+    "alt": "LLM Router for Orca cover with gateway overview and provider panels beside a short feature summary"
   },
   "screenshots": [
     {

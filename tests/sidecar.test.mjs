@@ -30,6 +30,8 @@ import {
   createSidecar,
   deriveAffinityKey,
   fetchProviderUsage,
+  probeProviderUsage,
+  resolveUsageFetch,
   safeCaptureBody,
   truncateText,
   geminiResponseToOpenAI,
@@ -1249,6 +1251,28 @@ test('records usage from a same-protocol streaming response', async () => {
   })
 })
 
+test('records a streaming request even when the provider sends no usage', async () => {
+  const config = pooledConfig([{ id: 'primary', secretKey: 'deepseek-key-1', enabled: true }])
+  const sse = 'data: {"id":"r1","choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n'
+  await withSidecar(
+    config,
+    async () => new Response(sse, { status: 200, headers: { 'content-type': 'text/event-stream' } }),
+    async (base, sidecar) => {
+      const res = await fetch(`${base}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'deepseek/deepseek-chat', stream: true, messages: [{ role: 'user', content: 'hi' }] })
+      })
+      assert.equal(res.status, 200)
+      await res.text()
+      const key = sidecar.status().providers.find((provider) => provider.name === 'deepseek').keyUsage[0]
+      assert.equal(key.requests.day, 1, 'the request is counted without a usage block')
+      assert.equal(key.tokens.day, 0, 'unknown tokens stay zero')
+    },
+    { 'deepseek-key-1': 'sk-first' }
+  )
+})
+
 test('resolves an alias and forwards the provider bare model', async () => {
   const config = testConfig({ aliases: { fast: 'deepseek/deepseek-chat' } })
   let forwarded = null
@@ -1507,6 +1531,72 @@ test('fetchProviderUsage targets a specific pool key', async () => {
   assert.equal(authorization, 'Bearer sk-second')
   assert.equal(result.secretKey, 'second-key')
   assert.equal(result.meters[0].used, 2)
+})
+
+test('probeProviderUsage detects a known balance shape and returns a connector', async () => {
+  const provider = {
+    name: 'probe',
+    baseUrl: 'https://api.example.test/v1',
+    keys: [{ secretKey: 'probe-key' }]
+  }
+  const seen = []
+  const result = await probeProviderUsage(provider, {
+    getSecret: () => 'sk-probe',
+    fetchImpl: async (url) => {
+      seen.push(url)
+      if (url === 'https://api.example.test/v1/credits') {
+        return new Response(JSON.stringify({ data: { total_credits: 10, total_usage: 3 } }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' }
+        })
+      }
+      return new Response('{}', { status: 404, headers: { 'content-type': 'application/json' } })
+    }
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.endpoint, 'https://api.example.test/v1/credits')
+  assert.equal(result.secretKey, 'probe-key')
+  assert.equal(result.connector.mapping.meters[0].id, 'balance')
+  assert.equal(result.meters[0].remaining, 7, 'remaining is derived from the mapped values')
+  assert.ok(result.tried.some((entry) => entry.url === result.endpoint))
+  assert.ok(seen.includes(result.endpoint))
+})
+
+test('probeProviderUsage never invents a quota from an unknown body', async () => {
+  const provider = {
+    name: 'probe',
+    baseUrl: 'https://api.example.test',
+    keys: [{ secretKey: 'probe-key' }]
+  }
+  const result = await probeProviderUsage(provider, {
+    getSecret: () => 'sk-probe',
+    fetchImpl: async () => new Response(JSON.stringify({ hello: 'world' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' }
+    })
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.reason, 'not-found')
+  assert.equal(result.meters.length, 0)
+  assert.ok(result.tried.length > 0, 'the attempted endpoints are reported')
+})
+
+test('probeProviderUsage reports missing keys instead of calling out', async () => {
+  const result = await probeProviderUsage({
+    name: 'probe',
+    baseUrl: 'https://api.example.test',
+    keys: []
+  }, { getSecret: () => null })
+  assert.equal(result.ok, false)
+  assert.equal(result.reason, 'no-keys')
+})
+
+test('resolveUsageFetch falls back to a preset by base URL', () => {
+  const fromPreset = resolveUsageFetch({ baseUrl: 'https://api.deepseek.com', keys: [] })
+  assert.equal(fromPreset.connectors[0].endpoint, 'https://api.deepseek.com/user/balance')
+  const configured = { enabled: true, connectors: [{ endpoint: 'https://custom.example.test/usage' }] }
+  assert.equal(resolveUsageFetch({ baseUrl: 'https://custom.example.test', usageFetch: configured }), configured)
+  assert.equal(resolveUsageFetch({ baseUrl: 'https://unknown.example.test', keys: [] }), undefined)
 })
 
 test('health endpoint reports providers', async () => {

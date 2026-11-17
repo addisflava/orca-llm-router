@@ -125,6 +125,24 @@ declare module 'orca' {
       input: { provider?: string; refresh?: boolean }
       output: { providers: ProviderKeyUsageReport[] }
     }
+    'router.usageProbe': {
+      input: { provider: string }
+      output: {
+        provider: string
+        ok: boolean
+        reason?: 'no-keys' | 'not-found' | 'probe-failed'
+        endpoint?: string
+        connector?: UsageConnector
+        meters?: ProviderUsageMeter[]
+        errors?: { message: string }[]
+        secretKey?: string
+        tried?: { url: string; status: number | string }[]
+      }
+    }
+    'router.provider.usage': {
+      input: { provider: string; usageFetch?: UsageFetchConfig | null }
+      output: { ok: true }
+    }
   }
   interface PluginPanelEvents {
     'router.statusChanged': { running: boolean; port: number }
@@ -192,6 +210,8 @@ export interface KeyProviderUsage {
 export interface ProviderKeyUsageReport {
   provider: string
   keys: KeyProviderUsage[]
+  /** Why a provider produced no per-key reports. */
+  reason?: 'no-endpoint' | 'no-keys' | 'error'
 }
 
 export interface ProviderKeyUsage {
@@ -225,6 +245,8 @@ export interface ProviderView {
   keyCount: number
   keyUsage?: ProviderKeyUsage[]
   health?: ProviderHealthView
+  /** True when a usage connector is configured (or matched from a preset). */
+  usageSource?: boolean
 }
 
 export interface PolicyCondition {
@@ -422,7 +444,37 @@ export interface ProviderConfig {
   keys: { id: string; secretKey: string; enabled?: boolean; priority?: number; weight?: number; limits?: Record<string, unknown> }[]
   enabled?: boolean
   pricing?: Record<string, unknown>
-  usageFetch?: { enabled?: boolean; connectors?: unknown[] }
+  usageFetch?: UsageFetchConfig
+}
+
+/** One meter read from a provider usage response. Expressions are JSON paths (`$.a.b`). */
+export interface UsageMeterMapping {
+  id?: string
+  kind?: string
+  label?: string
+  limit?: number | string
+  used?: number | string
+  remaining?: number | string
+  unit?: string
+  window?: string
+  resetAt?: string
+}
+
+/** An HTTP-JSON usage connector, the same shape imported from CCR and OmniRoute. */
+export interface UsageConnector {
+  id?: string
+  type?: string
+  endpoint: string
+  auth?: string
+  method?: string
+  headers?: Record<string, string>
+  body?: unknown
+  mapping?: { meters?: UsageMeterMapping[] }
+}
+
+export interface UsageFetchConfig {
+  enabled?: boolean
+  connectors?: UsageConnector[]
 }
 
 export interface LogEntry {

@@ -42,7 +42,7 @@ import {
   type Tone,
   type WithChildren
 } from 'orca'
-import type { AgentRoute, DetectedRouterInfo, FallbackPolicy, KeyProviderUsage, LogEntry, ModelRoute, ModelTarget, ProviderHealthView, ProviderKeyUsage, ProviderKeyUsageReport, ProviderPreset, ProviderUsageMeter, ProviderView, RouterConfig, PolicyCondition, PolicyRewrite, RequestPolicy } from './protocol'
+import type { AgentRoute, DetectedRouterInfo, FallbackPolicy, KeyProviderUsage, LogEntry, ModelRoute, ModelTarget, ProviderConfig, ProviderHealthView, ProviderKeyUsage, ProviderKeyUsageReport, ProviderPreset, ProviderUsageMeter, ProviderView, RouterConfig, UsageConnector, UsageMeterMapping, PolicyCondition, PolicyRewrite, RequestPolicy } from './protocol'
 
 // ---------------------------------------------------------------------------
 // State
@@ -69,6 +69,19 @@ const agentList = atom<AgentRoute[]>([])
 const presetList = atom<ProviderPreset[]>([])
 const logs = atom<LogEntry[]>([])
 const keyQuotaReports = atom<ProviderKeyUsageReport[]>([])
+// The provider whose usage is being fetched, and the last inline result for it.
+const usageBusy = atom('usageBusy', '')
+const usageNote = atom<{
+  provider: string
+  text: string
+  tone: 'neutral' | 'success' | 'danger'
+  action?: 'configure'
+} | null>('usageNote', null)
+const usageDraft = atom('usageDraft', { endpoint: '', auth: 'provider-api-key', meters: '' })
+const usageDetected = atom<{ provider: string; endpoint: string; connector: UsageConnector } | null>(
+  'usageDetected',
+  null
+)
 const loaded = atom(false)
 const usage = atom<{
   requests: number
@@ -230,7 +243,7 @@ const logsInfoOpen = atom<boolean | null>(null)
 // owns the edit slot; the shared add forms double as editors for rules/routes.
 const providerEditFor = atom('')
 const providerEditDisplayName = atom('')
-const providerEditBaseUrl = atom('')
+const providerEditEndpoints = atom<{ baseUrl: string; protocols: string[] }[]>('providerEditEndpoints', [])
 const providerEditModels = atom('')
 // Which provider's full model list is expanded under its header, so long
 // endpoint lists stay compact until someone asks for all of them.
@@ -1192,51 +1205,262 @@ async function fetchEditModels(name: string) {
   }
 }
 
+function usageMeterSummary(meters: ProviderUsageMeter[]) {
+  return meters
+    .map((meter) => {
+      const value = meter.remaining ?? meter.used ?? meter.limit
+      return `${meter.label ?? meter.id ?? 'meter'}: ${value ?? 'n/a'} ${meter.unit ?? ''}`.trim()
+    })
+    .join('; ')
+}
+
 async function fetchUsage(name: string) {
   set(error, '')
   set(message, '')
+  set(usageBusy, name)
+  set(usageNote, null)
+  set(usageDetected, null)
   try {
     const result = await plugin.request('router.keyUsage', { provider: name, refresh: true })
     const report = result.providers.find((item) => item.provider === name)
-    if (!report) {
-      set(message, 'Usage: this provider has no usage endpoint configured')
-      return
-    }
-    const current = read(keyQuotaReports)
-    set(keyQuotaReports, [...current.filter((item) => item.provider !== name), report])
-    lastKeyQuotaRefresh = Date.now()
-    const summary = report.keys
-      .flatMap((key) =>
-        key.meters.map((meter) => {
-          const value = meter.remaining ?? meter.used ?? meter.limit
-          return `${meter.label ?? meter.id ?? 'meter'}: ${value ?? 'n/a'} ${meter.unit ?? ''}`.trim()
-        })
-      )
+    if (report?.keys.length) {
+      const current = read(keyQuotaReports)
+      set(keyQuotaReports, [...current.filter((item) => item.provider !== name), report])
+      lastKeyQuotaRefresh = Date.now()
+      const summary = report.keys
+      .map((key) => {
+        const meters = usageMeterSummary(key.meters)
+        if (!meters) return ''
+        return report.keys.length > 1 ? `${key.id || key.secretKey}: ${meters}` : meters
+      })
+      .filter(Boolean)
       .join('; ')
     const errors = report.keys.flatMap((key) => key.errors)
-    set(message, summary || (errors.length ? `Usage failed: ${errors[0].message}` : 'Usage: no meters returned'))
+      set(usageNote, {
+        provider: name,
+        text: summary || (errors.length ? `Usage failed: ${errors[0].message}` : 'Usage: no meters returned'),
+        tone: summary ? 'success' : 'danger'
+      })
+      return
+    }
+    if (report?.reason === 'no-keys') {
+      set(usageNote, { provider: name, text: 'Add a key to read provider usage.', tone: 'neutral' })
+      return
+    }
+    if (report?.reason === 'error') {
+      set(usageNote, { provider: name, text: 'Usage failed: the endpoint could not be read.', tone: 'danger' })
+      return
+    }
+    // No saved connector: try a few well-known balance endpoints once, using
+    // the provider key. Nothing is saved until the user accepts the result.
+    const probe = await plugin.request('router.usageProbe', { provider: name })
+    if (probe.ok && probe.meters?.length) {
+      const secretKey = probe.secretKey ?? ''
+      if (secretKey) {
+        const current = read(keyQuotaReports).filter((item) => item.provider !== name)
+        set(keyQuotaReports, [
+          ...current,
+          {
+            provider: name,
+            keys: [{
+              id: 'detected',
+              secretKey,
+              enabled: true,
+              status: 'ok',
+              meters: probe.meters,
+              errors: [] as { message: string }[],
+              fetchedAt: Date.now()
+            }]
+          }
+        ])
+      }
+      if (probe.connector) {
+        set(usageDetected, { provider: name, endpoint: probe.endpoint ?? probe.connector.endpoint, connector: probe.connector })
+      }
+      // Keep the detected bars visible until the user saves or dismisses them;
+      // the periodic quota refresh would otherwise replace the list.
+      lastKeyQuotaRefresh = Date.now()
+      set(usageNote, {
+        provider: name,
+        text: `Detected ${usageMeterSummary(probe.meters)} from ${probe.endpoint}. Save it to keep it.`,
+        tone: 'success'
+      })
+      return
+    }
+    const tried = probe.tried?.length ?? 0
+    set(usageNote, {
+      provider: name,
+      text: probe.reason === 'no-keys'
+        ? 'Add a key to read provider usage.'
+        : `No usage source found${tried ? ` after trying ${tried} endpoint${tried === 1 ? '' : 's'}` : ''}.`,
+      tone: 'neutral',
+      action: probe.reason === 'no-keys' ? undefined : 'configure'
+    })
   } catch (cause) {
-    set(error, `Usage failed: ${(cause as Error).message}`)
+    set(usageNote, { provider: name, text: `Usage failed: ${(cause as Error).message}`, tone: 'danger' })
+  } finally {
+    set(usageBusy, '')
   }
+}
+
+// Protocols an edited provider can expose. Kept in sync with the outbound
+// translation layer in worker/sidecar.mjs.
+const EDIT_PROTOCOLS = [
+  { id: 'openai', label: 'OpenAI' },
+  { id: 'anthropic', label: 'Anthropic' },
+  { id: 'responses', label: 'Responses' },
+  { id: 'gemini', label: 'Gemini' }
+]
+
+// Endpoint rows shown in the provider editor. Imported configs often repeat the
+// same base URL once per protocol, so group by URL and union the protocols to
+// keep the form readable; saving writes one endpoint per URL.
+function canonicalProtocol(protocol: string) {
+  const normalized = protocol.toLowerCase().replace(/[-_]/g, '_')
+  if (normalized.includes('anthropic')) return 'anthropic'
+  if (normalized.includes('responses')) return 'responses'
+  if (normalized.includes('gemini') || normalized.includes('google')) return 'gemini'
+  if (normalized.includes('openai') || normalized.includes('chat')) return 'openai'
+  return protocol
+}
+
+function editEndpointsFor(
+  cfg: ProviderConfig | undefined,
+  fallback: { baseUrl: string; protocols: string[] }
+): { baseUrl: string; protocols: string[] }[] {
+  const source = cfg?.endpoints?.length
+    ? cfg.endpoints
+    : [{ baseUrl: cfg?.baseUrl ?? fallback.baseUrl, protocols: cfg?.protocols ?? fallback.protocols }]
+  const grouped = new Map<string, Set<string>>()
+  for (const endpoint of source) {
+    const baseUrl = (endpoint.baseUrl ?? '').trim()
+    if (!baseUrl) continue
+    const protocols = grouped.get(baseUrl) ?? new Set<string>()
+    for (const protocol of endpoint.protocols ?? []) protocols.add(canonicalProtocol(protocol))
+    grouped.set(baseUrl, protocols)
+  }
+  return [...grouped].map(([baseUrl, protocols]) => ({ baseUrl, protocols: [...protocols] }))
+}
+
+function updateEditEndpoint(index: number, patch: Partial<{ baseUrl: string; protocols: string[] }>) {
+  set(
+    providerEditEndpoints,
+    read(providerEditEndpoints).map((endpoint, position) => (position === index ? { ...endpoint, ...patch } : endpoint))
+  )
+}
+
+function toggleEditEndpointProtocol(index: number, protocol: string, checked: boolean) {
+  const endpoint = read(providerEditEndpoints)[index]
+  if (!endpoint) return
+  const protocols = checked
+    ? [...endpoint.protocols.filter((item) => item !== protocol), protocol]
+    : endpoint.protocols.filter((item) => item !== protocol)
+  updateEditEndpoint(index, { protocols })
 }
 
 function startEditProvider(provider: ProviderView) {
   const cfg = configProvider(provider.name)
+  const connector = cfg?.usageFetch?.connectors?.[0]
   closeModelPicker()
   set(providerEditFor, provider.name)
   set(providerEditDisplayName, cfg?.displayName ?? provider.displayName ?? '')
-  set(providerEditBaseUrl, cfg?.baseUrl ?? provider.baseUrl)
+  set(providerEditEndpoints, editEndpointsFor(cfg, provider))
   set(providerEditModels, (cfg?.models ?? []).map((model) => model.id).join('\n'))
+  set(usageDraft, {
+    endpoint: connector?.endpoint ?? '',
+    auth: connector?.auth === 'none' ? 'none' : 'provider-api-key',
+    meters: connector?.mapping?.meters?.length ? JSON.stringify(connector.mapping.meters, null, 2) : ''
+  })
+  set(usageDetected, null)
+}
+
+async function saveUsageSource(name: string) {
+  const draft = read(usageDraft)
+  const endpoint = draft.endpoint.trim()
+  if (!/^https?:\/\//i.test(endpoint)) {
+    set(error, 'Usage endpoint must start with http:// or https://')
+    return
+  }
+  let meters: unknown
+  try {
+    meters = JSON.parse(draft.meters || '[]')
+  } catch {
+    set(error, 'Meters must be valid JSON')
+    return
+  }
+  if (!Array.isArray(meters) || !meters.length) {
+    set(error, 'Add at least one meter mapping')
+    return
+  }
+  set(error, '')
+  try {
+    await plugin.request('router.provider.usage', {
+      provider: name,
+      usageFetch: {
+        enabled: true,
+        connectors: [{
+          id: 'custom',
+          type: 'http-json',
+          endpoint,
+          auth: draft.auth === 'none' ? 'none' : 'provider-api-key',
+          mapping: { meters: meters as UsageMeterMapping[] }
+        }]
+      }
+    })
+    set(usageDetected, null)
+    await refresh()
+    await fetchUsage(name)
+    set(message, 'Usage source saved')
+  } catch (cause) {
+    set(error, `Usage source failed: ${(cause as Error).message}`)
+  }
+}
+
+async function clearUsageSource(name: string) {
+  set(error, '')
+  try {
+    await plugin.request('router.provider.usage', { provider: name, usageFetch: null })
+    set(keyQuotaReports, read(keyQuotaReports).filter((item) => item.provider !== name))
+    set(usageDetected, null)
+    await refresh()
+    set(usageNote, { provider: name, text: 'Usage source removed.', tone: 'neutral' })
+  } catch (cause) {
+    set(error, `Usage source failed: ${(cause as Error).message}`)
+  }
+}
+
+async function saveDetectedUsage(name: string) {
+  const detected = read(usageDetected)
+  if (!detected || detected.provider !== name) return
+  set(error, '')
+  try {
+    await plugin.request('router.provider.usage', {
+      provider: name,
+      usageFetch: { enabled: true, connectors: [detected.connector] }
+    })
+    set(usageDetected, null)
+    await refresh()
+    await fetchUsage(name)
+    set(message, 'Usage source saved')
+  } catch (cause) {
+    set(error, `Usage source failed: ${(cause as Error).message}`)
+  }
 }
 
 async function saveProviderEdit(name: string) {
   const cfg = configProvider(name)
-  // Providers that route each protocol to its own base URL keep their endpoint
-  // URLs; this editor only manages the name and model list for them.
-  const perProtocol = (cfg?.endpoints?.length ?? 0) > 1
-  const baseUrl = read(providerEditBaseUrl).trim()
-  if (!perProtocol && !baseUrl) {
+  const endpoints = read(providerEditEndpoints)
+    .map((endpoint) => ({
+      baseUrl: endpoint.baseUrl.trim().replace(/\/+$/, ''),
+      protocols: [...new Set(endpoint.protocols.filter(Boolean))]
+    }))
+    .filter((endpoint) => endpoint.baseUrl)
+  if (!endpoints.length) {
     set(error, 'Provider needs a base URL')
+    return
+  }
+  if (!endpoints.some((endpoint) => endpoint.protocols.length)) {
+    set(error, 'Enable at least one protocol')
     return
   }
   // Keep description/pricing on models that survive the edit.
@@ -1247,16 +1471,15 @@ async function saveProviderEdit(name: string) {
     .filter(Boolean)
     .map((id) => known.get(id) ?? { id })
   const displayName = read(providerEditDisplayName).trim()
+  const protocols = [...new Set(endpoints.flatMap((endpoint) => endpoint.protocols))]
   set(error, '')
   set(message, '')
   const saved = await saveConfig((next) => {
     const provider = next.providers.find((item) => item.name === name)
     if (!provider) return
-    if (!perProtocol) {
-      const protocols = provider.protocols ?? cfg?.protocols ?? []
-      provider.baseUrl = baseUrl
-      provider.endpoints = [{ baseUrl, protocols }]
-    }
+    provider.baseUrl = endpoints[0].baseUrl
+    provider.endpoints = endpoints
+    provider.protocols = protocols
     provider.models = models
     if (displayName) provider.displayName = displayName
     else delete provider.displayName
@@ -3014,7 +3237,11 @@ function KeyBadges({ usage, quota }: { usage?: ProviderKeyUsage; quota?: KeyProv
   if (!cooling && !limited && !quotaUnavailable) return null
   return (
     <Row gap="xs" align="center" wrap>
-      {cooling ? <Badge tone="warning">cooling</Badge> : null}
+      {cooling ? (
+        <Text size="xs" tone="warning">
+          cooling
+        </Text>
+      ) : null}
       {limited ? <Badge tone="danger">at limit</Badge> : null}
       {quotaUnavailable ? <Badge tone="warning">quota unavailable</Badge> : null}
     </Row>
@@ -3094,9 +3321,10 @@ function ProviderCard({ provider }: { provider: ProviderView }) {
   const keyUsage = new Map((provider.keyUsage ?? []).map((entry) => [entry.secretKey, entry]))
   const quotaReport = read(keyQuotaReports).find((report) => report.provider === provider.name)
   const keyQuota = new Map((quotaReport?.keys ?? []).map((entry) => [entry.secretKey, entry]))
+  const note = read(usageNote)
+  const detected = read(usageDetected)
   const formOpen = read(keyFormFor) === provider.name
   const editing = read(providerEditFor) === provider.name
-  const perProtocol = (cfg?.endpoints?.length ?? 0) > 1
   const drafts = read(keyDrafts)
   const filledDrafts = drafts.filter((draft) => draft.value.trim()).length
   const draftNames = draftKeyNames(drafts, existingSecretNames())
@@ -3201,14 +3429,66 @@ function ProviderCard({ provider }: { provider: ProviderView }) {
               value={read(providerEditDisplayName)}
               onChange={(value) => set(providerEditDisplayName, value)}
             />
-            {perProtocol ? null : (
-              <Input
-                label="Base URL"
-                placeholder="https://api.example.com/v1"
-                value={read(providerEditBaseUrl)}
-                onChange={(value) => set(providerEditBaseUrl, value)}
-              />
-            )}
+            <Heading level={3}>
+              {read(providerEditEndpoints).length > 1 ? 'Endpoints' : 'Endpoint'}
+            </Heading>
+            {read(providerEditEndpoints).map((endpoint, index) => (
+              <Stack key={index} gap="xs">
+                <Row gap="xs" align="center">
+                  <Box grow>
+                    <Input
+                      label={read(providerEditEndpoints).length > 1 ? `Base URL ${index + 1}` : 'Base URL'}
+                      placeholder="https://api.example.com/v1"
+                      value={endpoint.baseUrl}
+                      onChange={(value) => updateEditEndpoint(index, { baseUrl: value })}
+                    />
+                  </Box>
+                  {read(providerEditEndpoints).length > 1 ? (
+                    <IconButton
+                      size="xs"
+                      icon="delete"
+                      label={`Remove endpoint ${index + 1}`}
+                      tooltip="Remove endpoint"
+                      onPress={() =>
+                        set(
+                          providerEditEndpoints,
+                          read(providerEditEndpoints).filter((_, position) => position !== index)
+                        )
+                      }
+                    />
+                  ) : null}
+                </Row>
+                <Row gap="sm" wrap>
+                  {EDIT_PROTOCOLS.map((protocol) => (
+                    <Switch
+                      key={protocol.id}
+                      label={protocol.label}
+                      checked={endpoint.protocols.includes(protocol.id)}
+                      onChange={(checked) => toggleEditEndpointProtocol(index, protocol.id, checked)}
+                    />
+                  ))}
+                </Row>
+              </Stack>
+            ))}
+            <Row gap="xs" wrap align="center">
+              <Button
+                size="xs"
+                variant="outline"
+                icon="add"
+                onPress={() =>
+                  set(providerEditEndpoints, [
+                    ...read(providerEditEndpoints),
+                    { baseUrl: '', protocols: [] }
+                  ])
+                }
+              >
+                Add endpoint
+              </Button>
+              <Text muted size="xs">
+                Each endpoint keeps its own protocols. Requests use the first endpoint that supports the protocol.
+              </Text>
+            </Row>
+            <Heading level={3}>Models</Heading>
             <Textarea
               label="Model IDs"
               placeholder={'gpt-4o\nclaude-sonnet-4-20250514'}
@@ -3244,6 +3524,46 @@ function ProviderCard({ provider }: { provider: ProviderView }) {
                 Cancel
               </Button>
             </Row>
+            <Separator />
+            <Heading level={3}>Usage source</Heading>
+            <Text muted size="xs">
+              Optional. Reads this provider's reported quota or balance when you press Fetch usage.
+            </Text>
+            <Input
+              label="Usage endpoint"
+              placeholder="https://api.example.com/v1/credits"
+              value={read(usageDraft).endpoint}
+              onChange={(value) => set(usageDraft, { ...read(usageDraft), endpoint: value })}
+            />
+            <Select
+              label="Auth"
+              value={read(usageDraft).auth}
+              options={[
+                { value: 'provider-api-key', label: 'Bearer provider key' },
+                { value: 'none', label: 'No auth' }
+              ]}
+              onChange={(value) => set(usageDraft, { ...read(usageDraft), auth: value })}
+            />
+            <Textarea
+              label="Meters JSON"
+              placeholder={'[{"id":"balance","kind":"balance","label":"Balance","remaining":"$.data.balance","unit":"USD"}]'}
+              rows={5}
+              value={read(usageDraft).meters}
+              onChange={(value) => set(usageDraft, { ...read(usageDraft), meters: value })}
+            />
+            <Text muted size="xs">
+              Map JSON fields with paths like $.data.balance. Set limit, used, or remaining; remaining is derived from limit minus used.
+            </Text>
+            <Row gap="xs" wrap>
+              <Button size="xs" variant="solid" tone="accent" onPress={() => void saveUsageSource(provider.name)}>
+                Save usage source
+              </Button>
+              {cfg?.usageFetch?.connectors?.length ? (
+                <Button size="xs" variant="ghost" onPress={() => void clearUsageSource(provider.name)}>
+                  Remove usage source
+                </Button>
+              ) : null}
+            </Row>
           </Stack>
         ) : null}
 
@@ -3254,8 +3574,15 @@ function ProviderCard({ provider }: { provider: ProviderView }) {
           <Button size="xs" variant="ghost" icon="search" disabled={read(fetchingModels)} onPress={() => void discover(provider.name)}>
             Fetch models
           </Button>
-          <Button size="xs" variant="ghost" icon="bar-chart-3" onPress={() => void fetchUsage(provider.name)}>
-            Usage
+          <Button
+            size="xs"
+            variant="ghost"
+            icon="bar-chart-3"
+            disabled={read(usageBusy) === provider.name}
+            tooltip={provider.usageSource ? 'Fetch the provider\'s reported usage' : 'Probe for a usage source'}
+            onPress={() => void fetchUsage(provider.name)}
+          >
+            {read(usageBusy) === provider.name ? 'Checking...' : 'Fetch usage'}
           </Button>
           <Button
             size="xs"
@@ -3273,6 +3600,24 @@ function ProviderCard({ provider }: { provider: ProviderView }) {
             onPress={() => set(confirmTarget, `provider:${provider.name}`)}
           />
         </Row>
+
+        {note?.provider === provider.name ? (
+          <Row gap="xs" align="center" wrap>
+            <Text size="xs" tone={note.tone} muted={note.tone === 'neutral'}>
+              {note.text}
+            </Text>
+            {detected?.provider === provider.name ? (
+              <Button size="xs" variant="ghost" onPress={() => void saveDetectedUsage(provider.name)}>
+                Save usage source
+              </Button>
+            ) : null}
+            {note.action === 'configure' ? (
+              <Button size="xs" variant="ghost" onPress={() => startEditProvider(provider)}>
+                Set up
+              </Button>
+            ) : null}
+          </Row>
+        ) : null}
 
         <ModelPicker
           token={`provider:${provider.name}`}
@@ -3422,8 +3767,8 @@ function ProviderCard({ provider }: { provider: ProviderView }) {
                 <Row justify="between" align="start" gap="sm">
                   <Box grow minWidth={120}>
                     <Row gap="sm" align="center" wrap>
-                      <Box minWidth={0}>
-                        <Text size="sm" weight="medium">
+                      <Box grow minWidth={0}>
+                        <Text size="xs" weight="medium">
                           {key.id || key.secretKey}
                         </Text>
                       </Box>
@@ -3678,7 +4023,7 @@ function Providers() {
         extra={
           <Row gap="xs" wrap>
             <Button variant="outline" icon="search" disabled={read(globalModelsFetching)} onPress={() => void fetchAllModels()}>
-              {read(globalModelsFetching) ? 'Fetching...' : 'Fetch all models from all providers'}
+              {read(globalModelsFetching) ? 'Fetching...' : 'Fetch all models'}
             </Button>
             <Button variant="outline" icon="refresh" onPress={() => void testProviders()}>
               Test all
