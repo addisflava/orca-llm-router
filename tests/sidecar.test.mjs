@@ -1217,6 +1217,9 @@ test('proxies chat completions directly to the resolved provider and logs the ro
     assert.match(seen[0].url, /api\.deepseek\.com\/v1\/chat\/completions/)
     assert.equal(sidecar.logs.length, 1)
     assert.equal(sidecar.logs[0].resolvedProvider, 'deepseek')
+    assert.equal(sidecar.logs[0].route, null)
+    assert.equal(sidecar.logs[0].requestModel, 'deepseek/deepseek-chat')
+    assert.equal(sidecar.logs[0].stream, false)
     // The provider must receive its own bare model id, not the routing prefix.
     assert.equal(JSON.parse(seen[0].init.body).model, 'deepseek-chat')
     // Usage and the resolved model are recorded after the body is read.
@@ -1247,6 +1250,7 @@ test('records usage from a same-protocol streaming response', async () => {
     assert.equal(res.status, 200)
     assert.match(await res.text(), /message_start/)
     assert.deepEqual(sidecar.logs[0].tokens, { input: 11, output: 2, cache: 0 })
+    assert.equal(sidecar.logs[0].stream, true)
     assert.equal(sidecar.usage().totalTokens, 13)
   })
 })
@@ -1392,7 +1396,66 @@ test('a route fails over to the backup provider after a 502', async () => {
     })
     assert.equal(res.status, 200)
     assert.ok(urls.length >= 2, `expected fallback, got ${urls.length}`)
-    assert.equal(sidecar.logs.at(-1).resolvedProvider, 'deepseek')
+    assert.equal(sidecar.logs.length, 1, 'one HTTP request is one log entry even when it tries several models')
+    const lastLog = sidecar.logs.at(-1)
+    const trail = lastLog.attempts
+    assert.equal(trail.filter((item) => item === 'anthropic/claude-sonnet-4-20250514#502').length, 3, 'retries on the failing target stay in the same entry')
+    assert.equal(trail.at(-1), 'deepseek/deepseek-chat', 'the successful hop names the full target')
+    assert.equal(lastLog.failures.length, 3)
+    assert.equal(lastLog.failures[0].provider, 'anthropic')
+    assert.equal(lastLog.failures[0].model, 'claude-sonnet-4-20250514')
+    assert.equal(lastLog.route, 'claude-backup')
+    assert.equal(lastLog.requestModel, 'claude-backup')
+    assert.equal(lastLog.resolvedProvider, 'deepseek')
+    assert.equal(lastLog.resolvedModel, 'deepseek-chat')
+    assert.equal(lastLog.failedOver, true, 'a recovered 200 is flagged as a failover')
+    assert.equal(sidecar.status().routeFailovers['claude-backup'], 1)
+    assert.equal(sidecar.status().routeRequests['claude-backup'], 1)
+  })
+})
+
+test('a route stays on its serving target until that target fails', async () => {
+  const config = testConfig({
+    routes: [{
+      name: 'sticky',
+      targets: [
+        { provider: 'anthropic', model: 'claude-sonnet-4-20250514' },
+        { provider: 'deepseek', model: 'deepseek-chat' }
+      ],
+      strategy: 'ordered',
+      retries: 0
+    }]
+  })
+  let failPrimary = false
+  const used = []
+  await withSidecar(config, async (url) => {
+    used.push(url.includes('anthropic.com') ? 'anthropic' : 'deepseek')
+    if (url.includes('anthropic.com') && failPrimary) {
+      return new Response('bad gateway', { status: 502, headers: { 'content-type': 'text/plain' } })
+    }
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } })
+  }, async (base, sidecar) => {
+    const send = () => fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'sticky', messages: [{ role: 'user', content: 'hi' }] })
+    })
+    assert.equal((await send()).status, 200)
+    assert.equal((await send()).status, 200)
+    assert.deepEqual(used.slice(0, 2), ['anthropic', 'anthropic'], 'the route stays pinned until a failure')
+
+    failPrimary = true
+    assert.equal((await send()).status, 200)
+    assert.deepEqual(used.slice(2), ['anthropic', 'deepseek'], 'a failed target falls over to the backup')
+    assert.equal(sidecar.logs.at(-1).failedOver, true)
+
+    failPrimary = false
+    assert.equal((await send()).status, 200)
+    assert.equal(used.at(-1), 'deepseek', 'the route stays on the new target after failover')
+    assert.equal(sidecar.status().routeRequests.sticky, 4)
+    sidecar.clearLogs()
+    assert.deepEqual(sidecar.status().routeRequests, {})
+    assert.deepEqual(sidecar.status().routeFailovers, {})
   })
 })
 
@@ -1435,6 +1498,8 @@ test('an unknown chat model returns 404 instead of mapping to a default provider
     assert.equal(prefixed.status, 404, 'an unknown provider prefix is not routed to the default provider')
     assert.equal(called, false, 'no provider is contacted for an unknown model')
     assert.equal(sidecar.logs.at(-1).status, 404)
+    assert.equal(sidecar.logs.at(-1).errorCode, 'model_not_found')
+    assert.equal(sidecar.logs.at(-1).route, null)
   })
 })
 
@@ -2021,6 +2086,111 @@ test('status reports rolling per-key usage and quota meters for the panel', asyn
   }
 })
 
+test('runtime snapshot survives a sidecar restart without storing secret values', async () => {
+  const config = pooledConfig([{ id: 'primary', secretKey: 'deepseek-key-1', enabled: true }])
+  const currentTime = 1_000_000
+  const fetchImpl = async () => new Response(
+    JSON.stringify({ id: 'r1', choices: [{ message: { content: 'ok' } }], usage: { prompt_tokens: 7, completion_tokens: 3 } }),
+    { status: 200, headers: { 'content-type': 'application/json' } }
+  )
+  let snapshot
+  const first = createSidecar({
+    getConfig: () => config,
+    getSecret: () => 'sk-first',
+    fetchImpl,
+    onLog: () => {},
+    now: () => currentTime,
+    persistState: (value) => { snapshot = value }
+  })
+  const addr = await first.start('127.0.0.1', 0)
+  try {
+    assert.equal((await proxy(`http://127.0.0.1:${addr.port}`)).status, 200)
+  } finally {
+    await first.stop()
+  }
+  first.flushRuntime()
+  assert.ok(snapshot, 'a runtime snapshot was written')
+  assert.equal(snapshot.version, 1)
+  assert.ok(snapshot.keyStates.some(([id]) => id === 'deepseek-key-1'), 'usage is keyed by secret name')
+  assert.equal(JSON.stringify(snapshot).includes('sk-first'), false, 'the snapshot holds no secret value')
+
+  // A plugin restart creates a fresh sidecar that only has the snapshot to go on.
+  const second = createSidecar({
+    getConfig: () => config,
+    getSecret: () => 'sk-first',
+    fetchImpl,
+    onLog: () => {},
+    now: () => currentTime,
+    initialState: snapshot
+  })
+  const restored = second.status().providers[0]
+  const key = restored.keyUsage.find((item) => item.secretKey === 'deepseek-key-1')
+  assert.equal(key.requests.day, 1, '24h request count survives the restart')
+  assert.equal(key.tokens.day, 10, '24h token count survives the restart')
+  assert.equal(restored.health.state, 'healthy', 'health badge survives the restart')
+  assert.equal(restored.health.samples, 1)
+})
+
+test('runtime restore prunes stale windows, cooldowns and expired circuits', () => {
+  const config = pooledConfig([{ id: 'primary', secretKey: 'deepseek-key-1', enabled: true }])
+  const current = 10_000_000
+  const now = () => current
+  const stale = current - 2 * 86_400_000
+  const snapshot = {
+    version: 1,
+    savedAt: stale,
+    keyStates: [['deepseek-key-1', {
+      requests: [stale, current - 1000],
+      tokens: [{ at: stale, tokens: 198 }, { at: current - 1000, tokens: 5 }],
+      images: [stale]
+    }]],
+    keyCooldowns: [['deepseek-key-1', current - 100]],
+    providerHealth: [['deepseek', { latencyMs: 120, samples: 3, failures: 0, successes: 3, lastSuccessAt: current - 1000, lastFailureAt: 0 }]],
+    providerCircuits: [['deepseek', { failures: 3, state: 'open', openUntil: current - 100, probeInFlight: true }]],
+    stats: { requests: 5, errors: 1, inputTokens: 2, outputTokens: 3, cost: 0.1, latencyMsTotal: 50, byProvider: { deepseek: 5 }, byModel: { model: 5 } }
+  }
+  const sidecar = createSidecar({ getConfig: () => config, getSecret: () => 'sk', now, initialState: snapshot })
+  const view = sidecar.status().providers[0]
+  const key = view.keyUsage.find((item) => item.secretKey === 'deepseek-key-1')
+  assert.equal(key.requests.day, 1, 'stale request timestamps are dropped')
+  assert.equal(key.tokens.day, 5, 'only fresh token entries are kept')
+  assert.equal(key.images.day, 0, 'stale image timestamps are dropped')
+  assert.equal(key.cooldownUntil, undefined, 'expired cooldowns are dropped')
+  assert.equal(view.health.state, 'healthy', 'an expired circuit does not keep the provider open')
+  assert.equal(view.health.latencyMs, 120)
+  const restored = sidecar.runtimeSnapshot()
+  assert.equal(restored.providerCircuits[0][1].state, 'closed', 'expired open circuit is closed on restore')
+  assert.equal(restored.providerCircuits[0][1].probeInFlight, false, 'no in-flight probe survives a restart')
+  assert.equal(restored.stats.requests, 5, 'aggregate stats are restored')
+})
+
+test('runtime persistence is throttled and flushes on demand', async () => {
+  const config = pooledConfig([{ id: 'primary', secretKey: 'deepseek-key-1', enabled: true }])
+  const currentTime = 1_000_000
+  let writes = 0
+  const sidecar = createSidecar({
+    getConfig: () => config,
+    getSecret: () => 'sk',
+    fetchImpl: async () => new Response(JSON.stringify({ id: 'r1', choices: [{ message: { content: 'ok' } }] }), {
+      status: 200, headers: { 'content-type': 'application/json' }
+    }),
+    onLog: () => {},
+    now: () => currentTime,
+    persistState: () => { writes++ }
+  })
+  const addr = await sidecar.start('127.0.0.1', 0)
+  try {
+    for (let i = 0; i < 5; i++) assert.equal((await proxy(`http://127.0.0.1:${addr.port}`)).status, 200)
+    // All requests share one injected timestamp, so only the first change
+    // writes immediately; the rest coalesce into the pending trailing flush.
+    assert.equal(writes, 1)
+    sidecar.flushRuntime()
+    assert.equal(writes, 2, 'an explicit flush persists the pending changes')
+  } finally {
+    await sidecar.stop()
+  }
+})
+
 test('a keyed provider retries a transient 5xx without cooling the key', async () => {
   const config = pooledConfig([{ id: 'only', secretKey: 'deepseek-key-1', enabled: true }])
   config.retries = 1
@@ -2091,6 +2261,7 @@ test('returns 420 when every key is over its configured limit', async () => {
       assert.equal((await exhausted.json()).error.code, 'all_keys_exhausted')
       assert.equal(calls, 1, 'the exhausted request never reaches upstream')
       assert.equal(sidecar.logs.at(-1).status, 420)
+      assert.equal(sidecar.logs.at(-1).errorCode, 'all_keys_exhausted')
     },
     { 'deepseek-key-1': 'sk-first' }
   )
@@ -2455,6 +2626,12 @@ test('normalizeConfig preserves the router default model', () => {
   assert.equal(normalized.defaultModel, 'pgs/deepseek-v4.1-flash')
 })
 
+test('normalizeConfig keeps the persistLogs opt-in without changing other configs', () => {
+  assert.equal(normalizeConfig({ providers: [] }).persistLogs, false)
+  assert.equal(normalizeConfig({ providers: [], persistLogs: true }).persistLogs, true)
+  assert.equal(normalizeConfig({ providers: [], persistLogs: false }).persistLogs, false)
+})
+
 test('convertClaudeCodeRouterConfig imports model aliases and profiles', () => {
   const result = convertClaudeCodeRouterConfig({
     Providers: [{
@@ -2697,12 +2874,18 @@ test('panelLogEntry strips bulky request/response bodies and headers', async () 
     at: Date.now(),
     upstream: 'anthropic',
     resolvedProvider: 'anthropic',
+    route: 'claude-backup',
     credential: 'key-1',
     model: 'claude-3-7-sonnet',
     protocol: 'anthropic_messages',
+    stream: true,
+    failedOver: true,
+    errorCode: 'upstream_failed',
+    policyId: 'policy-1',
     status: 500,
     latencyMs: 120,
-    attempts: ['anthropic'],
+    attempts: ['anthropic/claude-3-7-sonnet#502', 'deepseek/deepseek-chat'],
+    failures: [{ provider: 'anthropic', model: 'claude-3-7-sonnet', status: 502, error: 'bad gateway' }],
     tokens: { input: 1000, output: 500 },
     requestBody: { hugePrompt: 'X'.repeat(500_000) },
     responseBody: { rawError: 'Y'.repeat(500_000) },
@@ -2715,8 +2898,15 @@ test('panelLogEntry strips bulky request/response bodies and headers', async () 
   assert.equal(panelEntry.requestHeaders, undefined)
   assert.equal(panelEntry.responseHeaders, undefined)
   assert.equal(panelEntry.upstream, 'anthropic')
+  assert.equal(panelEntry.route, 'claude-backup')
+  assert.equal(panelEntry.stream, true)
+  assert.equal(panelEntry.failedOver, true)
+  assert.deepEqual(panelEntry.attempts, ['anthropic/claude-3-7-sonnet#502', 'deepseek/deepseek-chat'])
+  assert.equal(panelEntry.failures[0].model, 'claude-3-7-sonnet')
+  assert.equal(panelEntry.errorCode, 'upstream_failed')
+  assert.equal(panelEntry.policyId, 'policy-1')
   assert.equal(panelEntry.status, 500)
-  assert.ok(JSON.stringify(panelEntry).length < 500)
+  assert.ok(JSON.stringify(panelEntry).length < 800)
 })
 
 test('50 logs stripped for panel status serialize to well under 1 MiB', async () => {

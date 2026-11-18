@@ -43,18 +43,49 @@ import {
   buildCodexModelCatalog,
   mergeOpenCodeConfig,
   agentProfileFor,
-  providerFromPreset
+  providerFromPreset,
+  isWebChatTransport,
+  webchatCatalog,
+  webchatConfigured
 } from './sidecar.mjs'
+import {
+  AUTH_PROVIDERS,
+  startAuthBrowser,
+  captureAuth,
+  connectPageTarget,
+  removeProfileSafely,
+  CDPClient,
+  devtoolsReady,
+} from './webchat/auth.mjs'
+import { DeepSeekWebTransport, normalizeCredential as normalizeDeepSeekCred } from './webchat/deepseek.mjs'
+import { QwenWebTransport, normalizeCredential as normalizeQwenCred } from './webchat/qwen.mjs'
 import { ORCA_AGENTS } from './orca-agents.mjs'
 
 const CONFIG_KEY = 'router.config'
+// Usage counters and provider health are runtime state, not settings. They are
+// snapshotted separately so a plugin restart keeps the 24h windows and badges.
+const RUNTIME_KEY = 'router.runtime'
+const RUNTIME_FLUSH_INTERVAL_MS = 10_000
+// Persisted request logs are opt-in and live under their own key. Only sanitized
+// entries (no bodies or headers) are written; see panelLogEntry.
+const LOGS_KEY = 'router.logs'
+const LOGS_PERSIST_THROTTLE_MS = 5_000
+const MAX_PERSISTED_LOGS = 300
 const STATUS_BAR_ID = 'router-status'
 
 let sidecar = null
+let runtimeFlushTimer = null
+let runtimeWrite = Promise.resolve()
+let persistedLogs = []
+let logsDirty = false
+let lastLogPersistAt = 0
+let logFlushTimer = null
+let logWrite = Promise.resolve()
 let config = null
 let settings = { enabled: true, port: 18080, bindHost: '127.0.0.1', timeoutMs: 600000, retries: 2, baseDelayMs: 200 }
 const secretsCache = new Map()
 const keyUsageCache = new Map()
+const authSessions = new Map() // webchat transport -> auth session state
 const KEY_USAGE_TTL_MS = 60_000
 let boundAddress = null
 let installedAgentsCache = null
@@ -108,17 +139,23 @@ export function panelLogEntry(entry) {
     at: entry.at,
     upstream: entry.upstream ?? null,
     resolvedProvider: entry.resolvedProvider ?? null,
+    route: entry.route ?? null,
     credential: entry.credential ?? null,
     requestModel: entry.requestModel,
     resolvedModel: entry.resolvedModel,
     model: entry.model ?? entry.resolvedModel ?? '',
     protocol: entry.protocol ?? '',
+    stream: entry.stream ?? null,
+    failedOver: entry.failedOver === true,
+    errorCode: entry.errorCode ?? null,
+    policyId: entry.policyId ?? null,
     status: Number(entry.status ?? 0),
     latencyMs: entry.latencyMs ?? null,
     attempts: Array.isArray(entry.attempts) ? entry.attempts.slice(0, 10) : [],
     failures: Array.isArray(entry.failures)
-      ? entry.failures.slice(0, 5).map((f) => ({
+      ? entry.failures.slice(0, 10).map((f) => ({
           provider: f.provider,
+          model: f.model,
           status: f.status,
           error: typeof f.error === 'string' ? f.error.slice(0, 200) : undefined
         }))
@@ -692,13 +729,40 @@ async function hostCall(orca, method, params) {
   }
 }
 
+// Verify a web-chat credential with a cheap real upstream call. Used both when
+// credentials are captured and by the panel's Test action.
+async function probeWebChat(transport, creds) {
+  const fetchFn = (url, init) => fetch(url, { ...init, signal: AbortSignal.timeout(10000) })
+  try {
+    const client = transport === 'deepseek-web'
+      ? new DeepSeekWebTransport({ creds, fetchFn })
+      : new QwenWebTransport({ creds, fetchFn })
+    const ok = await client.probe()
+    return { ok: Boolean(ok), message: ok ? 'verified' : 'auth check returned no result' }
+  } catch (probeError) {
+    return { ok: false, message: String(probeError?.message ?? probeError) }
+  }
+}
+
+// Web-chat credentials are stored as a JSON string in the vault. The transports
+// and status checks consume an object, so parse those secrets on load — plain
+// API keys stay untouched strings.
+function parseCachedSecret(secretKey, value) {
+  if (typeof value !== 'string' || !secretKey?.startsWith('webchat:')) return value
+  try {
+    const parsed = JSON.parse(value)
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed
+  } catch { /* not JSON — keep the raw value */ }
+  return value
+}
+
 async function refreshSecrets(orca) {
   secretsCache.clear()
   for (const provider of config?.providers ?? []) {
     for (const key of provider.keys ?? []) {
       try {
         const value = (await orca.secrets.get(key.secretKey)) ?? null
-        if (value) secretsCache.set(key.secretKey, value)
+        if (value) secretsCache.set(key.secretKey, parseCachedSecret(key.secretKey, value))
       } catch {
         /* unreadable store: leave the slot empty, requests fall back to the caller's key */
       }
@@ -707,7 +771,7 @@ async function refreshSecrets(orca) {
   for (const key of config?.clientKeys ?? []) {
     try {
       const value = (await orca.secrets.get(key.secretKey)) ?? null
-      if (value) secretsCache.set(key.secretKey, value)
+      if (value) secretsCache.set(key.secretKey, parseCachedSecret(key.secretKey, value))
     } catch {
       /* as above */
     }
@@ -968,10 +1032,71 @@ async function persistConfig(orca, next, options = {}) {
   return config
 }
 
+// Serialize runtime snapshots so a slow write cannot be overwritten by a newer
+// one landing out of order. Storage failures are swallowed: usage tracking is
+// best-effort and must never break routing or panel requests.
+function persistRuntime(orca, snapshot) {
+  runtimeWrite = runtimeWrite
+    .then(() => orca.storage.set(RUNTIME_KEY, snapshot))
+    .catch(() => {})
+  return runtimeWrite
+}
+
+// --- Persisted request logs -------------------------------------------------
+// These are opt-in and separate from the runtime snapshot: only sanitized
+// entries reach storage, so captured bodies/headers are never persisted.
+function persistSavedLogs() {
+  if (!activeOrca) return
+  logsDirty = false
+  lastLogPersistAt = Date.now()
+  logWrite = logWrite
+    .then(() => activeOrca.storage.set(LOGS_KEY, persistedLogs))
+    .catch(() => {})
+  return logWrite
+}
+
+function markSavedLogsDirty() {
+  if (config?.persistLogs !== true || !activeOrca) return
+  logsDirty = true
+  if (Date.now() - lastLogPersistAt >= LOGS_PERSIST_THROTTLE_MS) {
+    persistSavedLogs()
+    return
+  }
+  if (logFlushTimer == null && typeof setTimeout === 'function') {
+    logFlushTimer = setTimeout(() => {
+      logFlushTimer = null
+      if (logsDirty) persistSavedLogs()
+    }, LOGS_PERSIST_THROTTLE_MS)
+    logFlushTimer.unref?.()
+  }
+}
+
+function rememberLog(entry) {
+  if (config?.persistLogs !== true) return
+  const safe = panelLogEntry(entry)
+  if (!safe) return
+  persistedLogs.push(safe)
+  if (persistedLogs.length > MAX_PERSISTED_LOGS) {
+    persistedLogs.splice(0, persistedLogs.length - MAX_PERSISTED_LOGS)
+  }
+  markSavedLogsDirty()
+}
+
+function clearSavedLogs() {
+  persistedLogs = []
+  logsDirty = false
+  if (logFlushTimer != null) {
+    clearTimeout(logFlushTimer)
+    logFlushTimer = null
+  }
+  persistSavedLogs()
+}
+
 /** @type {import('orca/worker').Activate} */
 export default async function activate(orca) {
   activeOrca = orca
   const stored = await storageGet(orca, CONFIG_KEY)
+  const storedRuntime = await storageGet(orca, RUNTIME_KEY)
   // Never replace what the store holds just because a read failed: a transient
   // error at activation used to overwrite an imported config with the default.
   if (stored.ok && stored.value && (stored.value.providers || stored.value.upstreams)) {
@@ -984,9 +1109,41 @@ export default async function activate(orca) {
   await refreshSettings(orca)
   await refreshSecrets(orca)
 
+  // Older versions added a web-chat provider as soon as "Add provider" was
+  // pressed, even with no credentials. Drop those orphans so the provider list
+  // only contains web accounts that actually have a verified secret.
+  {
+    const kept = config.providers.filter((provider) => {
+      if (!isWebChatTransport(provider)) return true
+      const key = (provider.keys ?? []).find((k) => k.enabled !== false) ?? (provider.keys ?? [])[0]
+      const secretKey = key?.secretKey || `webchat:${provider.transport}:auth`
+      return webchatConfigured(provider, secretsCache.get(secretKey))
+    })
+    if (kept.length !== config.providers.length) {
+      config = jsonSafe(normalizeConfig({ ...config, providers: kept }))
+      await orca.storage.set(CONFIG_KEY, config).catch(() => {})
+    }
+  }
+
+  // Restore previously saved logs only when the toggle is on. Storage entries
+  // were already sanitized on the way out, but filter defensively on the way in.
+  persistedLogs = []
+  if (config.persistLogs === true) {
+    const storedLogs = await storageGet(orca, LOGS_KEY)
+    if (storedLogs.ok && Array.isArray(storedLogs.value)) {
+      persistedLogs = storedLogs.value
+        .filter((entry) => entry && typeof entry.at === 'number' && Number.isFinite(entry.status))
+        .slice(-MAX_PERSISTED_LOGS)
+        .map((entry) => panelLogEntry(entry))
+        .filter(Boolean)
+    }
+  }
+
   sidecar = createSidecar({
     getConfig: effectiveConfig,
     getSecret: (secretKey) => secretsCache.get(secretKey) ?? null,
+    initialState: storedRuntime.ok ? storedRuntime.value : null,
+    persistState: (snapshot) => persistRuntime(orca, snapshot),
     onLog: (entry) => {
       try {
         const sanitized = panelLogEntry(entry)
@@ -994,8 +1151,15 @@ export default async function activate(orca) {
       } catch {
         /* no panel open */
       }
+      rememberLog(entry)
     }
   })
+  // A periodic flush catches the tail of a burst; deactivate() flushes the
+  // final state. The sidecar throttles on-change writes in between.
+  if (runtimeFlushTimer == null && typeof setInterval === 'function') {
+    runtimeFlushTimer = setInterval(() => sidecar?.flushRuntime?.(), RUNTIME_FLUSH_INTERVAL_MS)
+    runtimeFlushTimer.unref?.()
+  }
 
   if (settings.enabled) await ensureRunning(orca)
   else await announce(orca, false, settings.port)
@@ -1008,7 +1172,8 @@ export default async function activate(orca) {
   orca.panels.handle('router.status', async () => {
     await refreshSettings(orca)
     const status = sidecar.status()
-    let logs = (sidecar.logs || []).slice(-50).map(panelLogEntry).filter(Boolean)
+    const source = config?.persistLogs === true ? persistedLogs : (sidecar.logs || [])
+    let logs = source.slice(-50).map(panelLogEntry).filter(Boolean)
     let payload = jsonSafe({ ...status, agents: agentRoutes(), logs })
     let serialized = JSON.stringify(payload)
     if (serialized.length > 750_000) {
@@ -1038,13 +1203,223 @@ export default async function activate(orca) {
   })
   orca.panels.handle('router.test', async () => testProviders())
   orca.panels.handle('router.testProvider', async ({ provider: name }) => testProviders(name))
+  orca.panels.handle('router.webchat.setup', async ({ transport }) => {
+    if (!authTransportFor(transport).transport) throw new Error(`unknown web-chat transport: ${transport}`)
+    const existing = config.providers.find((item) => item.transport === transport)
+    if (existing) return { ok: true, provider: existing.name, created: false, secretKey: webchatSecretKey(existing) }
+    const secretKey = `webchat:${transport}:auth`
+    const provider = providerFromPreset(transport, { apiKeySecretKey: secretKey })
+    if (!provider) throw new Error(`unknown web-chat preset: ${transport}`)
+    const next = structuredClone(config)
+    next.providers.push(provider)
+    await persistConfig(orca, next)
+    return { ok: true, provider: provider.name, created: true, secretKey }
+  })
+  orca.panels.handle('router.webchat.resetSession', async ({ provider, affinityKey, keyIdentity: kid, all }) => {
+    const target = config.providers.find((item) => item.name === provider)
+    const transport = target?.transport || 'deepseek-web'
+    if (all) {
+      const removed = typeof sidecar?.resetWebChatSessionsByTransport === 'function'
+        ? sidecar.resetWebChatSessionsByTransport(transport) : 0
+      return { ok: true, removed, key: `webchat:${transport}:*` }
+    }
+    const key = `webchat:${transport}:${affinityKey || 'anon'}:${kid || ''}`
+    const removed = typeof sidecar?.resetWebChatSession === 'function' ? sidecar.resetWebChatSession(key) : false
+    return { ok: true, removed, key }
+  })
+  orca.panels.handle('router.webchat.sessions', async () => {
+    const list = typeof sidecar?.webchatSessions?.list === 'function' ? sidecar.webchatSessions.list() : []
+    return { ok: true, sessions: list }
+  })
+  // --- web-chat auth: native Chrome/CDP login capture + paste fallback -------
+  const authProfilesRoot = () => join(tmpdir(), 'orca-router-webchat')
+  const authTransportFor = (name) => {
+    const target = config.providers.find((item) => item.name === name)
+    const transport = target?.transport || (name && isWebChatTransport({ transport: name }) ? name : null)
+    return { target, transport }
+  }
+  const webchatSecretKey = (target) => {
+    const key = (target?.keys ?? []).find((k) => k.enabled !== false) ?? (target?.keys ?? [])[0]
+    return key?.secretKey || `webchat:${target?.transport || 'deepseek-web'}:auth`
+  }
+  const closeAuthBrowser = async (session) => {
+    if (!session) return
+    // Always drop the page CDP connection; it holds the header event buffer.
+    try { session.cdp?.close?.() } catch { /* noop */ }
+    session.cdp = null
+    if (session.mode === 'attach' || !session.port) return
+    try {
+      const version = await devtoolsReady(session.port)
+      if (version && version.webSocketDebuggerUrl) {
+        const browser = new CDPClient(version.webSocketDebuggerUrl)
+        await browser.ready()
+        try { await browser.send('Browser.close') } catch { /* already closed */ }
+        await new Promise((r) => setTimeout(r, 800))
+        browser.close()
+      }
+    } catch { /* noop */ }
+    if (session.profileDir) removeProfileSafely(session.profileDir)
+  }
+  const ensureWebChatKey = async (name, secretKey) => {
+    const next = structuredClone(config)
+    const t = next.providers.find((item) => item.name === name)
+    if (!t) return
+    t.keys = t.keys ?? []
+    if (!t.keys.some((k) => k.secretKey === secretKey)) {
+      t.keys.push({ id: 'auth', secretKey, enabled: true })
+      await persistConfig(orca, next)
+    }
+  }
+  // A web-chat provider is created only AFTER its credentials were captured and
+  // verified with a real upstream call — never just because "Add provider" was
+  // pressed. The preset supplies the model catalog; the key points to the vault.
+  const ensureWebChatProvider = async (transport, secretKey) => {
+    const existing = config.providers.find((item) => item.transport === transport)
+    if (existing) return existing.name
+    const provider = providerFromPreset(transport, { apiKeySecretKey: secretKey })
+    if (!provider) return null
+    const next = structuredClone(config)
+    next.providers.push(provider)
+    await persistConfig(orca, next)
+    return provider.name
+  }
+  const summarizeAuth = (auth) => ({
+    token: auth.token ? `OK (${auth.token.length} chars)` : 'MISSING',
+    cookie: auth.cookie ? `OK (${auth.cookiesCount ?? '?'} cookies)` : 'MISSING',
+    hif: (auth.hif_dliq || auth.hif_leim) ? 'captured' : 'optional',
+    bx: (auth.bx_umidtoken || auth.bx_ua || auth.bx_v) ? 'captured' : 'optional',
+  })
+
+  orca.panels.handle('router.webchat.auth.start', async ({ provider: name, port }) => {
+    const { target, transport } = authTransportFor(name)
+    if (!transport) throw new Error(`not a web-chat provider: ${name}`)
+    const prior = authSessions.get(transport)
+    if (prior) { await closeAuthBrowser(prior).catch(() => {}); authSessions.delete(transport) }
+    // Starting a new login invalidates any previously stored session — clear it
+    // so the UI cannot show "Connected" from stale credentials captured before
+    // the user actually signed in. Auto-capture restores it after a real login.
+    // Keep any existing credentials until the new ones are captured AND
+    // verified — a failed reconnect must not leave the account disconnected.
+    const started = await startAuthBrowser(transport, {
+      attachPorts: port ? [Number(port)] : [],
+      profileRoot: authProfilesRoot(),
+    })
+    // Attach the CDP session NOW, before the user logs in and sends the test
+    // message. Network headers (bx-*, x-hif-*) must be observed at that moment;
+    // connecting only at capture time would miss them entirely.
+    const url = AUTH_PROVIDERS[transport].url
+    const { cdp } = await connectPageTarget(started.port, url)
+    authSessions.set(transport, { ...started, provider: name, cdp, startedAt: Date.now() })
+    return { ok: true, ...started, secretKey: webchatSecretKey(target) }
+  })
+
+  orca.panels.handle('router.webchat.auth.status', async ({ provider: name }) => {
+    const { target, transport } = authTransportFor(name)
+    const session = transport ? authSessions.get(transport) : null
+    const secretKey = target ? webchatSecretKey(target) : ''
+    const creds = secretsCache.get(secretKey)
+    const configured = Boolean(target && webchatConfigured(target, creds))
+    const parsed = typeof creds === 'string' ? (() => { try { return JSON.parse(creds) } catch { return null } })() : creds
+    const headersCaptured = transport === 'qwen-web'
+      ? Boolean(parsed?.bx_umidtoken || parsed?.bx_ua || parsed?.bx_v)
+      : Boolean(parsed?.hif_dliq || parsed?.hif_leim)
+    return {
+      ok: true,
+      configured,
+      secretKey,
+      headersCaptured,
+      session: session ? { mode: session.mode, port: session.port, startedAt: session.startedAt } : null,
+    }
+  })
+
+  orca.panels.handle('router.webchat.auth.capture', async ({ provider: name, secretKey, silent, attempts }) => {
+    const { target, transport } = authTransportFor(name)
+    if (!transport) throw new Error(`not a web-chat provider: ${name}`)
+    const session = authSessions.get(transport)
+    if (!session) throw new Error('no web-chat login session; start the login first')
+    const url = AUTH_PROVIDERS[transport].url
+    // Reuse the CDP connection opened at start so headers captured while the
+    // user sent the test message are still available. For silent polling we
+    // leave it open so later attempts see the same accumulated header buffer.
+    let cdp = session.cdp
+    if (!cdp) {
+      ({ cdp } = await connectPageTarget(session.port, url))
+      session.cdp = cdp
+    }
+    const { ok, auth } = await captureAuth(transport, {
+      port: session.port,
+      url,
+      cdp,
+      attempts: Number.isFinite(attempts) ? Math.max(1, Math.min(attempts, 20)) : 20,
+      close: !silent,
+      // Automatic capture must prove the user actually logged in; a manual
+      // Capture credentials click is an explicit override.
+      requireLiveSession: Boolean(silent),
+    })
+    const sk = secretKey || webchatSecretKey(target)
+    if (!ok || !auth) {
+      if (silent) return { ok: false, secretKey: sk, summary: null }
+      throw new Error(`no credentials captured. Log in to ${url} in the opened Chrome window, send one short message (e.g. "ok"), then capture again.`)
+    }
+    // Only accept credentials that actually work: make a real upstream call
+    // with them before saving anything or adding the provider to the config.
+    const probe = await probeWebChat(transport, auth)
+    if (!probe.ok) {
+      if (silent) return { ok: false, secretKey: sk, summary: null, reason: 'verification_failed', message: probe.message }
+      throw new Error(`Credentials were captured but could not be verified: ${probe.message}`)
+    }
+    await orca.secrets.set(sk, JSON.stringify(auth))
+    secretsCache.set(sk, auth)
+    await ensureWebChatProvider(transport, sk)
+    if (target) await ensureWebChatKey(name, sk)
+    if (!silent) {
+      // An explicit capture means "I'm done" — close the browser and session.
+      await closeAuthBrowser(session).catch(() => {})
+      authSessions.delete(transport)
+    }
+    // Silent (automatic) capture only refreshes the stored credentials: leave
+    // the window and CDP session alive so the person can finish logging in or
+    // send their test message, and later polls can pick up rotated headers.
+    return { ok: true, secretKey: sk, summary: summarizeAuth(auth), verified: true }
+  })
+
+  orca.panels.handle('router.webchat.auth.cancel', async ({ provider: name }) => {
+    const { transport } = authTransportFor(name)
+    const session = transport ? authSessions.get(transport) : null
+    if (session) { await closeAuthBrowser(session).catch(() => {}); authSessions.delete(transport) }
+    return { ok: true }
+  })
+
+  orca.panels.handle('router.webchat.auth.paste', async ({ provider: name, json, secretKey }) => {
+    const { target, transport } = authTransportFor(name)
+    if (!transport) throw new Error(`not a web-chat provider: ${name}`)
+    let parsed
+    try { parsed = typeof json === 'string' ? JSON.parse(json) : json } catch { parsed = null }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('credentials must be a JSON object')
+    const creds = transport === 'deepseek-web' ? normalizeDeepSeekCred(parsed) : normalizeQwenCred(parsed)
+    if (!creds.token) throw new Error('credentials contain no token (look for "token", "access_token" or "userToken")')
+    const probe = await probeWebChat(transport, creds)
+    if (!probe.ok) throw new Error(`credentials could not be verified: ${probe.message}`)
+    const sk = secretKey || webchatSecretKey(target)
+    await orca.secrets.set(sk, JSON.stringify(creds))
+    secretsCache.set(sk, creds)
+    await ensureWebChatProvider(transport, sk)
+    if (target) await ensureWebChatKey(name, sk)
+    return { ok: true, secretKey: sk, verified: true, summary: summarizeAuth({ ...creds, cookiesCount: creds.cookie ? 1 : 0 }) }
+  })
+
   orca.panels.handle('router.clearLogs', async () => {
     if (typeof sidecar?.clearLogs === 'function') sidecar.clearLogs()
     else sidecar.logs.length = 0
+    clearSavedLogs()
     return { ok: true }
   })
   orca.panels.handle('router.usage', async ({ window }) => sidecar.usage({ window: window ?? 'today' }))
-  orca.panels.handle('router.presets', async () => ({ presets: PROVIDER_PRESETS }))
+  orca.panels.handle('router.presets', async () => ({
+    // Web-chat presets are configured from the dedicated Web Chat tab, not the
+    // generic preset picker (they have no base URL and need browser login).
+    presets: PROVIDER_PRESETS.filter((preset) => !preset.transport)
+  }))
   orca.panels.handle('router.config.get', async () => jsonSafe({ config }))
   orca.panels.handle('router.config.save', async ({ config: next }) => {
     const problem = validateConfig(next)
@@ -1053,7 +1428,17 @@ export default async function activate(orca) {
       error.code = 'invalid_params'
       throw error
     }
+    const wasPersisting = config?.persistLogs === true
     await persistConfig(orca, next)
+    if (config.persistLogs === true && !wasPersisting) {
+      // Seed from the live buffer so enabling the toggle is immediate.
+      persistedLogs = (sidecar?.logs ?? []).slice(-MAX_PERSISTED_LOGS)
+        .map(panelLogEntry).filter(Boolean)
+      logsDirty = true
+      persistSavedLogs()
+    } else if (config.persistLogs !== true && wasPersisting) {
+      clearSavedLogs()
+    }
     return { ok: true }
   })
   orca.panels.handle('router.config.export', async () => {
@@ -1300,6 +1685,10 @@ export default async function activate(orca) {
     // has not been saved yet.
     const target = name ? config.providers.find((item) => item.name === name) : null
     if (name && !target) throw new Error(`unknown provider: ${name}`)
+    // Web-chat transports have no /v1/models endpoint; return the static catalog.
+    if (isWebChatTransport(target ?? { transport: null })) {
+      return { ok: true, models: webchatCatalog(target).map((m) => m.id), provider: name ?? null }
+    }
     const resolvedBaseUrl = String(baseUrl ?? target?.baseUrl ?? target?.endpoints?.[0]?.baseUrl ?? '').trim()
     if (!resolvedBaseUrl) throw new Error('a base URL is required to fetch models')
     const resolvedProtocols = protocols ?? target?.protocols ?? target?.capabilities ?? []
@@ -1321,6 +1710,9 @@ export default async function activate(orca) {
     const providers = effectiveConfig().providers ?? []
     const results = await Promise.all(
       providers.map(async (provider) => {
+        if (isWebChatTransport(provider)) {
+          return { provider: provider.name, models: webchatCatalog(provider).map((m) => m.id) }
+        }
         const baseUrl = String(provider.baseUrl ?? provider.endpoints?.[0]?.baseUrl ?? '').trim()
         if (!baseUrl) return { provider: provider.name, models: [], error: 'no base URL' }
         const key = (provider.keys ?? []).map((entry) => secretsCache.get(entry.secretKey)).find(Boolean)
@@ -1535,6 +1927,29 @@ async function testProviders(only) {
   for (const provider of effectiveConfig().providers.filter((item) => !only || item.name === only)) {
     const started = Date.now()
     const key = (provider.keys ?? []).map((entry) => secretsCache.get(entry.secretKey)).find(Boolean)
+    // Web-chat transports have no /v1/models endpoint, but we can still probe
+    // the actual subscription with a cheap authenticated call. This surfaces
+    // expired tokens/cookies as a failed test instead of a false green badge.
+    if (isWebChatTransport(provider)) {
+      if (!webchatConfigured(provider, key)) {
+        results.push({
+          provider: provider.name,
+          ok: false, status: 401,
+          message: 'missing auth secret (run the web-chat login)',
+          latencyMs: Date.now() - started,
+        })
+      } else {
+        const probe = await probeWebChat(provider.transport, key)
+        results.push({
+          provider: provider.name,
+          ok: probe.ok,
+          status: probe.ok ? 200 : 401,
+          message: probe.ok ? undefined : probe.message,
+          latencyMs: Date.now() - started,
+        })
+      }
+      continue
+    }
     const baseUrl = provider.baseUrl ?? provider.endpoints?.[0]?.baseUrl
     const probe = providerProbe(provider, key)
     try {
@@ -1567,6 +1982,36 @@ async function testProviders(only) {
 export async function deactivate() {
   stopCodexConfigGuard()
   await restoreCodexGlobal(activeOrca).catch(() => {})
+  // Close any web-chat auth browser and remove its throwaway profiles.
+  for (const [, session] of authSessions) {
+    try { session?.cdp?.close?.() } catch { /* noop */ }
+    if (session && session.mode !== 'attach' && session.port) {
+      try {
+        const version = await devtoolsReady(session.port)
+        if (version && version.webSocketDebuggerUrl) {
+          const browser = new CDPClient(version.webSocketDebuggerUrl)
+          await browser.ready()
+          try { await browser.send('Browser.close') } catch { /* noop */ }
+          browser.close()
+        }
+      } catch { /* noop */ }
+      if (session.profileDir) removeProfileSafely(session.profileDir)
+    }
+  }
+  authSessions.clear()
+  try { removeProfileSafely(join(tmpdir(), 'orca-router-webchat')) } catch { /* noop */ }
+  sidecar?.flushRuntime?.()
+  await runtimeWrite.catch(() => {})
+  if (logFlushTimer != null) {
+    clearTimeout(logFlushTimer)
+    logFlushTimer = null
+  }
+  if (logsDirty) persistSavedLogs()
+  await logWrite.catch(() => {})
+  if (runtimeFlushTimer != null) {
+    clearInterval(runtimeFlushTimer)
+    runtimeFlushTimer = null
+  }
   await sidecar?.stop?.().catch(() => {})
   boundAddress = null
   activeOrca = null

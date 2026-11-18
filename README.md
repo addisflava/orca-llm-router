@@ -31,7 +31,8 @@ One stable local endpoint (`127.0.0.1:18080`) for every coding agent you run in 
 ## Core Features
 
 - **Single Unified Endpoint**: Connects popular coding and AI clients (such as Claude Code, OpenAI Codex, OpenCode, Pi, Aider, Cursor, and Cline) to one local endpoint — no per-tool setup, no editing dotfiles. Orca LLM Router wires each agent up automatically when it launches.
-- **Multi-Provider Aggregation**: **32 built-in presets** covering OpenAI, Anthropic, Google Gemini, OpenRouter, DeepSeek, NVIDIA, OpenCode Go, Xiaomi MiMo and its regional token plans, Kimi, Zhipu/Z.AI, MiniMax, Mistral, SiliconFlow, Alibaba Bailian, and more — plus any OpenAI-, Anthropic-, or Gemini-compatible endpoint you point it at. Mix subscriptions, API keys, and local models behind one address.
+- **Multi-Provider Aggregation**: **34 built-in presets** covering OpenAI, Anthropic, Google Gemini, OpenRouter, DeepSeek, NVIDIA, OpenCode Go, Xiaomi MiMo and its regional token plans, Kimi, Zhipu/Z.AI, MiniMax, Mistral, SiliconFlow, Alibaba Bailian, and more — plus any OpenAI-, Anthropic-, or Gemini-compatible endpoint you point it at. Mix subscriptions, API keys, and local models behind one address.
+- **Native Web-Chat Transports (free subscriptions)**: **DeepSeek Web** and **Qwen Web** presets drive the free web subscriptions (`chat.deepseek.com`, `chat.qwen.ai`) directly through the gateway — no external proxy, no local server. A one-click Chrome/CDP login in the panel captures the browser session into Orca's secret vault (paste fallback included), and the router manages the remote chat (session chaining, recovery, continuation) exactly like any other provider.
 - **Smart Auto-Fallback**: A model name your agents send can resolve to an ordered list (or a fastest-healthy-first ranking) of provider/model targets. Targets are retried, then the next target takes over on 429s, 5xxs, timeouts, or open circuits — so a rate-limited provider never stalls your session.
 - **Credential Pools with Smooth Weighted Rotation**: Add multiple keys per provider. Lower priority tiers serve first; a key with weight `3` gets roughly three times the traffic of weight `1`; higher-priority keys stay idle until the preferred tier is cooling, over its limit, or near a utilization threshold.
 - **Automatic Cooldowns & Explicit Exhaustion**: Keys that hit 401/403 or 429 cool down automatically (honoring `Retry-After`). When every key is cooling or over quota, the gateway returns `420 router_exhausted` with `all_keys_exhausted` instead of silently reusing a blocked key.
@@ -71,19 +72,33 @@ Notes:
 
 ## See it in the panel
 
-![Orca LLM Router overview — live gateway status, request metrics, and agent endpoint configuration](assets/screenshot-overview.png)
+A visual tour of the Orca LLM Router panel inside Orca's sidebar:
 
-*Live gateway status, real-time metrics, and agent endpoint configuration — all in Orca's sidebar.*
+| Gateway Overview & Telemetry | Smart Cross-Provider Routing |
+|:---:|:---:|
+| [![Gateway Overview](assets/screenshot-overview.png)](assets/screenshot-overview.png) | [![Smart Routing](assets/screenshot-routing.png)](assets/screenshot-routing.png) |
+| *Live gateway metrics: real-time tokens, latency, cost, and active local endpoints.* | *Unified model aliases (`deepseek-rout`, `claude-sonnet-4-6`) with fastest-first ranking & failover counts.* |
 
-![Orca LLM Router providers — provider credentials, model discovery, and multi-key load balancing](assets/screenshot-providers.png)
+| Resilient Auto-Failover & Logs | Visual Route Builder |
+|:---:|:---:|
+| [![Live Request Logs](assets/screenshot-logs.png)](assets/screenshot-logs.png) | [![Visual Route Builder](assets/screenshot-targets.png)](assets/screenshot-targets.png) |
+| *Real-time log query showing 10-attempt retry chains recovering from 503/429 errors into 200 OK.* | *Multi-provider target picker: search 360+ models, select fallback order, and customize sequence.* |
 
-*Provider presets, model discovery, and multi-key pools with per-key usage.*
+| Multi-Key Credential Pools | 45+ Native Coding Agents |
+|:---:|:---:|
+| [![Providers & Keys](assets/screenshot-providers.png)](assets/screenshot-providers.png) | [![Coding Agents](assets/screenshot-agents.png)](assets/screenshot-agents.png) |
+| *Weighted multi-key rotation, priority tiers, individual key toggles, and rolling 24h usage meters.* | *One-click toggle routing for Claude Code, Codex, OpenCode, Cursor, Pi, Kimi, and 45+ agents.* |
+
+| Opt-In Token Optimization |
+|:---:|
+| [![Request Optimization](assets/screenshot-optimization.png)](assets/screenshot-optimization.png) |
+| *Settings panel: Prompt compression (ANSI/whitespace), context relay on failover, and response cache.* |
 
 ---
 
 ## Supported Providers
 
-**32 built-in presets**, plus a custom endpoint. Presets carry model catalogs and pricing data where available; some also include provider-specific usage scrapers.
+**34 built-in presets**, plus a custom endpoint. Presets carry model catalogs and pricing data where available; some also include provider-specific usage scrapers. Two of the presets are **native web-chat transports** that drive free web subscriptions directly (no HTTP gateway to reach).
 
 | Provider | Protocols | Default Base URL |
 |---|---|---|
@@ -94,6 +109,8 @@ Notes:
 | **NVIDIA** | `openai` | `https://integrate.api.nvidia.com/v1` |
 | **OpenCode Go** | `openai`, `responses`, `anthropic` | `https://opencode.ai/zen/go/v1` |
 | **DeepSeek** | `openai` | `https://api.deepseek.com` |
+| **DeepSeek Web** ⚡ | `openai` | free web subscription — native transport |
+| **Qwen Web** ⚡ | `openai` | free web subscription — native transport |
 | **Xiaomi MiMo** | `openai`, `responses` | `https://api.xiaomimimo.com/v1` |
 | **Xiaomi Token Plan (China)** | `openai`, `responses` | `https://token-plan-cn.xiaomimimo.com/v1` |
 | **Xiaomi Token Plan (Singapore)** | `openai`, `responses` | `https://token-plan-sgp.xiaomimimo.com/v1` |
@@ -120,6 +137,13 @@ Notes:
 | **claudeapi** | `anthropic` | `https://gw.claudeapi.com` |
 | **Y-API** | `openai`, `anthropic` | `https://api.y-api.bestvirtualgoods.com/v1` |
 | **Ollama or any local server** | `openai`, `anthropic`, `responses`, `gemini` | Custom — e.g. `http://127.0.0.1:11434/v1` |
+
+⚡ **Web-chat providers** have no base URL: the gateway talks to the web subscription directly. They are added from the **Web chat** tab inside the **Add provider** dialog under **Providers**:
+
+1. Under **Providers**, open **Add provider** and choose **Web chat**, then press **Add as a provider** for **DeepSeek Web** or **Qwen Web**.
+2. The router opens (or attaches to) a Chrome instance with remote debugging and watches for the login automatically. Sign in to the provider and send one short message so the anti-bot tokens rotate.
+3. The browser session (token, cookies, anti-bot headers) is captured and saved to Orca's encrypted secret vault automatically. **Capture credentials** forces an immediate check, and **Paste auth JSON** accepts a blob from a manual browser session.
+4. Models resolve from the built-in catalog (`deepseek-chat`, `deepseek-reasoner`, `deepseek-v4-pro`, `qwen3-max`, `qwen3-max-thinking`, …). The router owns the remote chat per conversation, so multi-turn chaining, empty-response retries, context-overflow resets, and continuation after a stale session all work like any other provider. **Reset remote sessions** in the same dialog drops stuck conversations.
 
 ---
 

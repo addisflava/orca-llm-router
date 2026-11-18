@@ -4,8 +4,8 @@
   "execution": "trusted-worker",
   "id": "llm-router",
   "name": "LLM Router for Orca",
-  "version": "1.0.3",
-  "description": "Use all your subscriptions and API credits from any provider and coding plan on any agent in Orca, in one place, without leaving Orca. Features multi-key credential pools with smooth weighted rotation, priority tiers, and routing different providers behind a single model name with seamless fallback.",
+  "version": "1.1.0",
+  "description": "Use all your subscriptions and API credits from any provider and coding plan on any agent in Orca, in one place, without leaving Orca. Features multi-key credential pools with smooth weighted rotation, priority tiers, routing different providers behind a single model name with seamless fallback, and native web-chat transports that drive free DeepSeek/Qwen web subscriptions directly.",
   "author": {
     "name": "addisflava"
   },
@@ -19,13 +19,33 @@
   "screenshots": [
     {
       "path": "assets/screenshot-overview.png",
-      "alt": "Orca LLM Router overview panel showing active gateway, metrics, and agent endpoints",
-      "caption": "Live gateway status, real-time metrics, and agent endpoint configuration"
+      "alt": "Orca LLM Router live overview dashboard showing active gateway, metrics, and agent endpoints",
+      "caption": "Live Gateway Dashboard — real-time tokens, latency metrics, and agent endpoint configuration"
+    },
+    {
+      "path": "assets/screenshot-routing.png",
+      "alt": "Orca LLM Router routing panel showing model aliases, fastest-first ranking, and live failover telemetry",
+      "caption": "Smart Cross-Provider Routing — unified model names with fastest-healthy-first ranking and live failover counts"
+    },
+    {
+      "path": "assets/screenshot-logs.png",
+      "alt": "Orca LLM Router live request log showing query filtering and automatic failover retries resolving to 200 OK",
+      "caption": "Live Request Log & Auto-Failover — resilient retry chains automatically route around upstream 503 and 429 errors"
     },
     {
       "path": "assets/screenshot-providers.png",
-      "alt": "Orca LLM Router providers panel showing multi-provider configuration and model discovery",
-      "caption": "Provider credentials, model discovery, and multi-key load balancing"
+      "alt": "Orca LLM Router providers panel showing multi-provider configuration, key pools, and model discovery",
+      "caption": "Multi-Key Credential Pools — weighted rotation, priority tiers, and per-key usage tracking"
+    },
+    {
+      "path": "assets/screenshot-targets.png",
+      "alt": "Interactive route target editor filtering 360+ models across providers with drag-and-drop order",
+      "caption": "Visual Route Builder — search across 360+ models from any provider and customize failover chains"
+    },
+    {
+      "path": "assets/screenshot-agents.png",
+      "alt": "Orca LLM Router agents tab with one-click routing toggles for 45+ supported coding agents",
+      "caption": "45+ Supported Agents — one-click zero-config routing for Claude Code, Codex, OpenCode, Cursor, and more"
     }
   ],
   "engines": {

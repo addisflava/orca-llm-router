@@ -18,6 +18,8 @@ declare module 'orca' {
         agentProfiles: AgentProfile[]
         agents: AgentRoute[]
         logs: LogEntry[]
+        routeFailovers?: Record<string, number>
+        routeRequests?: Record<string, number>
       }
     }
     'router.start': { input: Record<string, never>; output: { running: boolean; port: number } }
@@ -143,6 +145,68 @@ declare module 'orca' {
       input: { provider: string; usageFetch?: UsageFetchConfig | null }
       output: { ok: true }
     }
+    'router.webchat.setup': {
+      input: { transport: 'deepseek-web' | 'qwen-web' }
+      output: { ok: true; provider: string; created: boolean; secretKey: string }
+    }
+    'router.webchat.resetSession': {
+      input: { provider?: string; affinityKey?: string; keyIdentity?: string; all?: boolean }
+      output: { ok: true; removed: boolean | number; key: string }
+    }
+    'router.webchat.sessions': {
+      input: Record<string, never>
+      output: {
+        ok: true
+        sessions: {
+          key: string
+          session_id: string | null
+          message_count: number
+          history_size: number
+          age_ms: number | null
+          idle_ms: number
+        }[]
+      }
+    }
+    'router.webchat.auth.start': {
+      input: { provider: string; port?: number }
+      output: {
+        ok: true
+        mode: 'attach' | 'launch'
+        port: number
+        profileDir: string
+        reused: boolean
+        secretKey: string
+      }
+    }
+    'router.webchat.auth.status': {
+      input: { provider: string }
+      output: {
+        ok: true
+        configured: boolean
+        secretKey: string
+        headersCaptured: boolean
+        session: { mode: string; port: number; startedAt: number } | null
+      }
+    }
+    'router.webchat.auth.capture': {
+      input: { provider: string; secretKey?: string; silent?: boolean; attempts?: number }
+      output: {
+        ok: boolean
+        secretKey: string
+        summary: { token: string; cookie: string; hif?: string; bx?: string } | null
+        verified?: boolean
+        reason?: 'verification_failed'
+        message?: string
+      }
+    }
+    'router.webchat.auth.cancel': {
+      input: { provider: string }
+      output: { ok: true }
+    }
+    'router.webchat.auth.paste': {
+      input: { provider: string; json: string | Record<string, unknown>; secretKey?: string }
+      output: { ok: true; secretKey: string; summary: { token: string; cookie: string; hif?: string; bx?: string } }
+    }
   }
   interface PluginPanelEvents {
     'router.statusChanged': { running: boolean; port: number }
@@ -172,6 +236,8 @@ export interface ProviderPreset {
   capabilities: string[]
   defaultModels: string[]
   websiteUrl?: string
+  /** Native web-chat transport id (deepseek-web | qwen-web), when the preset drives a web subscription. */
+  transport?: 'deepseek-web' | 'qwen-web'
   usage?: { endpoint: string; auth: string; mapping: { meters: unknown[] } }
 }
 
@@ -247,6 +313,8 @@ export interface ProviderView {
   health?: ProviderHealthView
   /** True when a usage connector is configured (or matched from a preset). */
   usageSource?: boolean
+  /** Native web-chat transport id when this provider drives a web subscription. */
+  transport?: 'deepseek-web' | 'qwen-web'
 }
 
 export interface PolicyCondition {
@@ -399,6 +467,8 @@ export interface RouterConfig {
   retries?: number
   baseDelayMs?: number
   logBodyCapture?: 'all' | 'errors' | 'none'
+  /** Opt-in: keep the request log in Orca storage across worker restarts. */
+  persistLogs?: boolean
   exposeRoutingHeaders?: boolean
   allowUnauthenticatedRemote?: boolean
 }
@@ -445,6 +515,8 @@ export interface ProviderConfig {
   enabled?: boolean
   pricing?: Record<string, unknown>
   usageFetch?: UsageFetchConfig
+  /** Native web-chat transport id when the provider drives a web subscription. */
+  transport?: 'deepseek-web' | 'qwen-web'
 }
 
 /** One meter read from a provider usage response. Expressions are JSON paths (`$.a.b`). */
@@ -481,15 +553,21 @@ export interface LogEntry {
   at: number
   upstream: string | null
   resolvedProvider?: string | null
+  route?: string | null
   credential?: string | null
   requestModel?: string
   resolvedModel?: string
   model: string
   protocol: string
+  stream?: boolean
+  /** A retry or failover happened before this response succeeded. */
+  failedOver?: boolean
+  errorCode?: string | null
+  policyId?: string | null
   status: number
   latencyMs: number | null
   attempts: string[]
-  failures?: { provider: string; status?: number; error?: string; code?: string }[]
+  failures?: { provider: string; model?: string; status?: number; error?: string; code?: string }[]
   delaysMs?: number[]
   bytes?: number
   tokens?: { input: number; output: number; cache?: number } | null

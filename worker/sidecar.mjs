@@ -30,6 +30,21 @@ import { homedir } from 'node:os'
 import { createSchedulerState, normalizeCircuitBreaker, normalizeProviderHealth, normalizeScheduler, rankProviderTargets, retryAfterMs, selectScheduledKey } from './scheduler.mjs'
 import { COMPRESSION_MODES, bodyCharLength, compressChatBody, normalizeCompression, normalizeContextRelay, relayChatBody } from './transforms.mjs'
 import { canonicalCacheKey, createResponseCache, extractPromptText, normalizeResponseCache, semanticParamsKey, shouldCacheRequest } from './cache.mjs'
+import { WebChatSessionStore } from './webchat/session.mjs'
+import { DeepSeekWebTransport } from './webchat/deepseek.mjs'
+import { QwenWebTransport } from './webchat/qwen.mjs'
+import { createWebChatProvider } from './webchat/index.mjs'
+import { createRecoveredWebChat } from './webchat/recovery.mjs'
+import { solvePOW as solvePOWFn } from './webchat/pow.mjs'
+import {
+  isWebChatTransport,
+  webchatCatalog,
+  webchatConfigured,
+  webchatSessionKey,
+  buildWebChatSuccessResponse,
+  buildWebChatErrorResponse,
+} from './webchat/sidecar.mjs'
+export { isWebChatTransport, webchatCatalog, webchatConfigured } from './webchat/sidecar.mjs'
 
 export const SIDECAR_MAX_BODY_BYTES = 64 * 1024 * 1024 // 64 MiB, the Orca cap
 const RETRYABLE_STATUSES = new Set([408, 409, 429, 500, 502, 503, 504])
@@ -101,7 +116,12 @@ export const PROVIDER_PRESETS = [
   { id: 'unity2', name: 'Unity2.Ai', baseUrl: 'https://unity2.ai/v1', capabilities: ['openai_chat_completions'], defaultModels: [], websiteUrl: 'https://unity2.ai/' },
   { id: 'code0', name: 'code0.ai', baseUrl: 'https://console.code0.ai', capabilities: ['openai_chat_completions', 'openai_responses', 'anthropic_messages'], defaultModels: [], websiteUrl: 'https://code0.ai/' },
   { id: 'claudeapi', name: 'claudeapi', baseUrl: 'https://gw.claudeapi.com', capabilities: ['anthropic_messages'], defaultModels: [], websiteUrl: 'https://console.claudeapi.com/' },
-  { id: 'y-api', name: 'Y-API', baseUrl: 'https://api.y-api.bestvirtualgoods.com/v1', capabilities: ['openai_chat_completions', 'anthropic_messages'], defaultModels: [], websiteUrl: 'https://y-api.bestvirtualgoods.com/' }
+  { id: 'y-api', name: 'Y-API', baseUrl: 'https://api.y-api.bestvirtualgoods.com/v1', capabilities: ['openai_chat_completions', 'anthropic_messages'], defaultModels: [], websiteUrl: 'https://y-api.bestvirtualgoods.com/' },
+  // Native web-chat transports. These drive the free web subscriptions directly
+  // (no HTTP gateway to reach); the router supplies the auth credential via a
+  // `secrets:own` secret. baseUrl is unused and kept empty.
+  { id: 'deepseek-web', name: 'DeepSeek Web', baseUrl: '', transport: 'deepseek-web', capabilities: ['openai_chat_completions'], defaultModels: ['deepseek-chat', 'deepseek-reasoner', 'deepseek-reasoner-search', 'deepseek-v4-pro'], websiteUrl: 'https://chat.deepseek.com/' },
+  { id: 'qwen-web', name: 'Qwen Web', baseUrl: '', transport: 'qwen-web', capabilities: ['openai_chat_completions'], defaultModels: ['qwen3-max', 'qwen3-max-thinking', 'qwen3-plus', 'qwen3-plus-thinking'], websiteUrl: 'https://chat.qwen.ai/' }
 ]
 
 export const SUPPORTED_PROTOCOLS = ['anthropic', 'openai', 'responses', 'gemini', 'passthrough']
@@ -138,6 +158,7 @@ export function providerFromPreset(presetId, { name, apiKeySecretKey } = {}) {
     protocols: protocols.length ? protocols : ['openai'],
     models: (preset.defaultModels ?? []).map((id) => ({ id })),
     keys,
+    transport: preset.transport,
     usageFetch: preset.usage
       ? { enabled: true, connectors: [{ id: preset.id, type: 'http-json', ...preset.usage }] }
       : undefined
@@ -231,12 +252,18 @@ export const DEFAULT_CONFIG = {
     maxTemperature: 0
   },
   logBodyCapture: 'errors',
+  persistLogs: false,
   exposeRoutingHeaders: false,
   allowUnauthenticatedRemote: false
 }
 
 const LOG_BODY_LIMIT = 4096
 const MAX_WINDOW_ENTRIES = 5000
+// Runtime usage/health snapshots are written at most this often. A trailing
+// timer flushes the tail of a burst; main.mjs also flushes on a slower interval
+// and on deactivate so an ungraceful exit loses no more than one window.
+const RUNTIME_PERSIST_THROTTLE_MS = 5000
+const RUNTIME_STATE_VERSION = 1
 
 const slug = (value) => String(value ?? '').trim().toLowerCase().replace(/[^a-z0-9-_]+/g, '-')
 
@@ -460,7 +487,10 @@ export function normalizeProvider(provider) {
     usageFetch: provider.usageFetch,
     // Most third-party Responses endpoints reject Codex's Lark-constrained
     // custom tools; only providers that explicitly opt in keep the grammar.
-    supportsCustomToolGrammar: provider.supportsCustomToolGrammar === true
+    supportsCustomToolGrammar: provider.supportsCustomToolGrammar === true,
+    // Web-chat native transports (deepseek-web | qwen-web) bypass the HTTP
+    // endpoint and drive the web subscription directly. Absent for HTTP providers.
+    transport: provider.transport
   }
   return normalized
 }
@@ -568,6 +598,7 @@ export function normalizeConfig(input) {
     responseCache: normalizeResponseCache(source.responseCache ?? DEFAULT_CONFIG.responseCache),
     modelDescriptions: source.modelDescriptions ?? {},
     logBodyCapture: ['all', 'errors', 'none'].includes(source.logBodyCapture) ? source.logBodyCapture : 'errors',
+    persistLogs: source.persistLogs === true,
     allowUnauthenticatedRemote: source.allowUnauthenticatedRemote === true,
     exposeRoutingHeaders: source.exposeRoutingHeaders === true,
     bindHost: typeof source.bindHost === 'string' ? source.bindHost : undefined
@@ -1922,7 +1953,9 @@ function resolveSelector(normalized, selector, fallbackModel = '') {
   if (slash > 0) {
     const provider = providerByName(normalized, text.slice(0, slash))
     if (provider) return { provider, model: text.slice(slash + 1) }
-    return null
+    // A model id may itself contain a slash (e.g. `qwen/qwen3-max`). When the
+    // prefix is not a provider name, fall through to an exact model-id match
+    // instead of dropping the selector — otherwise such catalogs are unusable.
   }
   const owner = findModelOwner(normalized, text)
   if (owner) return { provider: owner, model: text }
@@ -2586,8 +2619,10 @@ export function deriveAffinityKey(headers = {}, body = null) {
   return `prompt:${createHash('sha256').update(stableStringify(prompt)).digest('hex')}`
 }
 
-export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Date.now }) {
+export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Date.now, solvePOW = solvePOWFn, initialState = null, persistState = null }) {
   const fetchFn = fetchImpl ?? globalThis.fetch
+  const webchatSessions = new WebChatSessionStore({ now })
+  let webchatRequestCount = 0
   const logs = []
   let server = null
   let bound = null
@@ -2597,6 +2632,9 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
   const providerCircuits = new Map() // provider name -> { failures, state, openUntil, probeInFlight }
   const providerHealth = new Map() // provider name -> { latencyMs, samples, failures, successes, lastSuccessAt, lastFailureAt }
   const providerAffinity = new Map() // affinity token -> { provider, at }
+  // A route keeps serving the same target until that target fails. Keyed by
+  // route name + affinity token, so separate sessions can pin different targets.
+  const routeAffinity = new Map()
   const affinityBindings = new Map() // provider\0model\0affinity -> { keyId, expiresAt }
   const responseCache = createResponseCache({ now })
   const pruneProviderAffinity = (ttl) => {
@@ -2604,7 +2642,153 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     const cutoff = now() - ttl
     for (const [token, value] of providerAffinity) if (value.at < cutoff) providerAffinity.delete(token)
   }
-  const stats = { requests: 0, errors: 0, inputTokens: 0, outputTokens: 0, cost: 0, latencyMsTotal: 0, byProvider: {}, byModel: {}, cacheHits: 0, cacheSavedTokens: 0, cacheSavedCost: 0, compressionSavedChars: 0, relayEvents: 0 }
+  const pruneRouteAffinity = (ttl) => {
+    if (routeAffinity.size <= 500) return
+    const cutoff = now() - ttl
+    for (const [token, value] of routeAffinity) if (value.at < cutoff) routeAffinity.delete(token)
+  }
+  const stats = { requests: 0, errors: 0, inputTokens: 0, outputTokens: 0, cost: 0, latencyMsTotal: 0, byProvider: {}, byModel: {}, routeRequests: {}, routeFailovers: {}, cacheHits: 0, cacheSavedTokens: 0, cacheSavedCost: 0, compressionSavedChars: 0, relayEvents: 0 }
+
+  // --- Runtime state persistence -------------------------------------------
+  // Usage counters and provider health are process-local, but they are
+  // snapshotted to Orca storage so a plugin/worker restart does not reset the
+  // 24-hour windows or the health badges. Nothing here contains a secret value:
+  // key identities are secret *names*, matching what config already stores.
+  const runtimeSnapshot = () => {
+    const copyState = (state) => ({
+      requests: [...(state.requests ?? [])],
+      // `tokens` is a numeric total per entry (see recordKeyUsage); keep it as
+      // a primitive so tokensInWindow still sums correctly after a restore.
+      tokens: (state.tokens ?? []).map((entry) => ({ at: entry.at, tokens: entry.tokens })),
+      images: [...(state.images ?? [])]
+    })
+    return {
+      version: RUNTIME_STATE_VERSION,
+      savedAt: now(),
+      keyStates: [...keyStates].map(([id, state]) => [id, copyState(state)]),
+      keyCooldowns: [...keyCooldowns].map(([id, until]) => [id, until]),
+      providerHealth: [...providerHealth].map(([name, health]) => [name, { ...health }]),
+      providerCircuits: [...providerCircuits].map(([name, circuit]) => [name, {
+        failures: circuit.failures,
+        state: circuit.state,
+        openUntil: circuit.openUntil,
+        probeInFlight: false
+      }]),
+      stats: {
+        ...stats,
+        byProvider: { ...stats.byProvider },
+        byModel: { ...stats.byModel }
+      }
+    }
+  }
+
+  const restoreRuntimeState = (state) => {
+    if (!state || typeof state !== 'object' || state.version !== RUNTIME_STATE_VERSION) return
+    const timestamp = now()
+    const DAY = 86_400_000
+    if (Array.isArray(state.keyStates)) {
+      for (const [id, raw] of state.keyStates) {
+        if (typeof id !== 'string' || !id || !raw || typeof raw !== 'object') continue
+        const entry = {
+          requests: Array.isArray(raw.requests) ? raw.requests.filter((value) => Number.isFinite(value)) : [],
+          tokens: Array.isArray(raw.tokens)
+            ? raw.tokens.filter((value) => value && Number.isFinite(value.at) && Number.isFinite(value.tokens))
+              .map((value) => ({ at: value.at, tokens: value.tokens }))
+            : [],
+          images: Array.isArray(raw.images) ? raw.images.filter((value) => Number.isFinite(value)) : []
+        }
+        pruneTimestamps(entry.requests, DAY, timestamp)
+        pruneTokenEntries(entry.tokens, DAY, timestamp)
+        pruneTimestamps(entry.images, DAY, timestamp)
+        if (entry.requests.length || entry.tokens.length || entry.images.length) keyStates.set(id, entry)
+      }
+    }
+    if (Array.isArray(state.keyCooldowns)) {
+      for (const [id, until] of state.keyCooldowns) {
+        if (typeof id === 'string' && Number.isFinite(until) && until > timestamp) keyCooldowns.set(id, until)
+      }
+    }
+    if (Array.isArray(state.providerHealth)) {
+      for (const [name, health] of state.providerHealth) {
+        if (typeof name !== 'string' || !health || typeof health !== 'object') continue
+        providerHealth.set(name, {
+          latencyMs: Number.isFinite(health.latencyMs) ? health.latencyMs : null,
+          samples: Number.isFinite(health.samples) ? health.samples : 0,
+          failures: Number.isFinite(health.failures) ? health.failures : 0,
+          successes: Number.isFinite(health.successes) ? health.successes : 0,
+          lastSuccessAt: Number.isFinite(health.lastSuccessAt) ? health.lastSuccessAt : 0,
+          lastFailureAt: Number.isFinite(health.lastFailureAt) ? health.lastFailureAt : 0
+        })
+      }
+    }
+    if (Array.isArray(state.providerCircuits)) {
+      for (const [name, raw] of state.providerCircuits) {
+        if (typeof name !== 'string' || !raw || typeof raw !== 'object') continue
+        const expired = raw.state === 'open' && Number.isFinite(raw.openUntil) && raw.openUntil <= timestamp
+        providerCircuits.set(name, {
+          failures: expired ? 0 : Number.isFinite(raw.failures) ? raw.failures : 0,
+          state: expired ? 'closed' : (raw.state === 'open' || raw.state === 'half-open' ? raw.state : 'closed'),
+          openUntil: expired ? 0 : Number.isFinite(raw.openUntil) ? raw.openUntil : 0,
+          probeInFlight: false
+        })
+      }
+    }
+    if (state.stats && typeof state.stats === 'object') {
+      const source = state.stats
+      const num = (value) => Number.isFinite(value) ? value : 0
+      stats.requests = num(source.requests)
+      stats.errors = num(source.errors)
+      stats.inputTokens = num(source.inputTokens)
+      stats.outputTokens = num(source.outputTokens)
+      stats.cost = num(source.cost)
+      stats.latencyMsTotal = num(source.latencyMsTotal)
+      stats.cacheHits = num(source.cacheHits)
+      stats.cacheSavedTokens = num(source.cacheSavedTokens)
+      stats.cacheSavedCost = num(source.cacheSavedCost)
+      stats.compressionSavedChars = num(source.compressionSavedChars)
+      stats.relayEvents = num(source.relayEvents)
+      stats.byProvider = source.byProvider && typeof source.byProvider === 'object' ? { ...source.byProvider } : {}
+      stats.byModel = source.byModel && typeof source.byModel === 'object' ? { ...source.byModel } : {}
+      stats.routeFailovers = source.routeFailovers && typeof source.routeFailovers === 'object' ? { ...source.routeFailovers } : {}
+      stats.routeRequests = source.routeRequests && typeof source.routeRequests === 'object' ? { ...source.routeRequests } : {}
+    }
+  }
+  restoreRuntimeState(initialState)
+
+  // `persistState` is injected by main.mjs and is best-effort: a storage failure
+  // must never break a request. Writes are throttled by injected time so the
+  // pure tests stay deterministic, with a trailing timer for the tail of a burst.
+  let runtimeDirty = false
+  let lastRuntimePersistAt = 0
+  let runtimeFlushTimer = null
+  const persistRuntimeNow = () => {
+    if (!persistState) return
+    if (runtimeFlushTimer != null) {
+      clearTimeout(runtimeFlushTimer)
+      runtimeFlushTimer = null
+    }
+    runtimeDirty = false
+    lastRuntimePersistAt = now()
+    try {
+      const result = persistState(runtimeSnapshot())
+      if (result && typeof result.catch === 'function') result.catch(() => {})
+    } catch { /* best effort */ }
+  }
+  const markRuntimeDirty = () => {
+    if (!persistState) return
+    runtimeDirty = true
+    if (now() - lastRuntimePersistAt >= RUNTIME_PERSIST_THROTTLE_MS) {
+      persistRuntimeNow()
+      return
+    }
+    if (runtimeFlushTimer == null && typeof setTimeout === 'function') {
+      runtimeFlushTimer = setTimeout(() => {
+        runtimeFlushTimer = null
+        if (runtimeDirty) persistRuntimeNow()
+      }, RUNTIME_PERSIST_THROTTLE_MS)
+      runtimeFlushTimer.unref?.()
+    }
+  }
 
   const log = (entry, { config, status } = {}) => {
     const captureMode = config?.logBodyCapture ?? 'errors'
@@ -2633,8 +2817,10 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     }
     if (record.cost != null) stats.cost += record.cost
     if (record.latencyMs != null) stats.latencyMsTotal += record.latencyMs
+    markRuntimeDirty()
     if (record.resolvedProvider) stats.byProvider[record.resolvedProvider] = (stats.byProvider[record.resolvedProvider] ?? 0) + 1
     if (record.resolvedModel) stats.byModel[record.resolvedModel] = (stats.byModel[record.resolvedModel] ?? 0) + 1
+    if (record.route) stats.routeRequests[record.route] = (stats.routeRequests[record.route] ?? 0) + 1
     if (loggingEnabled) {
       logs.push(record)
       if (logs.length > 300) logs.splice(0, logs.length - 300)
@@ -2664,6 +2850,7 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
       stats.outputTokens += tokens.output ?? 0
     }
     if (cost != null) stats.cost += cost
+    markRuntimeDirty()
   }
 
   const circuitFor = (providerName) => {
@@ -2708,6 +2895,7 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
   // provider slowing down without letting one slow request reorder the chain.
   const recordHealthSample = (provider, outcome, config, latencyMs) => {
     if (outcome !== 'success' && outcome !== 'failure') return
+    markRuntimeDirty()
     const entry = healthFor(provider.name)
     if (outcome === 'success') {
       const sample = Number(latencyMs)
@@ -2730,6 +2918,7 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
   // endpoint is reachable, so it closes the circuit without resetting key state.
   const recordProviderOutcome = (provider, outcome, config, latencyMs) => {
     recordHealthSample(provider, outcome, config, latencyMs)
+    markRuntimeDirty()
     const rules = normalizeCircuitBreaker(config.circuitBreaker)
     if (!rules.enabled) return
     const circuit = circuitFor(provider.name)
@@ -2887,11 +3076,13 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
       for (const [id, until] of keyCooldowns) if (until <= t) keyCooldowns.delete(id)
     }
     keyCooldowns.set(keyIdentity(key), now() + cooldown)
+    markRuntimeDirty()
   }
 
   const clearKeyFailure = (key) => {
     if (!key) return
     keyCooldowns.delete(keyIdentity(key))
+    markRuntimeDirty()
   }
 
   const recordKeyUsage = (key, tokens, imageCount) => {
@@ -2901,6 +3092,7 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     recordInWindow(state.requests, timestamp, 86_400_000)
     if (tokens) recordTokensInWindow(state.tokens, { at: timestamp, tokens }, 86_400_000)
     for (let i = 0; i < imageCount; i++) recordInWindow(state.images, timestamp, 86_400_000)
+    markRuntimeDirty()
   }
 
   const buildHeaders = (provider, key, incoming, protocol, extraHeaders = {}) => {
@@ -3176,6 +3368,91 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     return Number.isFinite(n) && n > 0 ? Math.floor(n) : 1
   }
 
+  // Native web-chat transport path. Drives DeepSeek Web / Qwen Web directly and
+  // returns a synthetic OpenAI Response so the standard translation pipeline
+  // converts it to the client's protocol. Failures are returned as synthetic
+  // error Responses (with .status / retry-after) so the router's existing
+  // key-rotation and cooldown logic handles them like any other upstream.
+  async function webchatForwardOnce({ target, provider, clientProtocol, body, path, wantsStream, affinityKey }) {
+    const config = configRef()
+    // Bound memory over a long-running gateway: evict idle web-chat sessions
+    // periodically (cheap relative to an upstream call).
+    if (++webchatRequestCount % 50 === 0) webchatSessions.sweepIdle()
+    const upstreamBody = body ? structuredClone(body) : null
+    if (upstreamBody && target.model) upstreamBody.model = target.model
+    let openaiBody = upstreamBody
+    if (clientProtocol !== 'openai' || !isChatPath(path)) {
+      openaiBody = translateRequest(upstreamBody ?? {}, clientProtocol, 'openai')
+    }
+    const messages = openaiBody?.messages ?? []
+    const tools = openaiBody?.tools ?? []
+    const model = target.model || openaiBody?.model || ''
+    if (!Array.isArray(messages) || !messages.length) {
+      const error = new Error('web-chat transport requires a chat request with messages')
+      error.status = 400
+      error.type = 'invalid_request_error'
+      return buildWebChatErrorResponse(error)
+    }
+    const selection = pickKey(provider, config, 0, 0, { model, affinity: affinityKey })
+    const key = selection?.key
+    if (!key) {
+      const error = new Error(`no usable credential for provider '${provider.name}' (web-chat needs an auth secret)`)
+      error.status = selection?.exhausted ? 429 : 502
+      error.type = 'upstream_http_error'
+      return buildWebChatErrorResponse(error)
+    }
+    const creds = getSecret(key.secretKey)
+    if (!creds) {
+      const error = new Error(`missing auth secret for provider '${provider.name}'`)
+      error.status = 502
+      error.type = 'upstream_http_error'
+      return buildWebChatErrorResponse(error)
+    }
+    const sessionKey = webchatSessionKey(provider.transport, affinityKey, keyIdentity(key))
+    const session = webchatSessions.getOrCreate(sessionKey)
+    webchatSessions.prepareForPrompt(sessionKey) // roll over depth/TTL (resets id when stale)
+
+    const transport = provider.transport === 'deepseek-web'
+      ? new DeepSeekWebTransport({ creds, fetchFn, solvePOW, now, log: onLog ?? (() => {}) })
+      : new QwenWebTransport({ creds, fetchFn, now, log: onLog ?? (() => {}) })
+    const webchat = createRecoveredWebChat(createWebChatProvider(transport, { now }), { log: onLog ?? (() => {}) })
+
+    try {
+      const result = await webchat.forwardOnce({ session, model, messages, tools })
+      if (result.modelError) {
+        // Content-level model error (e.g. Qwen success:false mid-stream).
+        const error = new Error(`web-chat model error: ${result.modelError.content || 'unknown'}`)
+        error.status = 502
+        error.type = 'upstream_http_error'
+        return buildWebChatErrorResponse(error)
+      }
+      const toolCall = result.tool_calls?.[0]?.function
+        ? { name: result.tool_calls[0].function.name, arguments: result.tool_calls[0].function.arguments }
+        : null
+      webchatSessions.storeHistory(sessionKey, result.promptUsed, result.content, toolCall)
+      const built = buildWebChatSuccessResponse(result, model, { wantsStream, clientProtocol, now })
+      return {
+        upstreamRes: built.upstreamRes,
+        responseProtocol: 'openai',
+        forwardedModel: model,
+        key,
+        bufferForStream: built.bufferForStream,
+        wantsStream,
+        targetPath: path,
+      }
+    } catch (error) {
+      return {
+        upstreamRes: buildWebChatErrorResponse(error),
+        responseProtocol: 'openai',
+        forwardedModel: model,
+        key,
+        bufferForStream: false,
+        wantsStream,
+        targetPath: path,
+      }
+    }
+  }
+
   async function forwardOnce(target, clientProtocol, path, body, incoming, { rawBody, wantsStreamHint, allowCooling = false, affinityKey = '' } = {}) {
     const config = configRef()
     const provider = target.provider
@@ -3183,6 +3460,9 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     const baseUrl = endpointFor(provider, responseProtocol)
     const chat = isChatPath(path)
     const wantsStream = wantsStreamHint ?? body?.stream === true
+    if (isWebChatTransport(provider)) {
+      return webchatForwardOnce({ target, provider, clientProtocol, body, path, wantsStream, affinityKey })
+    }
     const geminiStreamUpstream = responseProtocol === 'gemini' && clientProtocol === 'gemini' && wantsStream === true
     let targetPath = path
     if (responseProtocol === 'gemini' && chat) targetPath = geminiPath(target.model, geminiStreamUpstream)
@@ -3296,6 +3576,34 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
       res.end(JSON.stringify(listModels(config)))
       return
     }
+    // Reset a web-chat remote session (POST /reset-session with
+    // { provider, affinityKey, keyIdentity }), so a stale conversation can be
+    // dropped and restarted. Auth via the same gateway token as other requests.
+    if (req.method === 'POST' && path === '/reset-session') {
+      const auth = clientAuth(config, req.headers, 0)
+      if (!auth.ok) {
+        res.writeHead(auth.status, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: { message: auth.message } }))
+        return
+      }
+      const payload = body && typeof body === 'object' ? body : {}
+      const key = webchatSessionKey(payload.transport || 'deepseek-web', payload.affinityKey || 'anon', payload.keyIdentity || '')
+      const removed = webchatSessions.delete(key)
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, removed, key }))
+      return
+    }
+    if (req.method === 'GET' && path === '/webchat-sessions') {
+      const auth = clientAuth(config, req.headers, 0)
+      if (!auth.ok) {
+        res.writeHead(auth.status, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: { message: auth.message } }))
+        return
+      }
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ sessions: webchatSessions.list() }))
+      return
+    }
     if (bodyParseError) {
       res.writeHead(400, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ error: { message: 'request body is not valid JSON', type: 'invalid_request_error', code: 'invalid_json' } }))
@@ -3334,6 +3642,9 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     // form the chain and the route's strategy decides health ranking. A policy
     // can still add retries or extra targets after the route.
     const matchedRoute = chatRequest ? findRoute(config, effectiveModel) : null
+    // The matched route name is recorded on every log entry so the request log
+    // shows which route a request came through and which model it selected.
+    const routeName = matchedRoute?.name ?? null
     // A policy may point at a route or a raw provider/model target. A raw
     // provider/model primary is never given extra failover targets: it is a
     // single target with retries.
@@ -3350,7 +3661,7 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     if (!chain.length) {
       const missingModel = !effectiveModel && chatRequest
       const status = missingModel ? 400 : 404
-      const entry = log({ upstream: null, resolvedProvider: null, resolvedModel: effectiveModel, protocol: clientProtocol, status, latencyMs: 0, attempts: [], error: missingModel ? 'no model specified' : 'no provider configured for model', requestBody: workingBody, requestHeaders: redactValue(req.headers) }, { config, status })
+      const entry = log({ upstream: null, resolvedProvider: null, route: routeName, requestModel: requestedModel, resolvedModel: effectiveModel, protocol: clientProtocol, stream: wantsStream, errorCode: missingModel ? 'model_required' : 'model_not_found', status, latencyMs: 0, attempts: [], error: missingModel ? 'no model specified' : 'no provider configured for model', requestBody: workingBody, requestHeaders: redactValue(req.headers) }, { config, status })
       res.writeHead(status, { 'content-type': 'application/json' })
       res.end(JSON.stringify({
         error: missingModel
@@ -3379,6 +3690,21 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
         providerAffinity.set(affinityKey, { provider: orderedChain[0].provider.name, at: now() })
         pruneProviderAffinity(scheduler.cacheAffinityTtlMs)
       }
+    }
+    // A route stays on the target that last served it until that target fails.
+    // The pin is applied after health ranking so it wins over a latency wobble,
+    // but a failed target is demoted by health/circuit state on the next request.
+    const schedulerOptions = normalizeScheduler(config.scheduler)
+    const routePinKey = matchedRoute ? `${matchedRoute.name}\0${affinityKey || 'anon'}` : null
+    if (routePinKey && orderedChain.length > 1) {
+      const pin = routeAffinity.get(routePinKey)
+      if (pin && now() - pin.at <= schedulerOptions.cacheAffinityTtlMs) {
+        const index = orderedChain.findIndex((target) => (
+          target.provider.name === pin.provider && target.model === pin.model
+        ))
+        if (index > 0) orderedChain.unshift(orderedChain.splice(index, 1)[0])
+      }
+      pruneRouteAffinity(schedulerOptions.cacheAffinityTtlMs)
     }
 
     // --- Opt-in request optimization -------------------------------------
@@ -3451,10 +3777,13 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
       log({
         upstream: cachePlan.target.provider.name,
         resolvedProvider: cachePlan.target.provider.name,
+        route: routeName,
         resolvedModel: cachePlan.target.model,
         model: cachePlan.target.model,
         requestModel: requestedModel,
         protocol: clientProtocol,
+        stream: wantsStream,
+        policyId: matchedPolicy?.id ?? null,
         status: cached.response.status,
         latencyMs: 0,
         attempts: [],
@@ -3497,6 +3826,9 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
 
     for (let chainIndex = 0; chainIndex < orderedChain.length; chainIndex++) {
       const target = orderedChain[chainIndex]
+      // Each trail entry names the full target, so the log shows exactly which
+      // model was tried at every hop without creating a separate log per try.
+      const attemptKey = `${target.provider.name}/${target.model}`
       // A handoff digest is only needed when the request actually moves to
       // another target (or when explicitly configured to always compact).
       const relayNow = Boolean(optimizableChat && relayOptions.enabled && routedBody && (
@@ -3532,9 +3864,10 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
               ? Math.min(circuitRetryAfterMs, circuit.retryAfterMs)
               : circuit.retryAfterMs
           }
-          attempts.push(`${target.provider.name}#circuit_open`)
+          attempts.push(`${attemptKey}#circuit_open`)
           failures.push({
             provider: target.provider.name,
+            model: target.model,
             status: 503,
             error: 'provider circuit is open',
             code: 'provider_circuit_open'
@@ -3551,18 +3884,18 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
           )
           if (forwarded?.error) {
             const errorStatus = forwarded.error.status ?? 502
-            attempts.push(`${target.provider.name}#${errorStatus}`)
+            attempts.push(`${attemptKey}#${errorStatus}`)
             if (forwarded.error.code === 'all_keys_exhausted') {
               recordProviderOutcome(target.provider, 'neutral', config)
               sawExhausted = true
               exhaustedReason = forwarded.error.message
-              failures.push({ provider: target.provider.name, status: errorStatus, error: forwarded.error.message, code: forwarded.error.code })
+              failures.push({ provider: target.provider.name, model: target.model, status: errorStatus, error: forwarded.error.message, code: forwarded.error.code })
               // No credential can be tried for this target. A model/provider
               // chain may still have a target, but retrying this one is useless.
               break
             }
             recordProviderOutcome(target.provider, 'neutral', config)
-            failures.push({ provider: target.provider.name, status: errorStatus, error: forwarded.error.message })
+            failures.push({ provider: target.provider.name, model: target.model, status: errorStatus, error: forwarded.error.message })
             madeAttempt = true
             lastStatus = errorStatus
             lastErrorBody = JSON.stringify({ error: { message: forwarded.error.message } })
@@ -3593,9 +3926,9 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
             markKeyFailure(key, status, upstreamRes.headers.get('retry-after'))
           }
           if ((retryable || keyRotatable || canFallback) && (moreAttemptsHere || moreChain) && status !== 200) {
-            const failure = `${target.provider.name}#${status}`
+            const failure = `${attemptKey}#${status}`
             attempts.push(failure)
-            failures.push({ provider: target.provider.name, status, credential: keyIdentity(key) || undefined })
+            failures.push({ provider: target.provider.name, model: target.model, status, credential: keyIdentity(key) || undefined })
             const bodyText = await upstreamRes.text().catch(() => '')
             lastErrorBody = bodyText
             lastStatus = status
@@ -3608,6 +3941,15 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
             break
           }
           if (status < 400) clearKeyFailure(key)
+          // Any prior failure before this response means a retry or failover
+          // happened. Flag it so a 200 can still carry a visible warning.
+          const failedOver = attempts.length > 0
+          if (routePinKey) {
+            routeAffinity.set(routePinKey, { provider: target.provider.name, model: target.model, at: now() })
+          }
+          if (failedOver && routeName) {
+            stats.routeFailovers[routeName] = (stats.routeFailovers[routeName] ?? 0) + 1
+          }
           // Only the first resolved target owns the cache scope. A response
           // that needed failover or relay is served, never stored.
           const servedFirstTarget = cachePlan
@@ -3620,13 +3962,16 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
             upstream: target.provider.name,
             resolvedProvider: target.provider.name,
             credential: key?.id ?? null,
+            route: routeName,
             requestModel: requestedModel,
             resolvedModel: forwardedModel,
             model: forwardedModel,
             protocol: clientProtocol,
+            stream: Boolean(forwarded.wantsStream),
+            failedOver,
             status,
             latencyMs: now() - started,
-            attempts: [...attempts, target.provider.name],
+            attempts: [...attempts, attemptKey],
             failures,
             delaysMs,
             bytes: rawBody.length,
@@ -3674,8 +4019,8 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
         } catch (error) {
           madeAttempt = true
           recordProviderOutcome(target.provider, 'failure', config)
-          attempts.push(`${target.provider.name}#${error?.name ?? 'error'}`)
-          failures.push({ provider: target.provider.name, error: String(error?.message ?? error) })
+          attempts.push(`${attemptKey}#${error?.name ?? 'error'}`)
+          failures.push({ provider: target.provider.name, model: target.model, error: String(error?.message ?? error) })
           lastStatus = 502
           if (attempt < targetAttempts - 1) {
             const delay = (config.baseDelayMs ?? 200) * 2 ** attempt
@@ -3708,7 +4053,11 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
             }
           })
         : lastErrorBody
-    log({ upstream: null, resolvedProvider: null, resolvedModel: effectiveModel, protocol: clientProtocol, status: finalStatus, latencyMs: now() - startedTotal, attempts, failures, error: allExhausted ? 'all keys exhausted' : allCircuitOpen ? 'all providers circuit-open' : lastErrorBody ? 'upstream failed' : 'all providers failed', compression: compressionInfo, relay: relayUsed ? relayInfo : null, cache: cachePlan ? (relayUsed ? 'bypass' : 'miss') : null, requestBody: routedBody, requestHeaders: redactValue(req.headers), responseBody: finalError }, { config, status: finalStatus })
+    if (routePinKey) routeAffinity.delete(routePinKey)
+    if (attempts.length > 0 && routeName) {
+      stats.routeFailovers[routeName] = (stats.routeFailovers[routeName] ?? 0) + 1
+    }
+    log({ upstream: null, resolvedProvider: null, route: routeName, requestModel: requestedModel, resolvedModel: effectiveModel, protocol: clientProtocol, stream: wantsStream, failedOver: attempts.length > 0, errorCode: allExhausted ? 'all_keys_exhausted' : allCircuitOpen ? 'provider_circuit_open' : 'upstream_failed', status: finalStatus, latencyMs: now() - startedTotal, attempts, failures, error: allExhausted ? 'all keys exhausted' : allCircuitOpen ? 'all providers circuit-open' : lastErrorBody ? 'upstream failed' : 'all providers failed', compression: compressionInfo, relay: relayUsed ? relayInfo : null, cache: cachePlan ? (relayUsed ? 'bypass' : 'miss') : null, requestBody: routedBody, requestHeaders: redactValue(req.headers), responseBody: finalError }, { config, status: finalStatus })
     const responseHeaders = {
       'content-type': 'application/json',
       'x-router-fallback-attempts': String(attempts.length),
@@ -3923,7 +4272,10 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     const seen = new Set()
     const data = []
     for (const provider of providersFor(config)) {
-      for (const model of provider.models ?? []) {
+      const catalogModels = isWebChatTransport(provider) && !(provider.models ?? []).length
+        ? webchatCatalog(provider)
+        : (provider.models ?? [])
+      for (const model of catalogModels) {
         const id = `${provider.name}/${model.id}`
         if (seen.has(id)) continue
         seen.add(id)
@@ -3941,6 +4293,9 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
   return {
     logs,
     stats,
+    webchatSessions,
+    resetWebChatSession: (key) => webchatSessions.delete(key),
+    resetWebChatSessionsByTransport: (transport) => webchatSessions.deleteByPrefix(`webchat:${transport}:`),
     start(host = '127.0.0.1', port = 18080) {
       return new Promise((resolve, reject) => {
         if (server) return resolve(bound)
@@ -3978,6 +4333,9 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
           protocols: p.protocols ?? [],
           models: (p.models ?? []).map((m) => m.id),
           keyCount: (p.keys ?? []).length,
+          // The Add-provider dialog's Web chat mode finds its provider by this
+          // field; without it the UI looks unchanged after setup().
+          transport: p.transport,
           health: providerHealthView(p.name, timestamp),
           usageSource: Boolean((resolveUsageFetch(p)?.connectors ?? []).length),
           keyUsage: (p.keys ?? []).map((key) => {
@@ -4004,11 +4362,22 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
         policies: config.policies,
         aliases: config.aliases ?? {},
         clientKeys: (config.clientKeys ?? []).map((key) => ({ id: key.id, name: key.name, expiresAt: key.expiresAt, limits: key.limits, enabled: key.enabled !== false })),
-        agentProfiles: config.agentProfiles ?? []
+        agentProfiles: config.agentProfiles ?? [],
+        routeFailovers: { ...stats.routeFailovers },
+        routeRequests: { ...stats.routeRequests }
       }
     },
     clearKeyCooldown(identity) {
       if (identity) keyCooldowns.delete(identity)
+      markRuntimeDirty()
+    },
+    // Best-effort persistence hooks. main.mjs calls flushRuntime on a timer and
+    // on deactivate; tests can inspect the payload with runtimeSnapshot().
+    runtimeSnapshot() {
+      return runtimeSnapshot()
+    },
+    flushRuntime() {
+      if (runtimeDirty) persistRuntimeNow()
     },
     // The panel's speed test feeds the same samples real traffic produces, so a
     // manual test can prime the ranking for a provider that has been idle.
@@ -4083,6 +4452,10 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     },
     clearLogs() {
       logs.length = 0
+      stats.routeFailovers = {}
+      stats.routeRequests = {}
+      routeAffinity.clear()
+      markRuntimeDirty()
       return { ok: true }
     }
   }
@@ -4303,6 +4676,10 @@ export async function probeProviderUsage(provider, { getSecret, fetchImpl, secre
 }
 
 export async function discoverProviderModels(provider, { getSecret, fetchImpl } = {}) {
+  // Web-chat transports have no /v1/models endpoint; the catalog is static.
+  if (isWebChatTransport(provider)) {
+    return { provider: provider.name, models: webchatCatalog(provider).map((m) => m.id), status: 200 }
+  }
   const fetchFn = fetchImpl ?? globalThis.fetch
   const key = (provider.keys ?? []).map((entry) => getSecret?.(entry.secretKey)).find(Boolean)
   const baseUrl = provider.baseUrl
