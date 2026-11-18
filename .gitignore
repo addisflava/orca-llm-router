@@ -2,3 +2,5 @@ node_modules/
 .orca/
 *.log
 .DS_Store
+*.swp
+assets/Screenshot from *.png
