@@ -51,9 +51,3 @@ export const ORCA_AGENTS = [
   { id: 'grok', name: 'Grok', commands: ['grok'] },
   { id: 'jcode', name: 'Jcode', commands: ['jcode'] }
 ]
-
-const AGENT_BY_ID = new Map(ORCA_AGENTS.map((agent) => [agent.id, agent]))
-
-export function orcaAgentName(id) {
-  return AGENT_BY_ID.get(id)?.name ?? id
-}

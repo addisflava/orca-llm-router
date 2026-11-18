@@ -61,8 +61,8 @@ if (both || (!positional && !ccrPath && !omniPath && detected.ccr && detected.om
   const ccrTarget = ccrPath || detected.ccr?.path
   const omniTarget = omniPath || detected.omniroute?.path
 
-  const ccrResult = ccrTarget ? detectAndConvertConfig(ccrTarget) : null
-  const omniResult = omniTarget ? detectAndConvertConfig(omniTarget, { encryptionKey }) : null
+  const ccrResult = ccrTarget && existsSync(ccrTarget) ? detectAndConvertConfig(ccrTarget) : null
+  const omniResult = omniTarget && existsSync(omniTarget) ? detectAndConvertConfig(omniTarget, { encryptionKey }) : null
 
   if (ccrResult && omniResult) {
     const merged = mergeRouterConfigs(ccrResult.config, omniResult.config, ccrResult.secrets, omniResult.secrets)
@@ -105,6 +105,12 @@ if (both || (!positional && !ccrPath && !omniPath && detected.ccr && detected.om
   converted = detectAndConvertConfig(detected.omniroute.path, { encryptionKey })
   sourceDescription = 'OmniRoute'
 } else {
+  console.error('No configuration found. Provide a path or ensure ~/.claude-code-router or ~/.omniroute exists.')
+  console.error('Usage: node tools/import-legacy-config.mjs [path] [--both] [--ccr <path>] [--omni <path>] [--out-dir <dir>]')
+  process.exit(1)
+}
+
+if (!converted) {
   console.error('No configuration found. Provide a path or ensure ~/.claude-code-router or ~/.omniroute exists.')
   console.error('Usage: node tools/import-legacy-config.mjs [path] [--both] [--ccr <path>] [--omni <path>] [--out-dir <dir>]')
   process.exit(1)
