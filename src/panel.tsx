@@ -14,6 +14,7 @@ import {
   Checkbox,
   Code,
   Collapsible,
+  derived,
   EmptyState,
   Grid,
   Heading,
@@ -22,8 +23,6 @@ import {
   Input,
   KeyValue,
   Link,
-  List,
-  ListItem,
   plugin,
   read,
   RelativeTime,
@@ -44,7 +43,7 @@ import {
   type Tone,
   type WithChildren
 } from 'orca'
-import type { AgentRoute, DetectedRouterInfo, FallbackPolicy, KeyProviderUsage, LogEntry, ModelRoute, ModelTarget, ProviderConfig, ProviderHealthView, ProviderKeyUsage, ProviderKeyUsageReport, ProviderPreset, ProviderUsageMeter, ProviderView, RouterConfig, UsageConnector, UsageMeterMapping, PolicyCondition, PolicyRewrite, RequestPolicy } from './protocol'
+import type { AgentRoute, DetectedRouterInfo, FallbackPolicy, KeyProviderUsage, LogEntry, ModelRoute, ModelTarget, ProviderConfig, ProviderHealthView, ProviderKeyUsage, ProviderKeyUsageReport, ProviderPreset, ProviderUsageMeter, ProviderView, RouterConfig, UsageConnector, UsageMeterMapping, PolicyCondition, PolicyRewrite, RequestPolicy, VpnServerConfig } from './protocol'
 
 // ---------------------------------------------------------------------------
 // State
@@ -79,18 +78,16 @@ const routeFailovers = atom<Record<string, number>>({})
 const routeRequests = atom<Record<string, number>>({})
 const keyQuotaReports = atom<ProviderKeyUsageReport[]>([])
 // The provider whose usage is being fetched, and the last inline result for it.
-const usageBusy = atom('usageBusy', '')
+// Transient UI state: plain (per-panel) atoms, never shared or persisted.
+const usageBusy = atom('')
 const usageNote = atom<{
   provider: string
   text: string
   tone: 'neutral' | 'success' | 'danger'
   action?: 'configure'
-} | null>('usageNote', null)
-const usageDraft = atom('usageDraft', { endpoint: '', auth: 'provider-api-key', meters: '' })
-const usageDetected = atom<{ provider: string; endpoint: string; connector: UsageConnector } | null>(
-  'usageDetected',
-  null
-)
+} | null>(null)
+const usageDraft = atom({ endpoint: '', auth: 'provider-api-key', meters: '' })
+const usageDetected = atom<{ provider: string; endpoint: string; connector: UsageConnector } | null>(null)
 const loaded = atom(false)
 const usage = atom<{
   requests: number
@@ -212,10 +209,22 @@ const routeEditName = atom('')
 // their provider yet. Picking one adds it as a target; saving the route also
 // writes it into that provider's model list.
 const routeFetchedModels = atom<ModelTarget[]>('routeFetchedModels', [])
+// A route's optional VPN/proxy server id. Empty means direct.
+const routeVpn = atom('')
+
+// VPN / proxy server editor (Settings). Credentials are written through the
+// worker to Orca's secret store; only their secret name is kept in config.
+const vpnFormOpen = atom(false)
+const vpnEditId = atom('')
+const vpnName = atom('')
+const vpnType = atom<'http' | 'socks5'>('socks5')
+const vpnHost = atom('')
+const vpnPort = atom('')
+const vpnUsername = atom('')
+const vpnPassword = atom('')
 
 const agentsOtherOpen = atom(false)
 
-const keyProvider = atom('')
 const keyFormFor = atom('')
 // The add-key form is a list of rows so a provider can take several pool
 // entries at once; each row carries its own optional name, priority and limits.
@@ -444,7 +453,6 @@ async function refresh() {
     set(config, loadedConfig.config)
     set(usage, metrics)
     set(presetList, presets.presets)
-    if (!read(keyProvider) && status.providers.length) set(keyProvider, status.providers[0].name)
   } catch (cause) {
     set(error, `Status failed: ${(cause as Error).message}`)
   } finally {
@@ -601,7 +609,6 @@ async function addPresetProvider() {
     set(presetKeys, [blankKeyDraft()])
     set(presetNameEditing, false)
     set(addProviderOpen, false)
-    set(keyProvider, result.provider)
     closeModelPicker()
     await refresh()
   } catch (cause) {
@@ -676,7 +683,6 @@ async function addCustomProvider() {
   set(customKeys, [blankKeyDraft()])
   set(customUsageDraft, { endpoint: '', auth: 'provider-api-key', meters: '' })
   set(addProviderOpen, false)
-  set(keyProvider, name)
   closeModelPicker()
   await refresh()
 }
@@ -1806,11 +1812,9 @@ function mergedRoutes(): ModelRoute[] {
   return routes
 }
 
-function routeOptions() {
-  return mergedRoutes()
-    .filter((route) => route.enabled !== false)
-    .map((route) => ({ value: route.name, label: route.name }))
-}
+// Reading a derived atom subscribes to the atoms mergedRoutes() reads, so the
+// four panels that render the route list share one computation per change.
+const mergedRoutesView = derived(() => mergedRoutes())
 
 function routeTargetsToRows(targets: ModelTarget[]): ChainRow[] {
   return parseChainRows(targets.map((target) => (target.provider ? `${target.provider}/${target.model}` : target.model)))
@@ -1926,7 +1930,8 @@ async function saveRoute() {
     targets,
     strategy: read(routeFastest) ? 'fastest' : 'ordered',
     enabled: existing?.enabled ?? true,
-    retries
+    retries,
+    ...(read(routeVpn) ? { vpn: read(routeVpn) } : {})
   }
   const saved = await saveConfig((next) => {
     next.routes = [...(next.routes ?? [])]
@@ -1965,6 +1970,7 @@ function startEditRoute(route: ModelRoute) {
   set(routeTargetFilter, '')
   set(routeFastest, route.strategy !== 'ordered')
   set(routeRetries, String(route.retries ?? 2))
+  set(routeVpn, route.vpn ?? '')
   set(routeOpen, true)
 }
 
@@ -1976,6 +1982,7 @@ function resetRouteForm() {
   set(routeTargetFilter, '')
   set(routeFastest, true)
   set(routeRetries, '2')
+  set(routeVpn, '')
   set(routeEditName, '')
 }
 
@@ -1987,15 +1994,6 @@ async function removeRoute(name: string) {
   if (!saved) return
   if (read(routeEditName) === name) resetRouteForm()
   set(message, `Deleted route ${name}`)
-}
-
-function policyPrimaryModel(): string {
-  const model = read(policyModel).trim()
-  if (model) return model
-  const rewrite = read(policyRewrites).find(
-    (draft) => draft.key.trim() === 'request.body.model' && (draft.operation || 'set') === 'set'
-  )
-  return rewrite?.value.trim() ?? ''
 }
 
 async function addPolicy() {
@@ -2902,50 +2900,35 @@ function AddSection({
   )
 }
 
-// An always-visible explainer banner: the title line stays put, and the body
-// expands on demand. Tabs pass the "auto" state so an empty configuration
-// starts open while a configured one starts collapsed.
+// A compact blue explainer: the title stays visible and the body expands on
+// demand. A Callout gives the thin blue rule and blue title without the boxy
+// background. Tabs pass the "auto" state so an empty config starts open.
 function InfoBanner({
   title,
-  tone = 'neutral',
   open,
   onOpenChange,
   children
 }: WithChildren & {
   title: string
-  tone?: Tone
   open: boolean
   onOpenChange: (open: boolean) => void
 }) {
   return (
-    <Box background="muted" border={tone} radius="md" paddingX="xs">
-      <Stack gap="xs">
-        <Row gap="xs" align="center">
-          <Box grow>
-            <List label={title}>
-              <ListItem icon="info" onPress={() => onOpenChange(!open)}>
-                <Text size="sm" weight="semibold">
-                  {title}
-                </Text>
-              </ListItem>
-            </List>
-          </Box>
-          <IconButton
-            size="xs"
-            variant="ghost"
-            icon={open ? 'collapse' : 'expand'}
-            label={open ? 'Collapse details' : 'Expand details'}
-            tooltip={open ? 'Collapse' : 'Expand'}
-            onPress={() => onOpenChange(!open)}
-          />
-        </Row>
-        {open ? (
-          <Box paddingX="xs" paddingY="xs">
-            {children}
-          </Box>
-        ) : null}
-      </Stack>
-    </Box>
+    <Row gap="xs" align="start">
+      <Box grow>
+        <Callout tone="neutral" title={title}>
+          {open ? children : null}
+        </Callout>
+      </Box>
+      <IconButton
+        size="xs"
+        variant="ghost"
+        icon={open ? 'collapse' : 'expand'}
+        label={open ? 'Collapse details' : 'Expand details'}
+        tooltip={open ? 'Collapse' : 'Expand'}
+        onPress={() => onOpenChange(!open)}
+      />
+    </Row>
   )
 }
 
@@ -3207,12 +3190,12 @@ function csvCell(value: unknown) {
 function exportLogsCsv() {
   const rows = [...read(logs)].reverse()
   if (!rows.length) return
-  const header = ['time', 'status', 'errorCode', 'route', 'requestModel', 'provider', 'resolvedModel', 'credential', 'protocol', 'stream', 'latencyMs', 'tokensIn', 'tokensOut', 'cost', 'cache', 'policyId', 'error']
+  const header = ['time', 'status', 'errorCode', 'route', 'vpn', 'requestModel', 'provider', 'resolvedModel', 'credential', 'protocol', 'stream', 'latencyMs', 'tokensIn', 'tokensOut', 'cost', 'cache', 'policyId', 'error']
   const lines = [header.join(',')]
   for (const entry of rows) {
     const parts = tokenParts(entry)
     lines.push([
-      new Date(entry.at).toISOString(), entry.status, entry.errorCode, entry.route, entry.requestModel,
+      new Date(entry.at).toISOString(), entry.status, entry.errorCode, entry.route, entry.vpn, entry.requestModel,
       entry.resolvedProvider ?? entry.upstream, entry.resolvedModel ?? entry.model, entry.credential,
       entry.protocol, entry.stream ? 'yes' : 'no', entry.latencyMs, parts?.input, parts?.output,
       entry.cost, entry.cache, entry.policyId, entry.error
@@ -3244,6 +3227,7 @@ function LogDetail({ entry }: { entry: LogEntry }) {
     { label: 'Time', value: formatLogTimestamp(entry.at) },
     { label: 'Requested', value: entry.requestModel ?? entry.model ?? '—' },
     { label: 'Route', value: entry.route ?? '—' },
+    ...(entry.vpn ? [{ label: 'VPN', value: entry.vpn }] : []),
     { label: 'Selected target', value: logTarget(entry) },
     { label: 'Credential', value: entry.credential ?? '—' },
     { label: 'Protocol', value: `${entry.protocol}${entry.stream ? ' · stream' : ''}` },
@@ -3458,7 +3442,7 @@ function Overview() {
   const ups = read(providers)
   const metric = read(usage)
   const gateway = `http://${read(host)}:${read(port)}`
-  const routeCount = mergedRoutes().length
+  const routeCount = read(mergedRoutesView).length
   const keyCount = read(clientKeys).length
   const routedAgents = read(agentList).filter((agent) => agent.enabled).length
   const policyCount = read(policies).length
@@ -3469,21 +3453,21 @@ function Overview() {
   return (
     <Stack gap="md">
       <InfoBanner
-        tone="accent"
-        title="Welcome to Orca LLM Router"
+        title="What Orca LLM Router does"
         open={read(overviewInfoOpen) ?? ups.length === 0}
         onOpenChange={(open) => set(overviewInfoOpen, open)}
       >
         <Stack gap="sm">
           <Text size="sm">
-            This panel runs a local gateway between your agents and model providers. It speaks the OpenAI and
-            Anthropic APIs, then routes each request to a provider you configure — applying routes, policies and
-            fallback along the way.
+            One local gateway for every coding agent in Orca. Point an agent at it and you can use any provider or
+            subscription you've configured through a single OpenAI-, Anthropic- or Gemini-compatible address. Keys
+            stay in Orca's secret store, are rotated across pools, and protocol and reasoning differences are handled
+            for you — agent code doesn't change.
           </Text>
           <Text size="sm">
-            There are no providers yet, so nothing can be routed. Add one from a preset, create a custom endpoint, or
-            import your existing config. Once traffic flows, this tab shows status, usage, the gateway addresses and
-            recent activity.
+            Routes, policies and fallback chains decide where each request goes, and warm prompt caches are preserved.
+            Add a provider under <Code>Providers</Code> to get started; this tab then shows the gateway addresses,
+            usage, provider health and recent activity.
           </Text>
           <Row gap="xs" wrap>
             <Button
@@ -3801,6 +3785,10 @@ function ProviderCard({ provider }: { provider: ProviderView }) {
   const health = provider.health
   const showHealthBadge = Boolean(health && health.state !== 'unknown')
   const showHealthMetrics = Boolean(health && health.samples > 0)
+  // The trailing status should describe the most recent outcome. A success long
+  // ago followed by a failure must not keep reading "ok" - show when it failed.
+  const lastOutcomeFailed = Boolean(health?.lastFailureAt && health.lastFailureAt > (health.lastSuccessAt ?? 0))
+  const lastOutcomeAt = lastOutcomeFailed ? health?.lastFailureAt : health?.lastSuccessAt
   const pool = cfg?.keys ?? []
   const keyCount = cfg ? pool.length : provider.keyCount
   const keyUsage = new Map((provider.keyUsage ?? []).map((entry) => [entry.secretKey, entry]))
@@ -3842,20 +3830,22 @@ function ProviderCard({ provider }: { provider: ProviderView }) {
               <Text muted size="xs">
                 {`Response avg ${health.latencyMs} ms / ${health.samples} req${health.samples === 1 ? '' : 's'}`}
               </Text>
-              {health.failures ? (
-                <Text muted size="xs">
-                  {` · ${health.failures} fail`}
-                </Text>
-              ) : null}
-              {health.lastSuccessAt ? (
+              {lastOutcomeAt ? (
                 <>
                   <Text muted size="xs">
                     {' · '}
                   </Text>
-                  <Text tone="success" size="xs">
-                    {'ok '}
-                    <RelativeTime at={health.lastSuccessAt} format="short" />
-                  </Text>
+                  {lastOutcomeFailed ? (
+                    <Text tone="warning" size="xs">
+                      {'failed '}
+                      <RelativeTime at={lastOutcomeAt} format="short" />
+                    </Text>
+                  ) : (
+                    <Text tone="success" size="xs">
+                      {'ok '}
+                      <RelativeTime at={lastOutcomeAt} format="short" />
+                    </Text>
+                  )}
                 </>
               ) : null}
             </Row>
@@ -4136,7 +4126,6 @@ function ProviderCard({ provider }: { provider: ProviderView }) {
                   variant="outline"
                   icon="add"
                   onPress={() => {
-                    set(keyProvider, provider.name)
                     set(keyDrafts, [blankKeyDraft()])
                     set(keyFormFor, provider.name)
                   }}
@@ -4417,6 +4406,172 @@ function ProviderCard({ provider }: { provider: ProviderView }) {
   )
 }
 
+function vpnServers(): VpnServerConfig[] {
+  return read(config)?.vpnServers ?? []
+}
+
+function resetVpnForm() {
+  set(vpnFormOpen, false)
+  set(vpnEditId, '')
+  set(vpnName, '')
+  set(vpnType, 'socks5')
+  set(vpnHost, '')
+  set(vpnPort, '')
+  set(vpnUsername, '')
+  set(vpnPassword, '')
+}
+
+function startEditVpn(server: VpnServerConfig) {
+  set(vpnEditId, server.id)
+  set(vpnName, server.name)
+  set(vpnType, server.type)
+  set(vpnHost, server.host)
+  set(vpnPort, String(server.port))
+  // Never prefill credentials from storage; leaving them blank keeps the
+  // existing secret. The panel only reads secrets for an explicit edit.
+  set(vpnUsername, '')
+  set(vpnPassword, '')
+  set(vpnFormOpen, true)
+}
+
+async function saveVpnServer() {
+  const host = read(vpnHost).trim()
+  const port = Number(read(vpnPort))
+  if (!host) {
+    set(error, 'VPN server needs a host')
+    return
+  }
+  if (!Number.isFinite(port) || port < 1 || port > 65535) {
+    set(error, 'VPN port must be between 1 and 65535')
+    return
+  }
+  try {
+    const result = await plugin.request('router.vpn.save', {
+      server: {
+        ...(read(vpnEditId) ? { id: read(vpnEditId) } : {}),
+        name: read(vpnName).trim() || host,
+        type: read(vpnType),
+        host,
+        port
+      },
+      username: read(vpnUsername),
+      password: read(vpnPassword)
+    }) as { server: VpnServerConfig }
+    resetVpnForm()
+    set(message, `Saved VPN server ${result.server.name}`)
+    await refresh()
+  } catch (cause) {
+    set(error, `Save failed: ${(cause as Error).message}`)
+  }
+}
+
+async function removeVpnServer(id: string) {
+  try {
+    await plugin.request('router.vpn.remove', { id })
+    resetVpnForm()
+    set(message, 'VPN server removed')
+    await refresh()
+  } catch (cause) {
+    set(error, `Remove failed: ${(cause as Error).message}`)
+  }
+}
+
+function VpnServersCard() {
+  const servers = vpnServers()
+  const editing = Boolean(read(vpnEditId))
+  return (
+    <Card
+      title="VPN / proxy servers"
+      description="Reusable HTTP CONNECT or SOCKS5 servers. Add as many as you like, then attach one to a route under Routing to tunnel that route's traffic through it."
+    >
+      <Stack gap="sm">
+        {servers.some((server) => server.id === 'sample-us-proxy' || server.name.includes('(sample)')) ? (
+          <Callout tone="warning">
+            <Text size="xs">
+              The sample public proxy is untrusted: its operator can see your prompts and provider keys, and it may stop
+              working at any time. Use it only for a quick test, then replace it with your own VPN.
+            </Text>
+          </Callout>
+        ) : null}
+        {servers.length ? (
+          <Stack gap="xs">
+            {servers.map((server) => (
+              <Box key={server.id} direction="row" align="center" gap="sm" background="muted" radius="md" padding="sm" wrap>
+                <Box grow minWidth={0}>
+                  <Stack gap="xs">
+                    <Row gap="xs" align="center" wrap>
+                      <Text size="sm" weight="medium" truncate>{server.name}</Text>
+                      <Badge tone="neutral">{server.type.toUpperCase()}</Badge>
+                      {server.enabled === false ? <Badge tone="neutral">disabled</Badge> : null}
+                      {server.secretKey ? <Badge tone="success">auth</Badge> : null}
+                    </Row>
+                    <Text muted size="xs" truncate>{server.host}:{server.port}</Text>
+                  </Stack>
+                </Box>
+                <Row gap="xs" align="center">
+                  <IconButton size="xs" icon="edit" label={`Edit VPN ${server.name}`} tooltip="Edit" onPress={() => startEditVpn(server)} />
+                  <IconButton size="xs" icon="delete" label={`Remove VPN ${server.name}`} tooltip="Remove" onPress={() => void removeVpnServer(server.id)} />
+                </Row>
+              </Box>
+            ))}
+          </Stack>
+        ) : (
+          <Text muted size="xs">No servers yet. Add one below, then pick it on a route.</Text>
+        )}
+
+        <Button
+          size="xs"
+          variant="outline"
+          icon={read(vpnFormOpen) ? 'close' : 'add'}
+          onPress={() => { if (read(vpnFormOpen)) resetVpnForm(); else set(vpnFormOpen, true) }}
+        >
+          {read(vpnFormOpen) ? 'Cancel' : editing ? 'Edit VPN server' : 'Add VPN server'}
+        </Button>
+
+        {read(vpnFormOpen) ? (
+          <Stack gap="sm">
+            <Input label="Server name" placeholder="Home proxy" value={read(vpnName)} onChange={(value) => set(vpnName, value)} />
+            <Select
+              label="Protocol"
+              value={read(vpnType)}
+              options={[
+                { value: 'socks5', label: 'SOCKS5' },
+                { value: 'http', label: 'HTTP CONNECT proxy' }
+              ]}
+              onChange={(value) => set(vpnType, value as 'http' | 'socks5')}
+            />
+            <Row gap="sm" wrap>
+              <Box grow minWidth={0}>
+                <Input label="Server host" placeholder="127.0.0.1" value={read(vpnHost)} onChange={(value) => set(vpnHost, value)} />
+              </Box>
+              <Box width={120}>
+                <Input label="Server port" placeholder={read(vpnType) === 'socks5' ? '1080' : '8080'} value={read(vpnPort)} onChange={(value) => set(vpnPort, value)} />
+              </Box>
+            </Row>
+            <Text muted size="xs">
+              {read(vpnType) === 'socks5'
+                ? 'Hostnames are resolved by the proxy, so DNS queries do not leave locally.'
+                : 'The proxy receives a CONNECT for each upstream endpoint.'}
+            </Text>
+            <Separator />
+            <Text size="sm" weight="semibold">Credentials (optional)</Text>
+            <Text muted size="xs">
+              Stored in Orca's secret store. Leave blank when editing to keep the current credentials.
+            </Text>
+            <Input label="Proxy username" value={read(vpnUsername)} onChange={(value) => set(vpnUsername, value)} />
+            <Input label="Proxy password" value={read(vpnPassword)} onChange={(value) => set(vpnPassword, value)} />
+            <Row justify="end">
+              <Button size="xs" variant="solid" tone="accent" onPress={() => void saveVpnServer()}>
+                {editing ? 'Save VPN server' : 'Add VPN server'}
+              </Button>
+            </Row>
+          </Stack>
+        ) : null}
+      </Stack>
+    </Card>
+  )
+}
+
 function SchedulerSettings() {
   const cfg = read(config)
   const scheduler = cfg?.scheduler ?? {}
@@ -4496,10 +4651,11 @@ function Providers() {
         onOpenChange={(open) => set(providersInfoOpen, open)}
       >
         <Text size="sm">
-          A provider is an upstream model service the gateway forwards to — OpenAI, Anthropic, a local server, or any
-          OpenAI- or Anthropic-compatible endpoint. Each one has a base URL, one or more protocols, the models it
-          serves, and a pool of API keys scheduled by priority and weight. Add a preset provider, a custom endpoint,
-          or a free web-chat subscription below.
+          Providers are the model services your agents reach through the gateway — OpenAI, Anthropic, Gemini, a local
+          server, a free web-chat account, or any compatible endpoint. Each owns its endpoints, protocols, model list
+          and key pool. Keys are rotated by priority and weight, stored only as names in Orca's secret store, and a
+          provider is skipped while its circuit is open. Use <Code>Test all</Code> to check connectivity and{' '}
+          <Code>Fetch all models</Code> to pick which models it offers.
         </Text>
       </InfoBanner>
 
@@ -4991,7 +5147,7 @@ function PolicyFallbackPicker({
   onChange: (entries: string[]) => void
 }) {
   const list = read(providers)
-  const routeChoices = mergedRoutes()
+  const routeChoices = read(mergedRoutesView)
     .filter((route) => route.enabled !== false)
     .map((route) => ({ value: route.name, label: route.name, kind: 'route' as const }))
   const targetChoices = list.flatMap((provider) =>
@@ -5277,7 +5433,7 @@ function RouteTargetPicker({
 }
 
 function RoutesPane() {
-  const routes = mergedRoutes()
+  const routes = read(mergedRoutesView)
   const ups = read(providers)
   const routePreview = previewChain('', read(routeTargets), ups, read(aliases), disabledProviderNames())
   return (
@@ -5396,6 +5552,23 @@ function RoutesPane() {
             Number of attempts on the same target before moving to the next.
           </Text>
 
+          <Separator />
+          <Select
+            label="VPN / proxy"
+            value={read(routeVpn) || 'direct'}
+            options={[
+              { value: 'direct', label: 'Direct (no VPN)' },
+              ...vpnServers()
+                .filter((server) => server.enabled !== false)
+                .map((server) => ({ value: server.id, label: server.name }))
+            ]}
+            onChange={(value) => set(routeVpn, value === 'direct' ? '' : value)}
+          />
+          <Text muted size="xs">
+            All upstream calls for this route — including streams — go through the selected server. Other routes stay
+            direct. Add servers under Settings.
+          </Text>
+
           {routeTargetWarnings(read(routeTargets)).length ? (
             <Text size="xs" tone="warning">
               {routeTargetWarnings(read(routeTargets)).join(' ')}
@@ -5429,6 +5602,11 @@ function RoutesPane() {
                       <Badge tone={route.strategy === 'ordered' ? 'neutral' : 'success'}>
                         {route.strategy === 'ordered' ? 'in order' : 'fastest'}
                       </Badge>
+                      {route.vpn ? (
+                        <Badge tone="accent">
+                          {`VPN: ${vpnServers().find((server) => server.id === route.vpn)?.name ?? route.vpn}`}
+                        </Badge>
+                      ) : null}
                       {read(routeRequests)[route.name] ? (
                         <Badge tone="neutral">{`${read(routeRequests)[route.name]} requests`}</Badge>
                       ) : null}
@@ -5495,7 +5673,7 @@ function healthLabel(state?: ProviderHealthView['state']) {
 }
 
 function Routing() {
-  const routeCount = mergedRoutes().length
+  const routeCount = read(mergedRoutesView).length
   return (
     <Stack gap="md">
       <InfoBanner
@@ -5505,15 +5683,14 @@ function Routing() {
       >
         <Stack gap="sm">
           <Text size="sm">
-            A route is a model name your agents send — like <Code>smart</Code> or <Code>fast</Code> — backed by one or
-            more <Code>provider/model</Code> targets. When a request names a route, the gateway walks those targets and
-            moves to the next one if a provider fails or is rate-limited.
+            A route is the model name your agents send — like <Code>smart</Code> or <Code>fast</Code> — backed by one or
+            more <Code>provider/model</Code> targets. Routes are the only way to fail over across providers: if a
+            target fails or is rate-limited, the gateway moves to the next one.
           </Text>
           <Text size="sm">
-            Try sequence chooses between fastest-available first, ranked by measured latency and circuit state, and the
-            order you selected. A model name that isn't a route maps to exactly one provider/model target and retries it
-            — it never fails over on its own. To add failover after it, attach a <Code>Global Policy</Code> under
-            Settings.
+            Try sequence picks fastest healthy first, by measured latency and circuit state, or the order you selected.
+            A plain model name that isn't a route resolves to one provider/model and retries only that target. To add
+            fallback after it, attach a <Code>Global Policy</Code> under Settings.
           </Text>
         </Stack>
       </InfoBanner>
@@ -5534,17 +5711,19 @@ function Settings() {
       >
         <Stack gap="sm">
           <Text size="sm">
-            Everything on this page is global — it applies to every provider and every route, not one provider at a
-            time. Policies are matched in order; every other group is a set of switches you can turn on or off.
+            Everything here is global: it applies to every provider and route. Global Policies are matched in order and
+            can rewrite a request or append a fallback chain. The other cards control request optimization, key
+            scheduling and circuit breaking, client API keys for tools outside Orca, and config import/export.
           </Text>
           <Text size="sm">
-            Per-provider base URLs, models and keys live under <Code>Providers</Code>. The model names your agents send
+            Per-provider endpoints, models and keys live under <Code>Providers</Code>; the model names your agents send
             live under <Code>Routing</Code>.
           </Text>
         </Stack>
       </InfoBanner>
 
       <PoliciesCard />
+      <VpnServersCard />
       <RequestOptimization />
       <SchedulerSettings />
       <Card
@@ -5590,6 +5769,7 @@ function RequestOptimization() {
     })
   }
   const numberFrom = (value: string, fallback: number | undefined) => {
+    if (!value.trim()) return fallback ?? 0
     const parsed = Number(value)
     return Number.isFinite(parsed) ? parsed : (fallback ?? 0)
   }
@@ -5781,13 +5961,14 @@ function Profiles() {
   return (
     <Stack gap="md">
       <InfoBanner
-        title="Agent routing"
+        title="What agents it works with"
         open={read(profilesInfoOpen) ?? agents.length === 0}
         onOpenChange={(open) => set(profilesInfoOpen, open)}
       >
         <Text size="sm">
-          Orca launches these agents. While the gateway is running, every enabled agent is pointed at it; turn one off
-          to let it use its own provider settings.
+          This is the list of coding agents Orca can launch. While the gateway is running, each enabled agent is pointed
+          at it at launch: env-based agents get the gateway address and auth, and OpenCode and Codex also get a
+          generated list of your providers and models. Turn an agent off to leave it on its own settings.
         </Text>
       </InfoBanner>
 
@@ -5940,15 +6121,16 @@ function Logs() {
       >
         <Stack gap="xs">
           <Text size="sm">
-            Plain text searches the route, model, key, provider and error. Narrow it with{' '}
-            <Code>field=value</Code> or <Code>field:value</Code>.
+            Each line is one request: the model sent, the provider/model that served it, the key used, status, latency
+            and any failover. Search that text directly, or narrow it with <Code>field=value</Code> or{' '}
+            <Code>field:value</Code>.
           </Text>
           <Stack gap="xs">
-            <Code>provider=tokenharbor</Code>
+            <Code>provider=openai</Code>
             <Text muted size="xs">Requests sent to that provider.</Text>
           </Stack>
           <Stack gap="xs">
-            <Code>route=deepseek-rout status=4xx</Code>
+            <Code>route=fast status=4xx</Code>
             <Text muted size="xs">Two terms with no operator mean AND.</Text>
           </Stack>
           <Stack gap="xs">
@@ -5956,7 +6138,7 @@ function Logs() {
             <Text muted size="xs">Either condition. Also AND, NOT, &amp;&amp;, || and !.</Text>
           </Stack>
           <Stack gap="xs">
-            <Code>(provider=openai OR key=gmail-03) AND status=4xx</Code>
+            <Code>(provider=openai OR key=key-1) AND status=4xx</Code>
             <Text muted size="xs">Group with parentheses. <Code>NOT error=</Code> finds requests without an error.</Text>
           </Stack>
           <Stack gap="xs">
@@ -6262,7 +6444,10 @@ async function webchatSetup(transport: 'deepseek-web' | 'qwen-web') {
       set(message, 'Chrome is ready — sign in and send a short message. The provider is added once the credentials are verified.')
       void webchatAutoCapture(transport)
     } catch (cause) {
-      set(message, `The browser could not start: ${(cause as Error).message}. Use “Paste auth JSON” instead.`)
+      // No browser means no login session to attach to, so show the paste form
+      // right away instead of pointing at a control that was never rendered.
+      set(webchatPasteFor, transport)
+      set(message, `The browser could not start: ${(cause as Error).message}. Paste your auth JSON below.`)
     }
   })
 }
@@ -6367,7 +6552,7 @@ function WebChatService({ service }: { service: typeof WEBCHAT_SERVICES[number] 
           </Button>
         ) : null}
 
-        {(provider || login) ? (
+        {(provider || login || read(webchatPasteFor) === transport) ? (
           <>
             {login ? (
               <Callout tone={login.captured ? 'success' : 'accent'} title={login.captured ? 'Connected' : 'Login in progress'}>
@@ -6392,6 +6577,14 @@ function WebChatService({ service }: { service: typeof WEBCHAT_SERVICES[number] 
                         </Button>
                       </>
                     )}
+                    <Button
+                      size="xs"
+                      variant="ghost"
+                      disabled={Boolean(busy)}
+                      onPress={() => set(webchatPasteFor, read(webchatPasteFor) === transport ? '' : transport)}
+                    >
+                      {read(webchatPasteFor) === transport ? 'Hide paste form' : 'Paste auth JSON'}
+                    </Button>
                   </Row>
                 </Stack>
               </Callout>
@@ -6445,8 +6638,6 @@ function WebChatService({ service }: { service: typeof WEBCHAT_SERVICES[number] 
               </Row>
             )}
 
-            {provider ? (
-              <>
             {read(webchatPasteFor) === transport ? (
               <Stack gap="xs">
                 <Textarea
@@ -6469,8 +6660,6 @@ function WebChatService({ service }: { service: typeof WEBCHAT_SERVICES[number] 
                   <Button size="xs" variant="ghost" onPress={() => set(webchatPasteFor, '')}>Cancel</Button>
                 </Row>
               </Stack>
-            ) : null}
-              </>
             ) : null}
           </>
         ) : null}

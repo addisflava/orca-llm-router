@@ -1024,6 +1024,37 @@ test('providers tab no longer owns scheduling policy', async () => {
   }
 })
 
+test('a provider whose last outcome failed does not keep reading ok', async () => {
+  const failedHealth = {
+    state: 'degraded',
+    latencyMs: 1635,
+    samples: 642,
+    failures: 1,
+    lastSuccessAt: Date.now() - 53 * 60_000,
+    lastFailureAt: Date.now() - 60_000
+  }
+  const host = mockHost({
+    requests: {
+      'router.status': { ...status, providers: [{ ...status.providers[0], health: failedHealth }] } as never,
+      'router.config.get': { config },
+      'router.usage': usage,
+      'router.presets': { presets: [] },
+      'router.keyUsage': { providers: [] }
+    }
+  })
+  const app = await mount(panel, { host, persisted: { plugin: { tab: 'providers' } } })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  await app.settled()
+
+  try {
+    assert.ok(app.find({ text: 'Response avg 1635 ms / 642 reqs' }), 'the metrics line is rendered')
+    assert.ok(app.find({ text: /^failed / }), 'the trailing status reports the recent failure')
+    assert.equal(app.find({ text: /^ok \d/ }), null, 'it no longer pairs a failure with ok')
+  } finally {
+    await app.unmount()
+  }
+})
+
 test('custom provider form uses the same grouped sections as the editor', async () => {
   const host = mockHost({
     requests: {
@@ -1271,5 +1302,71 @@ test('route cards use compact strategy badges', async () => {
     assert.ok(app.find({ text: 'in order' }), 'an ordered route shows an in order badge')
   } finally {
     await app.unmount()
+  }
+})
+
+test('VPN servers live in Settings and can be attached to a route', async () => {
+  const vpnConfig: RouterConfig = {
+    ...config,
+    vpnServers: [
+      { id: 'sample-us-proxy', name: 'Free US proxy (sample)', type: 'http', host: '47.85.161.37', port: 3128 },
+      { id: 'vpn-main', name: 'Home SOCKS', type: 'socks5', host: '127.0.0.1', port: 1080 }
+    ],
+    routes: [{ ...config.routes[0], vpn: 'vpn-main' }]
+  }
+  let savedVpn: Record<string, unknown> | null = null
+  const host = mockHost({
+    requests: {
+      'router.status': status as never,
+      'router.config.get': () => ({ config: vpnConfig }),
+      'router.usage': usage,
+      'router.presets': { presets: [] },
+      'router.vpn.save': (input) => {
+        savedVpn = input
+        return { ok: true, server: { id: 'vpn-2', ...input.server } }
+      }
+    }
+  })
+  const app = await mount(panel, { host, persisted: { plugin: { tab: 'settings' } } })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  await app.settled()
+  try {
+    assert.ok(app.find({ label: 'VPN / proxy servers' }), 'VPN card is under settings')
+    assert.ok(app.find({ text: 'Home SOCKS' }), 'configured server is listed')
+    assert.ok(app.find({ text: 'Free US proxy (sample)' }), 'the sample US proxy is listed too')
+    await app.press(app.findAll({ text: 'Add VPN server' })[0])
+    await app.type({ label: 'Server name' }, 'Work HTTP')
+    await app.select({ label: 'Protocol' }, 'http')
+    await app.type({ label: 'Server host' }, 'proxy.example')
+    await app.type({ label: 'Server port' }, '3128')
+    await app.type({ label: 'Proxy username' }, 'alice')
+    await app.type({ label: 'Proxy password' }, 'secret')
+    await app.press(app.findAll({ text: 'Add VPN server' })[0])
+    assert.ok(savedVpn, 'the worker received the new server')
+    assert.deepEqual(savedVpn?.server, { name: 'Work HTTP', type: 'http', host: 'proxy.example', port: 3128 })
+    assert.equal(savedVpn?.username, 'alice')
+    assert.equal(savedVpn?.password, 'secret')
+  } finally {
+    await app.unmount()
+  }
+
+  const routingHost = mockHost({
+    requests: {
+      'router.status': status as never,
+      'router.config.get': () => ({ config: vpnConfig }),
+      'router.usage': usage,
+      'router.presets': { presets: [] }
+    }
+  })
+  const routing = await mount(panel, { host: routingHost, persisted: { plugin: { tab: 'routing' } } })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  await routing.settled()
+  try {
+    assert.ok(routing.find({ text: 'VPN: Home SOCKS' }), 'the route shows its VPN badge')
+    await routing.press({ label: 'Edit route fast' })
+    await routing.settled()
+    assert.equal(routing.valueOf({ label: 'VPN / proxy' }), 'vpn-main', 'route editor loads the attached server')
+  } finally {
+    await routing.unmount()
   }
 })

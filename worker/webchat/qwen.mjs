@@ -14,7 +14,7 @@
 // which must surface as 401 (handled by the router's auth cooldown).
 
 import crypto from 'node:crypto'
-import { createUpstreamHttpError, providerHttpError, looksLikeHtml } from './errors.mjs'
+import { providerHttpError, looksLikeHtml } from './errors.mjs'
 import { qwenResolveModel, qwenCatalog } from './models.mjs'
 
 const BASE_URL = 'https://chat.qwen.ai'
@@ -358,5 +358,3 @@ export class QwenWebTransport {
     return this._finish(session, result, effectivePrompt, needsFresh)
   }
 }
-
-export { qwenResolveModel, qwenCatalog }

@@ -57,8 +57,6 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const sleepSync = (ms) => {
   try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms) } catch { /* noop */ }
 }
-const isTruthy = (value) => /^(1|true|yes|on|always|require|required)$/i.test(String(value || '').trim())
-
 export function parsePorts(value, defaults = []) {
   const ports = []
   for (const raw of String(value || '').split(/[,\s]+/)) {
@@ -121,7 +119,7 @@ export function resolveChromePath() {
             ]
           }
           if (process.platform === 'win32') {
-            return [path.join(baseDir, 'chrome-win64', 'chrome.exe'), path.join(baseDir, 'chrome-win64', 'chrome.exe')]
+            return [path.join(baseDir, 'chrome-win64', 'chrome.exe')]
           }
           return [path.join(baseDir, 'chrome-linux64', 'chrome'), path.join(baseDir, 'chrome-linux64', 'chrome.exe')]
         })
@@ -273,16 +271,6 @@ export async function waitDevtools(port, { attempts = 48, child = null, context 
     await sleep(250)
   }
   throw new Error(`Chrome DevTools endpoint did not start on port ${port}.${context}`)
-}
-
-export async function getPageTarget(port, host) {
-  for (let i = 0; i < 40; i++) {
-    const targets = await fetchJson(`http://127.0.0.1:${port}/json`)
-    const page = targets.find((t) => t.type === 'page' && t.url.includes(host)) || targets.find((t) => t.type === 'page')
-    if (page && page.webSocketDebuggerUrl) return page
-    await sleep(250)
-  }
-  throw new Error('No Chrome page target found')
 }
 
 // Orca's plugin worker is launched without a desktop session (no DISPLAY,
@@ -572,10 +560,12 @@ export async function captureAuth(providerId, { port, url, cdp, attempts = 20, c
     if (complete) break
     await sleep(500)
   }
-  // `close: false` lets the panel poll repeatedly with the same CDP connection
-  // (and keeps the accumulated header events between attempts).
-  if (close) cdp.close()
   const ok = Boolean(auth && auth.token && auth.cookie
     && (!requireLiveSession || (auth.authHeaderSeen && (providerId !== 'deepseek-web' || auth.hif_dliq || auth.hif_leim))))
+  // `close: false` lets the panel poll repeatedly with the same CDP connection
+  // (and keeps the accumulated header events between attempts). Only close a
+  // successful capture: a failed one may be retried with the same session, and
+  // a closed CDP object cached there would make every retry fail instantly.
+  if (close && ok) cdp.close()
   return { ok, auth }
 }

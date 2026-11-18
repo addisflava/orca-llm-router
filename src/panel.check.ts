@@ -399,10 +399,6 @@ export default defineCheck({
     ...populated,
     persisted: { plugin: { tab: 'profiles' } }
   },
-  keys: {
-    ...populated,
-    persisted: { plugin: { tab: 'keys' } }
-  },
   logs: {
     ...populated,
     persisted: { plugin: { tab: 'logs' } }

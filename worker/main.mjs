@@ -46,8 +46,10 @@ import {
   providerFromPreset,
   isWebChatTransport,
   webchatCatalog,
-  webchatConfigured
+  webchatConfigured,
+  joinUpstreamUrl
 } from './sidecar.mjs'
+import { normalizeVpnServer } from './proxy.mjs'
 import {
   AUTH_PROVIDERS,
   startAuthBrowser,
@@ -140,6 +142,8 @@ export function panelLogEntry(entry) {
     upstream: entry.upstream ?? null,
     resolvedProvider: entry.resolvedProvider ?? null,
     route: entry.route ?? null,
+    // Only the server's display name is shown; URLs and credentials never are.
+    vpn: entry.vpn ?? null,
     credential: entry.credential ?? null,
     requestModel: entry.requestModel,
     resolvedModel: entry.resolvedModel,
@@ -993,10 +997,6 @@ async function mergeSecretsIntoConfig(next, previous, preserveMissingKeys = true
       key.secretKey = priorKey?.secretKey
     }
   }
-  if (!next.clientKeys.length && priorClientKeys.length && next.clientKeys === priorClientKeys) {
-    // keep previous keys untouched
-    next.clientKeys = priorClientKeys
-  }
 }
 
 // Report chains that were just converted into routes. The panel shows
@@ -1359,13 +1359,24 @@ export default async function activate(orca) {
     const sk = secretKey || webchatSecretKey(target)
     if (!ok || !auth) {
       if (silent) return { ok: false, secretKey: sk, summary: null }
+      // A failed capture must not leave the closed/dead CDP object cached —
+      // the next click reconnects to the still-open browser instead.
+      cdp.close()
+      session.cdp = null
       throw new Error(`no credentials captured. Log in to ${url} in the opened Chrome window, send one short message (e.g. "ok"), then capture again.`)
     }
     // Only accept credentials that actually work: make a real upstream call
     // with them before saving anything or adding the provider to the config.
-    const probe = await probeWebChat(transport, auth)
+    // Silent capture is polled every 2.5s while the browser stays open; the
+    // Qwen probe creates a remote chat, so re-verifying on every poll would
+    // leave an orphan chat behind each time. Throttle silent re-verification.
+    const probeDue = !silent || Date.now() - (session.lastProbeAt ?? 0) >= 60_000
+    const probe = probeDue ? await probeWebChat(transport, auth) : { ok: true, message: 'verified' }
+    if (probeDue) session.lastProbeAt = Date.now()
     if (!probe.ok) {
       if (silent) return { ok: false, secretKey: sk, summary: null, reason: 'verification_failed', message: probe.message }
+      cdp.close()
+      session.cdp = null
       throw new Error(`Credentials were captured but could not be verified: ${probe.message}`)
     }
     await orca.secrets.set(sk, JSON.stringify(auth))
@@ -1778,8 +1789,55 @@ export default async function activate(orca) {
     }
     return { ok: true }
   })
+  orca.panels.handle('router.vpn.save', async ({ server: input, username, password } = {}) => {
+    const existingId = String(input?.id ?? '').trim()
+    const existing = (config.vpnServers ?? []).find((item) => item.id === existingId)
+    const used = new Set((config.vpnServers ?? []).filter((item) => item.id !== existingId).map((item) => item.id))
+    const server = normalizeVpnServer({
+      ...input,
+      id: existingId || undefined,
+      secretKey: existing?.secretKey || undefined
+    }, used)
+    if (!server) {
+      const error = new Error('a VPN server needs a type (HTTP or SOCKS5) and a host')
+      error.code = 'invalid_params'
+      throw error
+    }
+    const hasCredentials = typeof username === 'string' && username.trim() !== '' || typeof password === 'string' && password !== ''
+    if (hasCredentials) {
+      await orca.secrets.set(server.secretKey ?? `vpn.${server.id}`, JSON.stringify({
+        username: String(username ?? '').trim(),
+        password: String(password ?? '')
+      }))
+      server.secretKey = server.secretKey ?? `vpn.${server.id}`
+    } else if (existing?.secretKey) {
+      // Empty credential fields mean "keep what is stored" on edit; removal of
+      // the secret happens only with the explicit Remove action.
+      server.secretKey = existing.secretKey
+    }
+    const next = structuredClone(config)
+    next.vpnServers = [...(next.vpnServers ?? [])]
+    const index = next.vpnServers.findIndex((item) => item.id === server.id)
+    if (index >= 0) next.vpnServers[index] = server
+    else next.vpnServers.push(server)
+    await persistConfig(orca, next)
+    return { ok: true, server }
+  })
+  orca.panels.handle('router.vpn.remove', async ({ id } = {}) => {
+    const target = (config.vpnServers ?? []).find((item) => item.id === id)
+    if (!target) return { ok: true }
+    const next = structuredClone(config)
+    next.vpnServers = (next.vpnServers ?? []).filter((item) => item.id !== id)
+    // Clearing the last server is an explicit choice: do not re-offer the sample.
+    if (!next.vpnServers.length) next.vpnSampleDismissed = true
+    for (const route of next.routes ?? []) {
+      if (route.vpn === id) delete route.vpn
+    }
+    await persistConfig(orca, next)
+    if (target.secretKey) await orca.secrets.delete(target.secretKey).catch(() => {})
+    return { ok: true }
+  })
 
-  // (debug handler removed)
   // --- command palette ---
   orca.commands.register('router.status', async () => {
     await refreshSettings(orca)
@@ -1882,25 +1940,20 @@ export default async function activate(orca) {
 }
 
 // Probe the provider's model list (which validates the credential) and fall
-// back to a reachability check when the endpoint is absent.
-function joinProbeUrl(baseUrl, pathname) {
-  const base = String(baseUrl).replace(/\/+$/, '')
-  const dedup = base.toLowerCase().endsWith('/v1') && pathname.toLowerCase().startsWith('/v1') ? base.slice(0, -3) : base
-  return `${dedup}${pathname}`
-}
-
+// back to a reachability check when the endpoint is absent. URL joining is
+// shared with the gateway so /v1 is never duplicated.
 function providerProbe(provider, key) {
   const baseUrl = String(provider.baseUrl ?? provider.endpoints?.[0]?.baseUrl ?? '').replace(/\/+$/, '')
   const protocols = (provider.protocols ?? provider.capabilities ?? []).map(String)
   const onlyGemini = protocols.includes('gemini') && !['openai', 'anthropic', 'responses', 'passthrough'].some((p) => protocols.includes(p))
   if (onlyGemini) {
-    return { url: joinProbeUrl(baseUrl, '/v1beta/models'), headers: key ? { 'x-goog-api-key': key } : {}, protocol: 'gemini' }
+    return { url: joinUpstreamUrl(baseUrl, '/v1beta/models'), headers: key ? { 'x-goog-api-key': key } : {}, protocol: 'gemini' }
   }
   const onlyAnthropic = protocols.includes('anthropic') && !['openai', 'responses', 'passthrough'].some((p) => protocols.includes(p))
   if (onlyAnthropic) {
-    return { url: joinProbeUrl(baseUrl, '/v1/models'), headers: { ...(key ? { 'x-api-key': key } : {}), 'anthropic-version': '2023-06-01' }, protocol: 'anthropic' }
+    return { url: joinUpstreamUrl(baseUrl, '/v1/models'), headers: { ...(key ? { 'x-api-key': key } : {}), 'anthropic-version': '2023-06-01' }, protocol: 'anthropic' }
   }
-  return { url: joinProbeUrl(baseUrl, '/v1/models'), headers: key ? { authorization: `Bearer ${key}` } : {}, protocol: 'openai' }
+  return { url: joinUpstreamUrl(baseUrl, '/v1/models'), headers: key ? { authorization: `Bearer ${key}` } : {}, protocol: 'openai' }
 }
 
 // Ask an endpoint for its model list, using the probe that matches its
@@ -1963,7 +2016,7 @@ async function testProviders(only) {
         continue
       }
       // No model-list endpoint (404/405): fall back to a reachability probe.
-      const health = await fetch(joinProbeUrl(baseUrl, '/health'), { method: 'GET', headers: probe.headers, signal: AbortSignal.timeout(5000) }).catch(() => null)
+      const health = await fetch(joinUpstreamUrl(baseUrl, '/health'), { method: 'GET', headers: probe.headers, signal: AbortSignal.timeout(5000) }).catch(() => null)
       if (health) {
         results.push({ provider: provider.name, ok: health.status < 500, status: health.status, latencyMs: Date.now() - started })
       } else {

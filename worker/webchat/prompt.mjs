@@ -17,7 +17,6 @@ export const MAX_MESSAGE_DEPTH = 100
 export const MAX_HISTORY_LENGTH = 15
 export const MAX_HISTORY_CHARS = 10000
 export const MAX_UPSTREAM_PROMPT_CHARS = 80000
-export const MIN_UPSTREAM_PROMPT_CHARS = 16000
 
 /**
  * Build the effective upstream prompt for one turn from the message array and
@@ -148,17 +147,4 @@ export function isContextTooLongError(error) {
     ? error
     : `${error?.content || ''} ${error?.message || ''} ${error?.finish_reason || ''} ${error?.type || ''}`
   return /(?:content|prompt|context).{0,40}(?:too\s+long|too\s+large|length|limit|maximum)|maximum.{0,30}(?:context|token)|too\s+many\s+tokens|содержани[ея]\s+слишком\s+длин|контекст.{0,30}(?:длин|лимит)|内容.{0,12}(?:过长|太长)|上下文.{0,12}(?:过长|超出)/i.test(message)
-}
-
-export function normalizeRetryResponse(result) {
-  return {
-    content: result?.content ? sanitize(result.content) : '',
-    reasoningContent: result?.reasoningContent ? sanitize(result.reasoningContent) : '',
-    finishReason: result?.finishReason ?? null,
-    modelError: result?.modelError || null,
-  }
-}
-
-function sanitize(text) {
-  return String(text ?? '').replace(/[\ud800-\udfff]/g, '')
 }

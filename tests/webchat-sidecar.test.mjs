@@ -200,3 +200,47 @@ test('qwen-web resolves its canonical model id to the correct upstream model', a
     await sidecar.stop()
   }
 })
+
+test('web-chat key exhaustion uses the router_exhausted contract with Retry-After', async () => {
+  const nowValue = 10_000_000
+  const config = {
+    version: 3,
+    token: 'orca-router',
+    providers: [{
+      name: 'deepseek-web',
+      transport: 'deepseek-web',
+      protocols: ['openai'],
+      models: [{ id: 'deepseek-chat' }],
+      keys: [{ id: 'k1', secretKey: 'ds-auth', enabled: true }],
+    }],
+    routes: [],
+    aliases: {},
+  }
+  const sidecar = createSidecar({
+    getConfig: () => config,
+    getSecret: (k) => (k === 'ds-auth' ? WEBCHAT_CREDS : null),
+    fetchImpl: async () => { throw new Error('no upstream call expected when exhausted') },
+    onLog: () => {},
+    now: () => nowValue,
+    initialState: {
+      version: 1,
+      savedAt: nowValue,
+      keyCooldowns: [['ds-auth', nowValue + 60_000]],
+    },
+  })
+  const addr = await sidecar.start('127.0.0.1', 0)
+  try {
+    const res = await fetch(`http://127.0.0.1:${addr.port}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'deepseek-chat', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    assert.equal(res.status, 420)
+    assert.equal(res.headers.get('retry-after'), '60')
+    const json = await res.json()
+    assert.equal(json.error.type, 'router_exhausted')
+    assert.equal(json.error.code, 'all_keys_exhausted')
+  } finally {
+    await sidecar.stop()
+  }
+})

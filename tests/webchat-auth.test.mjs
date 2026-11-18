@@ -125,6 +125,8 @@ test('captureAuth reports not-ok when credentials are missing', async () => {
   const { ok, auth } = await captureAuth('qwen-web', { port: 0, url: 'https://chat.qwen.ai/', cdp, attempts: 2 })
   assert.equal(ok, false)
   assert.equal(auth.token, '')
+  // A failed capture leaves the connection open so the caller can retry.
+  assert.equal(cdp.closed, undefined)
 })
 test('captureAuth with close:false keeps the connection open across polls', async () => {
   let ready = false

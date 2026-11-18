@@ -26,21 +26,6 @@ export function providerHttpError(status, message, type, retryAfter = null) {
   return error
 }
 
-// Parse a Retry-After header value into a cooldown duration in ms, or null if
-// absent/unparseable. Supports delta-seconds ("120") and HTTP-date forms.
-export function parseRetryAfterMs(retryAfterRaw, now = Date.now()) {
-  if (!retryAfterRaw) return null
-  const raw = String(retryAfterRaw).trim()
-  if (/^\d+$/.test(raw)) return Math.max(1000, Number(raw) * 1000)
-  const t = Date.parse(raw)
-  if (!Number.isNaN(t)) return Math.max(1000, t - now)
-  return null
-}
-
 export function looksLikeHtml(body) {
   return /^\s*<(?:!doctype|html|head|body)/i.test(String(body || ''))
-}
-
-export function isRetryableStatus(status) {
-  return [400, 404, 429, 500, 502, 503, 504].includes(Number(status))
 }

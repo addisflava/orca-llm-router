@@ -145,6 +145,15 @@ declare module 'orca' {
       input: { provider: string; usageFetch?: UsageFetchConfig | null }
       output: { ok: true }
     }
+    'router.vpn.save': {
+      input: {
+        server: { id?: string; name: string; type: 'http' | 'socks5'; host: string; port: number; enabled?: boolean }
+        username?: string
+        password?: string
+      }
+      output: { ok: true; server: VpnServerConfig }
+    }
+    'router.vpn.remove': { input: { id: string }; output: { ok: true } }
     'router.webchat.setup': {
       input: { transport: 'deepseek-web' | 'qwen-web' }
       output: { ok: true; provider: string; created: boolean; secretKey: string }
@@ -358,6 +367,22 @@ export interface ModelRoute {
   enabled?: boolean
   /** Attempts per target (plus the first). Defaults to the router retry count. */
   retries?: number
+  /** Id of a reusable VPN/proxy server; absent means a direct connection. */
+  vpn?: string
+}
+
+/**
+ * A reusable HTTP CONNECT or SOCKS5 server. Credentials are stored in Orca's
+ * secret store under `secretKey`; only the name lives in config.
+ */
+export interface VpnServerConfig {
+  id: string
+  name: string
+  type: 'http' | 'socks5'
+  host: string
+  port: number
+  enabled?: boolean
+  secretKey?: string
 }
 
 /** One legacy custom chain auto-migrated into a route. */
@@ -445,6 +470,10 @@ export interface RouterConfig {
   /** Routes (the failover unit). Model names agents send map to these. */
   routes: ModelRoute[]
   aliases: Record<string, string>
+  /** Reusable VPN/proxy servers attachable to routes. */
+  vpnServers?: VpnServerConfig[]
+  /** True once the sample server has been offered, so an empty list stays empty. */
+  vpnSampleDismissed?: boolean
   /** Global policies. Legacy `routes` (v2) is accepted at runtime and normalized here. */
   policies: RequestPolicy[]
   defaultModel?: string
@@ -554,6 +583,8 @@ export interface LogEntry {
   upstream: string | null
   resolvedProvider?: string | null
   route?: string | null
+  /** Display name of the VPN server used for this request, when any. */
+  vpn?: string | null
   credential?: string | null
   requestModel?: string
   resolvedModel?: string

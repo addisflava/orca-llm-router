@@ -29,7 +29,8 @@ import { join, dirname } from 'node:path'
 import { homedir } from 'node:os'
 import { createSchedulerState, normalizeCircuitBreaker, normalizeProviderHealth, normalizeScheduler, rankProviderTargets, retryAfterMs, selectScheduledKey } from './scheduler.mjs'
 import { COMPRESSION_MODES, bodyCharLength, compressChatBody, normalizeCompression, normalizeContextRelay, relayChatBody } from './transforms.mjs'
-import { canonicalCacheKey, createResponseCache, extractPromptText, normalizeResponseCache, semanticParamsKey, shouldCacheRequest } from './cache.mjs'
+import { canonicalCacheKey, createResponseCache, extractPromptText, normalizeResponseCache, semanticParamsKey, shouldCacheRequest, stableStringify } from './cache.mjs'
+import { SAMPLE_VPN_SERVER, createProxyFetch, findVpnServer, normalizeVpnServers } from './proxy.mjs'
 import { WebChatSessionStore } from './webchat/session.mjs'
 import { DeepSeekWebTransport } from './webchat/deepseek.mjs'
 import { QwenWebTransport } from './webchat/qwen.mjs'
@@ -63,9 +64,9 @@ const KEY_LIMIT_WINDOWS = [
 const DOWNSTREAM_FALLBACK_STATUSES = (s) => s >= 400 && s < 600
 
 // ---------------------------------------------------------------------------
-// Provider presets. Endpoints, protocols and default models are the same as
-// Provider presets are ported from common gateway defaults.
-// are mapped to the sidecar's own protocol names when a provider is created.
+// Provider presets. Endpoints, protocols and default models are ported from
+// common gateway defaults and mapped to the sidecar's own protocol names when
+// a provider is created.
 // ---------------------------------------------------------------------------
 export const PROVIDER_PRESETS = [
   { id: 'openai', name: 'OpenAI', baseUrl: 'https://api.openai.com/v1', capabilities: ['openai_chat_completions', 'openai_responses'], defaultModels: ['gpt-4o'], websiteUrl: 'https://openai.com/' },
@@ -124,16 +125,6 @@ export const PROVIDER_PRESETS = [
   { id: 'qwen-web', name: 'Qwen Web', baseUrl: '', transport: 'qwen-web', capabilities: ['openai_chat_completions'], defaultModels: ['qwen3-max', 'qwen3-max-thinking', 'qwen3-plus', 'qwen3-plus-thinking'], websiteUrl: 'https://chat.qwen.ai/' }
 ]
 
-export const SUPPORTED_PROTOCOLS = ['anthropic', 'openai', 'responses', 'gemini', 'passthrough']
-
-const LEGACY_TO_SIDECAR_PROTOCOL = {
-  anthropic_messages: 'anthropic',
-  openai_chat_completions: 'openai',
-  openai_responses: 'responses',
-  gemini_generate_content: 'gemini',
-  gemini_interactions: 'gemini'
-}
-
 function mapLegacyProtocol(proto) {
   if (!proto) return 'openai'
   const normalized = String(proto).toLowerCase().replace(/[-_]/g, '_')
@@ -141,7 +132,7 @@ function mapLegacyProtocol(proto) {
   if (normalized.includes('responses')) return 'responses'
   if (normalized.includes('gemini') || normalized.includes('google')) return 'gemini'
   if (normalized.includes('openai') || normalized.includes('chat')) return 'openai'
-  return LEGACY_TO_SIDECAR_PROTOCOL[proto] ?? proto
+  return proto
 }
 
 export function providerFromPreset(presetId, { name, apiKeySecretKey } = {}) {
@@ -190,6 +181,12 @@ export const DEFAULT_CONFIG = {
   // for imported single-target aliases and older configs.
   routes: [],
   aliases: {},
+  // Reusable VPN / proxy servers. Routes reference one by id; a route without
+  // a reference stays on the direct connection. A working public US proxy is
+  // seeded for a first-run trial; it is never attached to a route.
+  vpnServers: [SAMPLE_VPN_SERVER],
+  // Set once the sample has been offered, so clearing the list is respected.
+  vpnSampleDismissed: false,
   // Global policies: ordered request matchers that rewrite or redirect.
   policies: [],
   defaultModel: '',
@@ -269,9 +266,10 @@ const slug = (value) => String(value ?? '').trim().toLowerCase().replace(/[^a-z0
 
 // Route names are selectors agents send verbatim, so they keep their
 // case and punctuation. Only provider names are slugged.
-function normalizeRoutes(input) {
+function normalizeRoutes(input, vpnServers = []) {
   const routes = []
   const seen = new Set()
+  const vpnIds = new Set(vpnServers.filter((server) => server.enabled !== false).map((server) => server.id))
   for (const raw of Array.isArray(input) ? input : []) {
     if (!raw || typeof raw !== 'object') continue
     const name = String(raw.name ?? '').trim()
@@ -291,7 +289,9 @@ function normalizeRoutes(input) {
       targets,
       strategy: raw.strategy === 'ordered' ? 'ordered' : 'fastest',
       enabled: raw.enabled !== false,
-      retries: normalizeRetries(raw.retries, 2)
+      retries: normalizeRetries(raw.retries, 2),
+      // A dangling or disabled reference degrades to a direct connection.
+      ...(vpnIds.has(String(raw.vpn ?? '')) ? { vpn: String(raw.vpn) } : {})
     })
   }
   return routes
@@ -555,7 +555,13 @@ export function normalizeConfig(input) {
       return !legacyReference
     })
   const aliases = source.aliases && typeof source.aliases === 'object' ? source.aliases : {}
-  const routes = mergeLegacyAliases(normalizeRoutes(rawRoutes), aliases, providers ?? [])
+  // Configs predating VPN support, and configs whose list was never populated,
+  // get one working sample server so the feature can be tried immediately.
+  // The flag records that the offer was made, so clearing the list is final.
+  const vpnDismissed = source.vpnSampleDismissed === true
+  const seedSampleVpn = !vpnDismissed && (!Array.isArray(source.vpnServers) || source.vpnServers.length === 0)
+  const vpnServers = normalizeVpnServers(seedSampleVpn ? [SAMPLE_VPN_SERVER] : source.vpnServers)
+  const routes = mergeLegacyAliases(normalizeRoutes(rawRoutes, vpnServers), aliases, providers ?? [])
   const normalizedPolicies = policies.map((policy, index) => ({
     id: policy.id ?? `policy-${index + 1}`,
     name: policy.name ?? `Policy ${index + 1}`,
@@ -582,6 +588,8 @@ export function normalizeConfig(input) {
     providers: providers ?? [],
     routes: migrated.routes,
     aliases,
+    vpnServers,
+    vpnSampleDismissed: vpnDismissed || seedSampleVpn,
     policies: migrated.policies,
     defaultFallback: migrated.defaultFallback,
     migration: migrated.migration,
@@ -1398,8 +1406,14 @@ function containsDeep(value, needle) {
   return String(value ?? '').includes(String(needle ?? ''))
 }
 
+const globRegexCache = new Map()
 function globMatch(pattern, value) {
-  const regex = new RegExp(`^${String(pattern).replace(/[.*+?^${'{}'}()|[\]\\]/g, '\\$&').replace(/\\\*/g, '.*')}$`)
+  let regex = globRegexCache.get(pattern)
+  if (!regex) {
+    regex = new RegExp(`^${String(pattern).replace(/[.*+?^${'{}'}()|[\]\\]/g, '\\$&').replace(/\\\*/g, '.*')}$`)
+    if (globRegexCache.size > 500) globRegexCache.clear()
+    globRegexCache.set(pattern, regex)
+  }
   return regex.test(String(value ?? ''))
 }
 
@@ -1721,6 +1735,74 @@ export function responsesToOpenAI(body) {
   }
 }
 
+// Translate an OpenAI chat request into the Responses API shape. Needed when a
+// provider declares only `responses` but an agent speaks chat completions or
+// messages. OpenAI chat remains the common denominator, so this mirrors
+// responsesToOpenAI above.
+export function openAIToResponses(body) {
+  if (!body || typeof body !== 'object') return { ...(body ?? {}) }
+  if (!Array.isArray(body.messages)) return { ...body }
+  const instructions = []
+  const input = []
+  let sawConversation = false
+  for (const message of body.messages) {
+    if (!message || typeof message !== 'object') continue
+    const text = contentText(message.content)
+    if ((message.role === 'system' || message.role === 'developer') && !sawConversation) {
+      if (text) instructions.push(text)
+      continue
+    }
+    sawConversation = true
+    if (message.role === 'tool') {
+      input.push({ type: 'function_call_output', call_id: String(message.tool_call_id ?? ''), output: text })
+      continue
+    }
+    if (message.role === 'assistant' && Array.isArray(message.tool_calls)) {
+      for (const call of message.tool_calls) {
+        if (!call?.function?.name) continue
+        input.push({ type: 'function_call', call_id: String(call.id ?? ''), name: call.function.name, arguments: call.function.arguments ?? '{}' })
+      }
+    }
+    if (text) {
+      const role = message.role === 'assistant' ? 'assistant'
+        : message.role === 'system' || message.role === 'developer' ? 'developer' : 'user'
+      input.push({ type: 'message', role, content: [{ type: role === 'assistant' ? 'output_text' : 'input_text', text }] })
+    }
+  }
+  const tools = (body.tools ?? []).map((tool) => {
+    if (tool?.type === 'function' && tool.function?.name) {
+      return {
+        type: 'function',
+        name: tool.function.name,
+        description: tool.function.description ?? '',
+        parameters: tool.function.parameters ?? { type: 'object' }
+      }
+    }
+    return tool
+  })
+  const choice = body.tool_choice
+  const toolChoice = !choice ? undefined
+    : typeof choice === 'string' ? choice
+      : choice?.type === 'function' && choice.function?.name ? { type: 'function', name: choice.function.name }
+        : choice
+  const effort = body.reasoning_effort ?? body.reasoning?.effort
+  const maxOutput = body.max_output_tokens ?? body.max_completion_tokens ?? body.max_tokens
+  return {
+    model: body.model,
+    ...(instructions.length ? { instructions: instructions.join('\n\n') } : {}),
+    input,
+    ...(maxOutput ? { max_output_tokens: maxOutput } : {}),
+    ...(body.temperature != null ? { temperature: body.temperature } : {}),
+    ...(body.top_p != null ? { top_p: body.top_p } : {}),
+    ...(body.stream != null ? { stream: body.stream } : {}),
+    ...(effort ? { reasoning: { effort } } : {}),
+    ...(tools.length ? { tools } : {}),
+    ...(toolChoice ? { tool_choice: toolChoice } : {}),
+    ...(body.parallel_tool_calls != null ? { parallel_tool_calls: body.parallel_tool_calls } : {}),
+    ...(body.metadata ? { metadata: body.metadata } : {})
+  }
+}
+
 export function openAIResponseToResponses(raw, model) {
   const choice = raw?.choices?.[0] ?? {}
   const message = choice.message ?? {}
@@ -1753,6 +1835,48 @@ export function openAIResponseToResponses(raw, model) {
       output_tokens: raw?.usage?.completion_tokens ?? 0,
       total_tokens: raw?.usage?.total_tokens ?? ((raw?.usage?.prompt_tokens ?? 0) + (raw?.usage?.completion_tokens ?? 0))
     }
+  }
+}
+
+// Reverse of openAIResponseToResponses: lets a Responses-only provider serve a
+// chat-completions or messages client instead of leaking a Responses body.
+export function responsesResponseToOpenAI(raw, model) {
+  const output = Array.isArray(raw?.output) ? raw.output : []
+  let text = ''
+  const toolCalls = []
+  for (const item of output) {
+    if (!item || typeof item !== 'object') continue
+    if (item.type === 'message') {
+      for (const part of item.content ?? []) {
+        if (part?.type === 'output_text' || typeof part?.text === 'string') text += part.text ?? ''
+      }
+    } else if (item.type === 'function_call' || item.type === 'custom_tool_call') {
+      const args = item.type === 'custom_tool_call'
+        ? JSON.stringify({ input: item.input ?? '' })
+        : (item.arguments ?? '{}')
+      toolCalls.push({
+        id: item.call_id ?? item.id ?? '',
+        type: 'function',
+        function: { name: item.name ?? '', arguments: args }
+      })
+    }
+  }
+  const status = raw?.status
+  const finishReason = status === 'incomplete' ? 'length'
+    : status === 'failed' ? 'stop'
+      : toolCalls.length ? 'tool_calls' : 'stop'
+  const input = raw?.usage?.input_tokens ?? 0
+  const outputTokens = raw?.usage?.output_tokens ?? 0
+  return {
+    id: raw?.id ?? `chatcmpl-${Date.now()}`,
+    object: 'chat.completion',
+    model: model ?? raw?.model,
+    choices: [{
+      index: 0,
+      finish_reason: finishReason,
+      message: { role: 'assistant', content: text || null, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) }
+    }],
+    usage: { prompt_tokens: input, completion_tokens: outputTokens, total_tokens: input + outputTokens }
   }
 }
 
@@ -1886,7 +2010,6 @@ export function buildOpenAISse(completion) {
   const chunks = []
   const base = { id: completion.id, object: 'chat.completion.chunk', model: completion.model }
   const emit = (delta, finishReason = null) => chunks.push(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta, finish_reason: finishReason }] })}\n\n`)
-  let first = true
   if (message.content || !message.tool_calls?.length) emit({ role: 'assistant', content: message.content ?? '' })
   for (const call of message.tool_calls ?? []) {
     emit({ role: 'assistant', tool_calls: [{ index: chunks.length, id: call.id, type: 'function', function: { name: call.function?.name, arguments: call.function?.arguments ?? '{}' } }] })
@@ -1964,28 +2087,13 @@ function resolveSelector(normalized, selector, fallbackModel = '') {
   return null
 }
 
-function resolveRouteTarget(normalized, target, fallbackModel = '') {
+function resolveRouteTarget(normalized, target, fallbackModel = '', vpn = '') {
   if (!target) return null
+  const withVpn = (resolved) => (resolved && vpn ? { ...resolved, vpn } : resolved)
   const provider = target.provider ? providerByName(normalized, target.provider) : null
-  if (provider) return { provider, model: target.model || fallbackModel }
-  if (target.model) return resolveSelector(normalized, target.model, fallbackModel)
+  if (provider) return withVpn({ provider, model: target.model || fallbackModel })
+  if (target.model) return withVpn(resolveSelector(normalized, target.model, fallbackModel))
   return null
-}
-
-function resolveProviderTargetNormalized(normalized, selector, fallbackModel = '') {
-  const route = findRoute(normalized, selector)
-  if (route) {
-    for (const target of route.targets) {
-      const resolved = resolveRouteTarget(normalized, target, fallbackModel)
-      if (resolved) return resolved
-    }
-    return null
-  }
-  return resolveSelector(normalized, selector, fallbackModel)
-}
-
-export function resolveProviderTarget(config, selector, fallbackModel = '') {
-  return resolveProviderTargetNormalized(normalizeConfig(config), selector, fallbackModel)
 }
 
 export function agentProfileFor(normalized, agentId) {
@@ -2263,7 +2371,9 @@ export function buildChainFromFallback(normalized, primarySelector, fallback) {
   const seen = new Set()
   const addTarget = (target) => {
     if (!target?.provider || !target.model) return
-    const key = `${target.provider.name}/${target.model}`
+    // Two identical provider/model pairs reached through different VPNs are
+    // distinct attempts: keep both in the chain.
+    const key = `${target.provider.name}/${target.model}\u0000${target.vpn ?? ''}`
     if (seen.has(key)) return
     seen.add(key)
     chain.push(target)
@@ -2274,11 +2384,11 @@ export function buildChainFromFallback(normalized, primarySelector, fallback) {
   let bare = primary?.model
   if (!bare && primaryRoute) {
     bare = primaryRoute.targets
-      .map((target) => resolveRouteTarget(normalized, target, ''))
+      .map((target) => resolveRouteTarget(normalized, target, '', primaryRoute.vpn))
       .find((target) => target?.model)?.model
   }
   if (primaryRoute) {
-    for (const target of primaryRoute.targets) addTarget(resolveRouteTarget(normalized, target, bare ?? ''))
+    for (const target of primaryRoute.targets) addTarget(resolveRouteTarget(normalized, target, bare ?? '', primaryRoute.vpn))
   }
   // A fallback entry is either a route name or a raw `provider/model` target.
   // A route contributes all of its targets; a raw entry resolves to one.
@@ -2287,7 +2397,7 @@ export function buildChainFromFallback(normalized, primarySelector, fallback) {
     if (typeof entry !== 'string') continue
     const route = findRoute(normalized, entry)
     if (route) {
-      for (const target of route.targets) addTarget(resolveRouteTarget(normalized, target, reuse))
+      for (const target of route.targets) addTarget(resolveRouteTarget(normalized, target, reuse, route.vpn))
       continue
     }
     addTarget(resolveSelector(normalized, entry, reuse))
@@ -2342,11 +2452,15 @@ function pruneTokenEntries(entries, windowMs, now) {
   return entries
 }
 
+// Windows are append-ordered and pruned from the front, so the first stale
+// entry marks the end of the useful range. Stop there instead of scanning the
+// whole array on every scheduling decision.
 function rateWindowCount(timestamps, windowMs, now) {
   const cutoff = now - windowMs
   let count = 0
   for (let i = timestamps.length - 1; i >= 0; i--) {
-    if (timestamps[i] >= cutoff) count++
+    if (timestamps[i] < cutoff) break
+    count++
   }
   return count
 }
@@ -2355,7 +2469,8 @@ function tokensInWindow(entries, windowMs, now) {
   const cutoff = now - windowMs
   let total = 0
   for (let i = entries.length - 1; i >= 0; i--) {
-    if (entries[i].at >= cutoff) total += entries[i].tokens
+    if (entries[i].at < cutoff) break
+    total += entries[i].tokens
   }
   return total
 }
@@ -2581,13 +2696,6 @@ function headerValue(headers, name) {
   return Array.isArray(value) ? value[0] : value
 }
 
-function stableStringify(value) {
-  if (value === undefined) return 'null'
-  if (value === null || typeof value !== 'object') return JSON.stringify(value)
-  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`
-  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`
-}
-
 // Resolve the stable cache-affinity token for a request. Explicit session
 // headers win, then body identifiers, then a hash of the stable prompt prefix.
 // The caller combines this with provider/model so a different model never
@@ -2620,7 +2728,15 @@ export function deriveAffinityKey(headers = {}, body = null) {
 }
 
 export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Date.now, solvePOW = solvePOWFn, initialState = null, persistState = null }) {
-  const fetchFn = fetchImpl ?? globalThis.fetch
+  const baseFetch = fetchImpl ?? globalThis.fetch
+  const proxyFetch = createProxyFetch({ getSecret, baseFetch })
+  // Routes opt in to a VPN server by id. Every upstream call made while that
+  // route serves a request uses this scoped fetch; everything else stays direct.
+  const scopedFetch = (vpnId, config = configRef()) => {
+    const server = findVpnServer(config, vpnId)
+    return server ? (url, init) => proxyFetch(url, init, server) : baseFetch
+  }
+  const vpnLabel = (config, vpnId) => findVpnServer(config, vpnId)?.name ?? null
   const webchatSessions = new WebChatSessionStore({ now })
   let webchatRequestCount = 0
   const logs = []
@@ -2945,10 +3061,9 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
 
   // What the panel shows for a provider: measured speed plus the same health
   // signals the ranking uses, so the displayed state explains the order.
-  const providerHealthView = (providerName, timestamp) => {
+  const providerHealthView = (providerName, timestamp, config) => {
     const entry = providerHealth.get(providerName)
     const circuit = providerCircuits.get(providerName)
-    const config = configRef()
     const rules = normalizeCircuitBreaker(config.circuitBreaker)
     const options = normalizeProviderHealth(config.providerHealth)
     const open = circuit?.state === 'open' && circuit.openUntil > timestamp
@@ -3006,7 +3121,21 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     // 429, after the retry delay. A fresh request still starts from the healthy
     // pool and gets the explicit exhausted response if there is none.
     const available = allowCooling && !cooling.length ? keys : cooling
-    const usable = available.filter((key) => keyWithinLimits(key, keyState(keyIdentity(key)), timestamp, estimatedTokens, imageCount))
+    // Compute the hard limit gate and the scheduling utilization once per key;
+    // both read the same rolling state and used to rescan every window twice.
+    const availability = available.map((key) => {
+      const id = keyIdentity(key)
+      const state = keyState(id)
+      return {
+        key,
+        id,
+        priority: key.priority ?? 0,
+        weight: key.weight ?? 1,
+        withinLimits: keyWithinLimits(key, state, timestamp, estimatedTokens, imageCount),
+        utilization: keyUtilization(key, state, timestamp, estimatedTokens, imageCount)
+      }
+    })
+    const usable = availability.filter((item) => item.withinLimits)
     if (!usable.length) {
       // Legacy "overflow" mode keeps the previous behaviour of using a key
       // anyway when every key is cooling or over limit. The default is a hard
@@ -3030,33 +3159,25 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
         rememberAffinity(chosen?.key)
         return { key: chosen?.key ?? null, overflow: true }
       }
-      const limited = available.length > 0 && available.every(
-        (key) => !keyWithinLimits(key, keyState(keyIdentity(key)), timestamp, estimatedTokens, imageCount)
-      )
+      const limited = availability.length > 0 && availability.every((item) => !item.withinLimits)
       return { key: null, exhausted: true, reason: limited ? 'limited' : 'cooling' }
     }
     if (bindingKey) {
       const binding = affinityBindings.get(bindingKey)
       if (binding) {
         const bound = binding.expiresAt > timestamp
-          ? usable.find((key) => keyIdentity(key) === binding.keyId)
+          ? usable.find((item) => item.id === binding.keyId)
           : null
         if (bound) {
           binding.expiresAt = timestamp + scheduler.cacheAffinityTtlMs
-          return { key: bound, affinity: true }
+          return { key: bound.key, affinity: true }
         }
         affinityBindings.delete(bindingKey)
       }
     }
     const chosen = selectScheduledKey({
       providerName: provider.name,
-      candidates: usable.map((key) => ({
-        key,
-        id: keyIdentity(key),
-        priority: key.priority ?? 0,
-        weight: key.weight ?? 1,
-        utilization: keyUtilization(key, keyState(keyIdentity(key)), timestamp, estimatedTokens, imageCount)
-      })),
+      candidates: usable.map(({ key, id, priority, weight, utilization }) => ({ key, id, priority, weight, utilization })),
       scheduler,
       state: schedulerState
     })
@@ -3136,7 +3257,7 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
   // Semantic cache embeddings: one explicit provider/model chosen in the panel,
   // called through the same key pool and header rules as chat traffic. Any
   // failure simply bypasses the semantic layer; exact caching still works.
-  async function embedCacheText(text, options, config) {
+  async function embedCacheText(text, options, config, vpn = '') {
     if (!text || !options.embeddingProvider || !options.embeddingModel) return null
     const provider = providersFor(config).find((item) => item.name === options.embeddingProvider)
     if (!provider) return null
@@ -3148,7 +3269,7 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     const headers = buildHeaders(provider, selection.key, incoming, 'openai')
     headers['content-type'] = 'application/json'
     try {
-      const response = await fetchFn(joinUpstreamUrl(endpointFor(provider, 'openai'), '/embeddings'), {
+      const response = await scopedFetch(vpn, config)(joinUpstreamUrl(endpointFor(provider, 'openai'), '/embeddings'), {
         method: 'POST',
         headers,
         body: JSON.stringify({ model: options.embeddingModel, input: text }),
@@ -3233,8 +3354,8 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     if (from === 'anthropic' && to === 'openai') return anthropicToOpenAI(body)
     if (from === 'openai' && to === 'anthropic') return openAIToAnthropic(body)
     if (from === 'responses' && to === 'openai') return responsesToOpenAI(body)
-    if (from === 'openai' && to === 'responses') return { ...body } // unsupported direct; handled via responses translator
-    if (from === 'anthropic' && to === 'responses') return { ...anthropicToOpenAI(body) }
+    if (from === 'openai' && to === 'responses') return openAIToResponses(body)
+    if (from === 'anthropic' && to === 'responses') return openAIToResponses(anthropicToOpenAI(body))
     if (from === 'responses' && to === 'anthropic') return openAIToAnthropic(responsesToOpenAI(body))
     return body
   }
@@ -3252,7 +3373,10 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     if (from === 'anthropic' && to === 'openai') return anthropicResponseToOpenAI(raw, model)
     if (from === 'openai' && to === 'responses') return openAIResponseToResponses(raw, model)
     if (from === 'anthropic' && to === 'responses') return openAIResponseToResponses(anthropicResponseToOpenAI(raw, model), model)
-    if (from === 'openai' && to === 'openai') return raw
+    if (from === 'responses') {
+      const openai = responsesResponseToOpenAI(raw, model)
+      return to === 'anthropic' ? openAIResponseToAnthropic(openai, model) : openai
+    }
     return raw
   }
 
@@ -3373,8 +3497,7 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
   // converts it to the client's protocol. Failures are returned as synthetic
   // error Responses (with .status / retry-after) so the router's existing
   // key-rotation and cooldown logic handles them like any other upstream.
-  async function webchatForwardOnce({ target, provider, clientProtocol, body, path, wantsStream, affinityKey }) {
-    const config = configRef()
+  async function webchatForwardOnce({ target, provider, clientProtocol, body, path, wantsStream, affinityKey, config }) {
     // Bound memory over a long-running gateway: evict idle web-chat sessions
     // periodically (cheap relative to an upstream call).
     if (++webchatRequestCount % 50 === 0) webchatSessions.sweepIdle()
@@ -3396,8 +3519,22 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     const selection = pickKey(provider, config, 0, 0, { model, affinity: affinityKey })
     const key = selection?.key
     if (!key) {
+      // Web-chat has no upstream HTTP call to produce an exhaustion signal, so
+      // surface the same structured scheduler result the normal path uses. The
+      // retry loop then emits the documented 420 / router_exhausted response
+      // (including Retry-After) instead of a generic upstream failure.
+      if (selection?.exhausted) {
+        const scheduler = normalizeScheduler(config.scheduler)
+        return {
+          error: {
+            status: scheduler.exhaustedStatus,
+            code: 'all_keys_exhausted',
+            message: `no usable credential for provider '${provider.name}' (${selection.reason === 'cooling' ? 'all keys are cooling down' : 'all keys are over their limits'})`
+          }
+        }
+      }
       const error = new Error(`no usable credential for provider '${provider.name}' (web-chat needs an auth secret)`)
-      error.status = selection?.exhausted ? 429 : 502
+      error.status = 502
       error.type = 'upstream_http_error'
       return buildWebChatErrorResponse(error)
     }
@@ -3412,9 +3549,10 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     const session = webchatSessions.getOrCreate(sessionKey)
     webchatSessions.prepareForPrompt(sessionKey) // roll over depth/TTL (resets id when stale)
 
+    const webFetch = scopedFetch(target.vpn, config)
     const transport = provider.transport === 'deepseek-web'
-      ? new DeepSeekWebTransport({ creds, fetchFn, solvePOW, now, log: onLog ?? (() => {}) })
-      : new QwenWebTransport({ creds, fetchFn, now, log: onLog ?? (() => {}) })
+      ? new DeepSeekWebTransport({ creds, fetchFn: webFetch, solvePOW, now, log: onLog ?? (() => {}) })
+      : new QwenWebTransport({ creds, fetchFn: webFetch, now, log: onLog ?? (() => {}) })
     const webchat = createRecoveredWebChat(createWebChatProvider(transport, { now }), { log: onLog ?? (() => {}) })
 
     try {
@@ -3453,15 +3591,15 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     }
   }
 
-  async function forwardOnce(target, clientProtocol, path, body, incoming, { rawBody, wantsStreamHint, allowCooling = false, affinityKey = '' } = {}) {
-    const config = configRef()
+  async function forwardOnce(target, clientProtocol, path, body, incoming, { rawBody, wantsStreamHint, allowCooling = false, affinityKey = '', config: passedConfig } = {}) {
+    const config = passedConfig ?? configRef()
     const provider = target.provider
     const responseProtocol = targetProtocol(provider, clientProtocol)
     const baseUrl = endpointFor(provider, responseProtocol)
     const chat = isChatPath(path)
     const wantsStream = wantsStreamHint ?? body?.stream === true
     if (isWebChatTransport(provider)) {
-      return webchatForwardOnce({ target, provider, clientProtocol, body, path, wantsStream, affinityKey })
+      return webchatForwardOnce({ target, provider, clientProtocol, body, path, wantsStream, affinityKey, config })
     }
     const geminiStreamUpstream = responseProtocol === 'gemini' && clientProtocol === 'gemini' && wantsStream === true
     let targetPath = path
@@ -3537,7 +3675,9 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     }
     // Providers with no configured keys are treated as keyless/pass-through at
     // the provider side; client gateway auth is still never forwarded upstream.
-    const upstreamRes = await fetchFn(url, {
+    // A route's VPN applies to the whole upstream exchange, including streams.
+    const upstreamFetch = scopedFetch(target.vpn, config)
+    const upstreamRes = await upstreamFetch(url, {
       method: incoming.method,
       headers,
       body: payload != null && (Buffer.isBuffer(payload) ? payload.length : String(payload).length) ? payload : undefined,
@@ -3549,9 +3689,11 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
   async function pipe(req, res) {
     const config = configRef()
     const chunks = []
+    let bodyBytes = 0
     for await (const chunk of req) {
       chunks.push(chunk)
-      if (chunks.reduce((n, c) => n + c.length, 0) > SIDECAR_MAX_BODY_BYTES) {
+      bodyBytes += chunk.length
+      if (bodyBytes > SIDECAR_MAX_BODY_BYTES) {
         res.writeHead(413, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ error: { message: 'request body too large' } }))
         return
@@ -3661,7 +3803,7 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     if (!chain.length) {
       const missingModel = !effectiveModel && chatRequest
       const status = missingModel ? 400 : 404
-      const entry = log({ upstream: null, resolvedProvider: null, route: routeName, requestModel: requestedModel, resolvedModel: effectiveModel, protocol: clientProtocol, stream: wantsStream, errorCode: missingModel ? 'model_required' : 'model_not_found', status, latencyMs: 0, attempts: [], error: missingModel ? 'no model specified' : 'no provider configured for model', requestBody: workingBody, requestHeaders: redactValue(req.headers) }, { config, status })
+      const entry = log({ upstream: null, resolvedProvider: null, route: routeName, vpn: vpnLabel(config, matchedRoute?.vpn), requestModel: requestedModel, resolvedModel: effectiveModel, protocol: clientProtocol, stream: wantsStream, errorCode: missingModel ? 'model_required' : 'model_not_found', status, latencyMs: 0, attempts: [], error: missingModel ? 'no model specified' : 'no provider configured for model', requestBody: workingBody, requestHeaders: redactValue(req.headers) }, { config, status })
       res.writeHead(status, { 'content-type': 'application/json' })
       res.end(JSON.stringify({
         error: missingModel
@@ -3755,7 +3897,7 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     const cacheBypassed = !cachePlan && cacheOptions.enabled
       && String(headers['x-router-cache'] ?? '').toLowerCase() === 'off'
     if (cachePlan && !cached && cacheOptions.mode === 'semantic' && cachePlan.promptText) {
-      cacheVector = await embedCacheText(cachePlan.promptText, cacheOptions, config)
+      cacheVector = await embedCacheText(cachePlan.promptText, cacheOptions, config, cachePlan.target?.vpn)
       if (cacheVector) {
         cached = responseCache.findSemantic(cachePlan.scope, cacheVector, cacheOptions.threshold, cacheOptions.maxEntries, cachePlan.paramsKey)
         if (cached) cacheHitKind = 'semantic-hit'
@@ -3878,9 +4020,9 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
         const started = now()
         try {
           const forwarded = await forwardOnce(
-            { provider: target.provider, model: target.model },
+            { provider: target.provider, model: target.model, vpn: target.vpn },
             clientProtocol, path, attemptBody, req,
-            { rawBody, wantsStreamHint: wantsStream, allowCooling: attempt > 0 && lastStatus === 429, affinityKey }
+            { rawBody, wantsStreamHint: wantsStream, allowCooling: attempt > 0 && lastStatus === 429, affinityKey, config }
           )
           if (forwarded?.error) {
             const errorStatus = forwarded.error.status ?? 502
@@ -3963,6 +4105,7 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
             resolvedProvider: target.provider.name,
             credential: key?.id ?? null,
             route: routeName,
+            vpn: vpnLabel(config, target.vpn),
             requestModel: requestedModel,
             resolvedModel: forwardedModel,
             model: forwardedModel,
@@ -4057,7 +4200,7 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     if (attempts.length > 0 && routeName) {
       stats.routeFailovers[routeName] = (stats.routeFailovers[routeName] ?? 0) + 1
     }
-    log({ upstream: null, resolvedProvider: null, route: routeName, requestModel: requestedModel, resolvedModel: effectiveModel, protocol: clientProtocol, stream: wantsStream, failedOver: attempts.length > 0, errorCode: allExhausted ? 'all_keys_exhausted' : allCircuitOpen ? 'provider_circuit_open' : 'upstream_failed', status: finalStatus, latencyMs: now() - startedTotal, attempts, failures, error: allExhausted ? 'all keys exhausted' : allCircuitOpen ? 'all providers circuit-open' : lastErrorBody ? 'upstream failed' : 'all providers failed', compression: compressionInfo, relay: relayUsed ? relayInfo : null, cache: cachePlan ? (relayUsed ? 'bypass' : 'miss') : null, requestBody: routedBody, requestHeaders: redactValue(req.headers), responseBody: finalError }, { config, status: finalStatus })
+    log({ upstream: null, resolvedProvider: null, route: routeName, vpn: vpnLabel(config, chain[0]?.vpn), requestModel: requestedModel, resolvedModel: effectiveModel, protocol: clientProtocol, stream: wantsStream, failedOver: attempts.length > 0, errorCode: allExhausted ? 'all_keys_exhausted' : allCircuitOpen ? 'provider_circuit_open' : 'upstream_failed', status: finalStatus, latencyMs: now() - startedTotal, attempts, failures, error: allExhausted ? 'all keys exhausted' : allCircuitOpen ? 'all providers circuit-open' : lastErrorBody ? 'upstream failed' : 'all providers failed', compression: compressionInfo, relay: relayUsed ? relayInfo : null, cache: cachePlan ? (relayUsed ? 'bypass' : 'miss') : null, requestBody: routedBody, requestHeaders: redactValue(req.headers), responseBody: finalError }, { config, status: finalStatus })
     const responseHeaders = {
       'content-type': 'application/json',
       'x-router-fallback-attempts': String(attempts.length),
@@ -4093,7 +4236,7 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
       }))
       return
     }
-    res.end(JSON.stringify({ error: { message: finalError ? safeJsonPreview(finalError) : `all providers failed (${attempts.join(', ')})`, attempts } }))
+    res.end(JSON.stringify({ error: { message: finalError ? String(finalError).slice(0, 2000) : `all providers failed (${attempts.join(', ')})`, attempts } }))
   }
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -4114,10 +4257,6 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     if (headerDelay > 0) return Math.min(30_000, headerDelay)
     return Math.min(30_000, (base ?? 200) * 2 ** attempt)
   }
-  function safeJsonPreview(text) {
-    try { JSON.parse(text); return text.slice(0, 2000) } catch { return text.slice(0, 2000) }
-  }
-
   const configRef = () => normalizeConfig(getConfig())
 
   async function streamResponse(upstreamRes, responseProtocol, clientProtocol, res, model, bufferForStream, provider, key, entry, { config, routingHeaders, chatRequest = true, wantsStream = false } = {}) {
@@ -4336,7 +4475,7 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
           // The Add-provider dialog's Web chat mode finds its provider by this
           // field; without it the UI looks unchanged after setup().
           transport: p.transport,
-          health: providerHealthView(p.name, timestamp),
+          health: providerHealthView(p.name, timestamp, config),
           usageSource: Boolean((resolveUsageFetch(p)?.connectors ?? []).length),
           keyUsage: (p.keys ?? []).map((key) => {
             const until = keyCooldowns.get(keyIdentity(key)) ?? 0
@@ -4673,32 +4812,4 @@ export async function probeProviderUsage(provider, { getSecret, fetchImpl, secre
     }
   }
   return { ok: false, reason: 'not-found', meters: [], errors: [], secretKey: resolvedKey, tried }
-}
-
-export async function discoverProviderModels(provider, { getSecret, fetchImpl } = {}) {
-  // Web-chat transports have no /v1/models endpoint; the catalog is static.
-  if (isWebChatTransport(provider)) {
-    return { provider: provider.name, models: webchatCatalog(provider).map((m) => m.id), status: 200 }
-  }
-  const fetchFn = fetchImpl ?? globalThis.fetch
-  const key = (provider.keys ?? []).map((entry) => getSecret?.(entry.secretKey)).find(Boolean)
-  const baseUrl = provider.baseUrl
-  const attempts = []
-  for (const candidate of [baseUrl, baseUrl?.replace(/\/v1$/, '')]) {
-    if (!candidate) continue
-    attempts.push(`${candidate}/v1/models`)
-  }
-  let last = null
-  for (const url of attempts) {
-    try {
-      const res = await fetchFn(url, { headers: key ? { authorization: `Bearer ${key}` } : {}, signal: AbortSignal.timeout(8000) })
-      if (!res.ok) { last = new Error(`${url} returned ${res.status}`); continue }
-      const json = await res.json().catch(() => ({}))
-      const models = (json.data ?? json.models ?? []).map((model) => String(model.id ?? model.name ?? '')).filter(Boolean)
-      return { provider: provider.name, models, status: res.status }
-    } catch (error) {
-      last = error
-    }
-  }
-  throw last ?? new Error('model discovery failed')
 }

@@ -5,6 +5,8 @@ import test from 'node:test'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { createServer } from 'node:http'
+import { connect as netConnect } from 'node:net'
 import {
   applyCodexGlobal,
   buildCodexManagedConfig,
@@ -25,15 +27,12 @@ import {
   decryptOmniRouteCredential,
   mergeRouterConfigs,
   detectAndConvertConfig,
-  readSqliteConfig,
-  detectLocalRouterConfigs,
   createSidecar,
   deriveAffinityKey,
   fetchProviderUsage,
   probeProviderUsage,
   resolveUsageFetch,
   safeCaptureBody,
-  truncateText,
   geminiResponseToOpenAI,
   joinUpstreamUrl,
   matchRoute,
@@ -48,7 +47,8 @@ import {
   resolveAgentProfile,
   resolveChain,
   buildChainFromFallback,
-  responsesToOpenAI
+  responsesToOpenAI,
+  openAIToResponses
 } from '../worker/sidecar.mjs'
 import {
   createSchedulerState,
@@ -293,6 +293,32 @@ test('responsesToOpenAI maps Codex custom tools and custom tool history', () => 
     tool_call_id: 'call-1',
     content: 'done'
   })
+})
+
+test('openAIToResponses maps chat messages, tools and reasoning to the Responses shape', () => {
+  const translated = openAIToResponses({
+    model: 'm',
+    messages: [
+      { role: 'system', content: 'be brief' },
+      { role: 'user', content: 'read a file' },
+      { role: 'assistant', content: null, tool_calls: [{ id: 'call-1', type: 'function', function: { name: 'shell', arguments: '{"cmd":"ls"}' } }] },
+      { role: 'tool', tool_call_id: 'call-1', content: 'ok' }
+    ],
+    tools: [{ type: 'function', function: { name: 'shell', description: 'run', parameters: { type: 'object' } } }],
+    tool_choice: 'auto',
+    max_tokens: 512,
+    temperature: 0.2,
+    reasoning_effort: 'low'
+  })
+  assert.equal(translated.instructions, 'be brief')
+  assert.equal(translated.input[0].content[0].text, 'read a file')
+  assert.deepEqual(translated.input[1], { type: 'function_call', call_id: 'call-1', name: 'shell', arguments: '{"cmd":"ls"}' })
+  assert.deepEqual(translated.input[2], { type: 'function_call_output', call_id: 'call-1', output: 'ok' })
+  assert.deepEqual(translated.tools, [{ type: 'function', name: 'shell', description: 'run', parameters: { type: 'object' } }])
+  assert.equal(translated.tool_choice, 'auto')
+  assert.equal(translated.max_output_tokens, 512)
+  assert.equal(translated.reasoning.effort, 'low')
+  assert.equal(translated.messages, undefined, 'chat-shaped fields must not leak into the Responses body')
 })
 
 test('openAIResponseToResponses restores a custom apply_patch call', () => {
@@ -1195,6 +1221,43 @@ test('normalizes Codex grammar custom tools for a third-party responses provider
     })
     assert.equal(res.status, 200)
     assert.equal(seen.tools[0].format.type, 'grammar')
+  })
+})
+
+test('chat completions sent to a responses-only provider translate both request and response', async () => {
+  const config = testConfig({
+    providers: [{
+      name: 'responses',
+      baseUrl: 'https://responses.example.test/v1',
+      protocols: ['responses'],
+      models: [{ id: 'm' }],
+      keys: []
+    }],
+    defaultModel: 'responses/m'
+  })
+  let seen
+  await withSidecar(config, async (url, init) => {
+    seen = { url, body: JSON.parse(init.body) }
+    return new Response(JSON.stringify({
+      id: 'resp_1',
+      object: 'response',
+      status: 'completed',
+      output: [{ type: 'message', id: 'msg_1', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: 'hello' }] }],
+      usage: { input_tokens: 7, output_tokens: 3 }
+    }), { status: 200, headers: { 'content-type': 'application/json' } })
+  }, async (base) => {
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'responses/m', messages: [{ role: 'user', content: 'hi' }] })
+    })
+    assert.equal(res.status, 200)
+    assert.match(seen.url, /\/v1\/responses$/)
+    assert.equal(seen.body.input[0].content[0].text, 'hi')
+    assert.equal(seen.body.messages, undefined)
+    const payload = await res.json()
+    assert.equal(payload.choices[0].message.content, 'hello')
+    assert.equal(payload.usage.prompt_tokens, 7)
   })
 })
 
@@ -3554,4 +3617,94 @@ test('compression leaves a bare Responses input string and instructions alone by
   assert.equal(result.body, body)
   assert.equal(body.input, input)
   assert.equal(body.instructions, 'system instructions')
+})
+
+test('normalizeConfig keeps valid route VPN references and drops dangling ones', () => {
+  const servers = [
+    { id: 'vpn-a', name: 'Home', type: 'socks5', host: '127.0.0.1', port: 1080 },
+    { id: 'vpn-b', name: 'Off', type: 'http', host: '127.0.0.1', port: 8080, enabled: false }
+  ]
+  const config = testConfig({
+    vpnServers: servers,
+    routes: [
+      { name: 'via-a', targets: [{ provider: 'deepseek', model: 'deepseek-chat' }], vpn: 'vpn-a' },
+      { name: 'via-off', targets: [{ provider: 'deepseek', model: 'deepseek-chat' }], vpn: 'vpn-b' },
+      { name: 'via-missing', targets: [{ provider: 'deepseek', model: 'deepseek-chat' }], vpn: 'nope' }
+    ]
+  })
+  assert.deepEqual(config.vpnServers.map((s) => s.id), ['vpn-a', 'vpn-b'])
+  assert.equal(config.routes.find((r) => r.name === 'via-a').vpn, 'vpn-a')
+  // Disabled and unknown servers degrade to a direct connection.
+  assert.equal(config.routes.find((r) => r.name === 'via-off').vpn, undefined)
+  assert.equal(config.routes.find((r) => r.name === 'via-missing').vpn, undefined)
+  assert.deepEqual(buildChainFromFallback(config, 'via-a', null)[0].vpn, 'vpn-a')
+})
+
+test('a route VPN tunnels upstream calls while other routes stay direct', async () => {
+  const upstream = createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ id: 'r', choices: [{ message: { content: 'ok' } }], usage: { prompt_tokens: 1, completion_tokens: 1 } }))
+  })
+  await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve))
+  const upstreamPort = upstream.address().port
+  const tunnels = []
+  const proxy = createServer()
+  proxy.on('connect', (req, client, head) => {
+    tunnels.push(req.url)
+    const [host, port] = req.url.split(':')
+    const target = netConnect(Number(port), host, () => {
+      client.write('HTTP/1.1 200 Connection Established\r\n\r\n')
+      if (head?.length) client.write(head)
+      target.pipe(client)
+      client.pipe(target)
+    })
+    target.on('error', () => client.destroy())
+  })
+  await new Promise((resolve) => proxy.listen(0, '127.0.0.1', resolve))
+  const config = testConfig({
+    providers: [{ ...deepseekProvider, baseUrl: `http://127.0.0.1:${upstreamPort}` }],
+    vpnServers: [{ id: 'vpn-a', name: 'Home VPN', type: 'http', host: '127.0.0.1', port: proxy.address().port }],
+    routes: [
+      { name: 'vpn-route', targets: [{ provider: 'deepseek', model: 'deepseek-chat' }], strategy: 'ordered', vpn: 'vpn-a' },
+      { name: 'direct-route', targets: [{ provider: 'deepseek', model: 'deepseek-chat' }], strategy: 'ordered' }
+    ]
+  })
+  let directCalls = 0
+  const fetchImpl = (url, init) => { directCalls++; return fetch(url, init) }
+  try {
+    await withSidecar(config, fetchImpl, async (base, sidecar) => {
+      const call = (model) => fetch(`${base}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }] })
+      })
+      assert.equal((await call('vpn-route')).status, 200)
+      assert.equal(directCalls, 0, 'the VPN route never calls native fetch directly')
+      assert.deepEqual(tunnels, [`127.0.0.1:${upstreamPort}`])
+      assert.equal(sidecar.logs[0].vpn, 'Home VPN')
+      assert.equal((await call('direct-route')).status, 200)
+      assert.equal(directCalls, 1, 'a route without a VPN stays direct')
+      assert.equal(sidecar.logs[1].vpn, null)
+    })
+  } finally {
+    await new Promise((resolve) => proxy.close(resolve))
+    await new Promise((resolve) => upstream.close(resolve))
+  }
+})
+
+test('normalizeConfig seeds one sample VPN server only when none were configured', () => {
+  const fresh = normalizeConfig({})
+  assert.equal(fresh.vpnServers.length, 1)
+  assert.equal(fresh.vpnServers[0].id, 'sample-us-proxy')
+  assert.equal(fresh.vpnServers[0].host, '47.85.161.37')
+  // The sample is never attached to a route automatically.
+  assert.equal(fresh.routes.length, 0)
+  // An existing config with an empty list also gets the one-time sample.
+  const stale = testConfig({ vpnServers: [] })
+  assert.equal(stale.vpnServers.length, 1)
+  assert.equal(stale.vpnServers[0].id, 'sample-us-proxy')
+  assert.equal(stale.vpnSampleDismissed, true)
+  // Removing the last server opts out permanently.
+  const cleared = testConfig({ vpnServers: [], vpnSampleDismissed: true })
+  assert.deepEqual(cleared.vpnServers, [])
 })

@@ -1,221 +1,270 @@
-# Orca LLM Router — Official Orca Marketplace Listing & Promotion Pack
+# Orca LLM Router — Marketplace Listing & Marketing Showcase
 
-[![Orca Plugin](https://img.shields.io/badge/Orca%20Plugin-v1.1.0-6366f1.svg)](https://onorca.dev/plugins)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Zero Telemetry](https://img.shields.io/badge/Privacy-Zero%20Telemetry-green.svg)](#privacy--security)
+[![Orca Plugin Directory](https://img.shields.io/badge/Orca%20Plugin-Install%20on%20orca.dev-6366f1?style=for-the-badge&logo=orca)](https://orca.dev/plugins/addisflava/orca-llm-router)
+[![Version: 1.1.0](https://img.shields.io/badge/Version-1.1.0-blue?style=for-the-badge)](package.json)
+[![Providers: 34+](https://img.shields.io/badge/Providers-34%2B%20Presets-success?style=for-the-badge)](#supported-providers)
+[![Agents: 45+](https://img.shields.io/badge/Agents-45%2B%20Supported-purple?style=for-the-badge)](#supported-coding-agents)
+[![Free Web Chat](https://img.shields.io/badge/Free%20Web%20Chat-DeepSeek%20%7C%20Qwen-emerald?style=for-the-badge)](#free-web-chat-transports-)
+[![Privacy](https://img.shields.io/badge/Privacy-100%25%20Localhost-green?style=for-the-badge)](#privacy--security)
+
+> 📦 **Official Orca Plugin Listing:** [https://orca.dev/plugins/addisflava/orca-llm-router](https://orca.dev/plugins/addisflava/orca-llm-router)
 
 ![Orca LLM Router Cover](assets/cover.jpg)
 
 ---
 
-## Part 1: Marketplace Metadata & Fast Copy
+## The Ultimate LLM Gateway for Orca
 
-### One-Sentence Hook (Elevator Pitch)
-> **Use all your subscriptions, API credits, and free web models across any coding agent in Orca — with zero-config auto-wiring, weighted rotation, and resilient cross-provider failover.**
+### Never let rate limits or provider outages kill your agent workflows again.
 
-### Short Description (Search / Modal Card — 75 words)
-> Stop getting blocked by provider rate limits mid-task. Orca LLM Router runs a lightweight, zero-dependency local gateway (`127.0.0.1:18080`) that bridges 45+ coding agents (Claude Code, Codex, OpenCode, Cursor, Pi, and more) to 34+ model providers. Features multi-key credential pools with smooth weighted rotation, resilient cross-provider failover, native web-chat transports for free DeepSeek and Qwen web subscriptions, and opt-in token compression. Your keys stay encrypted in Orca’s vault.
+When you run autonomous coding agents like **Claude Code**, **OpenAI Codex**, or **OpenCode**, hitting an upstream `429 Too Many Requests`, a `503 Service Unavailable`, or a sudden key exhaustion means your entire coding workflow grinds to a halt.
 
-### Marketplace Tags
-`developer-tools` `ai-agents` `llm-gateway` `rate-limiting` `failover` `claude-code` `codex` `opencode` `deepseek` `token-optimization`
+**Orca LLM Router** gives you a single local endpoint (`127.0.0.1:18080`) that connects every coding agent in Orca to all your AI subscriptions, API keys, free web models, and local servers. It translates between protocols on the fly, balances traffic across multi-key pools, and automatically fails over to backup providers when an upstream rate-limits or goes down.
 
 ---
 
-## Part 2: Marketplace Listing (Long-Form Storefront)
+## Why You Need Orca LLM Router
 
-# Orca LLM Router
-
-### Never let an upstream rate limit or API outage kill an agent run again.
-
-When you run autonomous coding agents like **Claude Code**, **OpenAI Codex**, or **OpenCode**, hitting an upstream `429 Too Many Requests`, a `503 Service Unavailable`, or a sudden key exhaustion means your entire coding workflow grinds to a halt. 
-
-**Orca LLM Router** eliminates provider bottlenecks by introducing a resilient, Orca-native local gateway that aggregates all your AI subscriptions, API credits, and local models into one unified endpoint.
-
----
-
-### The Daily Pain vs. The Orca LLM Router Solution
-
-| The Daily Frustration | What Orca LLM Router Does |
+| The Frustration | What Orca LLM Router Does For You |
 |---|---|
-| **Rate limits kill your agent mid-task** | Routes automatically retry and fail over across alternative providers or models. Your agent session continues uninterrupted. |
-| **Paid subscriptions sit idle while API keys burn** | One endpoint drains all your subscriptions, token plans, and API credits with smooth, weighted rotation. |
-| **API keys scattered across dotfiles & repos** | Every credential is saved in Orca’s encrypted secret vault; configs and logs only ever reference friendly key names. |
-| **Every agent requires conflicting configs** | An Orca launch hook injects the gateway configuration per agent session with zero dotfile overwrites. |
-| **Multi-key rotation busts prompt caching** | Cache affinity pins sessions to the same credential and preserves upstream prompt caching headers (`anthropic-beta`). |
-| **Provider outages stall the entire IDE** | Provider circuit breakers, exponential backoff, and explicit `420 router_exhausted` route around bad upstreams. |
+| **Your agent crashes mid-task when a provider hits 429 rate limits** | **Zero-Downtime Auto-Failover**: Routes instantly retry on alternative providers or models. Your agent session keeps working seamlessly. |
+| **Paid subscriptions sit idle while expensive API credits burn** | **Multi-Provider Pooling**: Combine subscriptions, coding plans, and pay-as-you-go keys behind one endpoint with weighted rotation. |
+| **Free web chat subscriptions (DeepSeek, Qwen) can't be used in terminal agents** | **Native Web Chat Transports**: 1-click Chrome login drives free DeepSeek Web and Qwen Web accounts as standard API models. |
+| **Scattered API keys across bash profiles, dotfiles, and git repos** | **Encrypted Vault Storage**: All credentials stay safely in Orca’s encrypted secret store. Configs and logs only ever show key names. |
+| **Every coding tool demands conflicting configs and base URLs** | **Zero-Config Agent Injection**: One-click toggles automatically wire Claude Code, Codex, OpenCode, Cursor, and 40+ others. |
+| **Key rotation wipes out upstream prompt caches** | **Prompt Cache Affinity**: Sessions stay pinned to the same credential to keep Anthropic and Gemini prompt caches hot and cheap (saving up to 90%). |
+| **Inference costs balloon from repetitive queries and bloated context** | **Intelligent Token Optimization**: Strip whitespace/ANSI junk, condense old turns on failover, and replay identical responses from a local cache. |
 
 ---
 
-## Visual Feature Gallery
+## 4-Tier Intelligent Fallback Architecture
 
-### 1. Live Gateway Overview & Telemetry
-Monitor real-time token throughput (input/output), average latency, active requests, cost tracking, and endpoint addresses at a single glance.
+Inspired by enterprise AI gateways, Orca LLM Router lets you build tiered fallback chains that slash your token bills while guaranteeing 100% agent uptime:
 
+```text
+┌─────────────────────────────────────────────────────────────┐
+│  Tier 1: Free Web Accounts (DeepSeek Web, Qwen Web)         │ ──► $0 Cost
+└──────────────────────────────┬──────────────────────────────┘
+                               │ (on rate-limit or outage)
+┌──────────────────────────────▼──────────────────────────────┐
+│  Tier 2: Flat-Rate Subscriptions & Coding Plans             │ ──► Zero Incremental Bill
+│  (OpenCode Go, Xiaomi MiMo, Kimi Coding Plans)              │
+└──────────────────────────────┬──────────────────────────────┘
+                               │ (on quota exhaustion)
+┌──────────────────────────────▼──────────────────────────────┐
+│  Tier 3: Pay-As-You-Go Fast Models (API Keys)               │ ──► Maximum Speed
+│  (DeepSeek API, Gemini 2.5 Flash, Claude 3.5 Sonnet)        │
+└──────────────────────────────┬──────────────────────────────┘
+                               │ (on network failure / offline)
+┌──────────────────────────────▼──────────────────────────────┐
+│  Tier 4: Local & Self-Hosted Fallback (Ollama, LM Studio)   │ ──► 100% Offline & Private
+└─────────────────────────────────────────────────────────────┘
+```
+
+When an upstream returns a `429 Too Many Requests`, a `503 Service Unavailable`, or an unexpected timeout, your coding agent doesn't stop or discard its context. The router steps down or shifts sideways to the next healthy provider automatically!
+
+---
+
+## Key Features & Advantages
+
+### 🔄 Resilient Cross-Provider Failover
+Define friendly model aliases (like `smart`, `fast`, or `coding`) backed by an ordered list or fastest-healthy-first ranking of backup providers. If DeepSeek is overloaded, traffic instantly reroutes to OpenRouter, Claude, or Gemini without dropping your turn.
+
+### ⚡ Free Web-Chat Transports (DeepSeek & Qwen)
+Turn your free web subscriptions into high-speed coding backends. With a 1-click Chrome login, Orca LLM Router captures your authenticated browser session and handles conversation chaining, anti-bot cookie rotation, and error recovery automatically.
+
+### 🔑 Multi-Key Credential Pools & Smart Scheduling
+Add multiple API keys per provider. Distribute requests with weighted round-robin scheduling, assign priority tiers so backup keys stay idle until needed, and let cooling keys rest automatically when they hit rate limits.
+
+### 🌐 Universal Protocol & Reasoning Translation
+Point Claude Code at DeepSeek, Codex at Claude, or OpenCode at Gemini with zero configuration. Orca LLM Router seamlessly converts between Anthropic Messages, OpenAI Chat Completions, OpenAI Responses, and Google Gemini APIs—including real-time streaming and extended thinking budgets.
+
+### 📊 Real-Time Telemetry & Failover Proof
+Watch your gateway in action with live metrics: active requests, token throughput, average latency, cost savings, and a searchable request log that proves when backup providers stepped in to save a failed request.
+
+### 🔒 100% Local & Private
+Runs exclusively on your local machine (`127.0.0.1:18080`). All keys are secured in Orca’s encrypted vault. Zero external telemetry, zero tracking, and zero secret leakage.
+
+---
+
+## Visual Tour: See It In Action
+
+### 1. Live Gateway Dashboard & Telemetry
+Monitor real-time token throughput (input/output), average latency, active requests, cost tracking, and copy-ready agent endpoint addresses at a glance:
 [![Gateway Overview](assets/screenshot-overview.png)](assets/screenshot-overview.png)
 
 ### 2. Smart Cross-Provider Routing
-Map friendly, unified model aliases (like `smart`, `fast`, or `deepseek-rout`) to multi-provider fallback chains. Rank by **fastest-healthy-first** or strict custom sequence with configurable retries per hop.
-
+Map model names agents send to multi-provider fallback chains. Rank by **fastest-healthy-first** or strict order, with real-time failover counters showing your backups in action:
 [![Smart Routing](assets/screenshot-routing.png)](assets/screenshot-routing.png)
 
-### 3. Real-World Failover Telemetry & Live Logs
-Proof that auto-failover saves your work: search and filter live logs (`provider=openrouter AND status=529`). Watch 10-attempt retry sequences route around upstream 503s to land smoothly on a healthy key with a `200 OK`.
-
+### 3. Real-World Auto-Failover in Action
+Proof that failover saves your workflow: watch a 10-attempt retry chain automatically route around upstream 503/429 errors to land smoothly on a healthy key with a `200 OK`:
 [![Live Request Logs](assets/screenshot-logs.png)](assets/screenshot-logs.png)
 
-### 4. Interactive Route Target Builder
-Search across 360+ discovered models from any connected provider. Multi-select backup models and drag-and-drop or use arrow controls to tune your fallback priority.
-
+### 4. Visual Route Target Builder
+Search across 360+ discovered models from any connected provider. Multi-select backup models and drag-and-drop or use arrow controls to tune your fallback priority:
 [![Visual Route Builder](assets/screenshot-targets.png)](assets/screenshot-targets.png)
 
 ### 5. Multi-Key Credential Pools & Quota Scrapers
-Add multiple API keys per provider with weighted round-robin distribution and priority tiers. Track 24-hour request/token meters with built-in quota scrapers and one-click balance probing.
-
+Add multiple API keys per provider with weighted rotation, priority tiers, individual key toggles, and rolling 24-hour request/token meters:
 [![Providers & Keys](assets/screenshot-providers.png)](assets/screenshot-providers.png)
 
 ### 6. 45+ Supported Coding Agents Out-of-the-Box
-Toggle routing per agent with a single click. Claude Code, Codex, OpenCode, Cursor, Cline, Pi, Kimi, and dozens more connect automatically without manual terminal flags.
-
+Toggle routing per agent with a single click. Claude Code, Codex, OpenCode, Cursor, Cline, Pi, Kimi, and dozens more connect automatically without manual terminal flags:
 [![Coding Agents](assets/screenshot-agents.png)](assets/screenshot-agents.png)
 
 ### 7. Opt-In Token Optimization
-Cut down context bloat and speed up inference. Opt into whitespace and ANSI prompt compression, deterministic one-line failover context relay, and local exact/semantic response caching.
-
+Cut down context bloat and speed up responses with prompt whitespace/ANSI compression, one-line handoff digests on failover, and local exact/semantic response caching:
 [![Request Optimization](assets/screenshot-optimization.png)](assets/screenshot-optimization.png)
 
 ---
 
-## Breakthrough Feature: Free Web-Chat Transports ⚡
+## How to Use Orca LLM Router (Quick Start)
+
+### Step 1: Open the Router Panel
+Click the **Orca LLM Router** icon in Orca's sidebar. The gateway starts automatically on `127.0.0.1:18080`.
+
+### Step 2: Add Your Providers
+- **API Keys**: Go to **Providers → Add provider**, choose any of the **34 built-in presets** (OpenAI, Anthropic, Gemini, OpenRouter, etc.), and paste your API key.
+- **Free Web Chat**: In **Add provider**, select **Web chat** and click **Add as a provider** for DeepSeek Web or Qwen Web. Log in through the opened browser window once—your credentials are encrypted and stored automatically.
+- **Local Models**: Add Ollama, LM Studio, or vLLM as a custom endpoint.
+
+### Step 3: Create a Smart Route (Optional)
+Under the **Routing** tab, click **New route**:
+1. Name the route (e.g. `coding` or `smart`).
+2. Search and check your preferred primary model and backup models from any provider.
+3. Choose your sequence: **Fastest available first** (recommended) or **In the order selected**.
+4. Save the route. Your agents can now use this single route name!
+
+### Step 4: Run Any Agent
+Launch your favorite coding agent in Orca (`claude`, `codex`, `opencode`, etc.). It connects to the gateway automatically—no setup required.
+
+---
+
+## Free Web-Chat Transports ⚡
 
 Why pay for API tokens when your existing web subscriptions are unlimited?
 
 Orca LLM Router includes **native web-chat transports** for **DeepSeek Web** (`chat.deepseek.com`) and **Qwen Web** (`chat.qwen.ai`):
-- **Direct Web Driving**: The gateway interacts directly with the provider web interfaces—no external servers, no third-party proxies.
-- **1-Click Browser Authentication**: Connects to Chrome via Chrome DevTools Protocol (CDP) to capture session tokens and anti-bot cookies directly into Orca's encrypted vault. Manual JSON paste fallback supported.
+- **Direct Driving**: The router interacts directly with the web platform—no external servers or third-party proxies needed.
+- **1-Click Browser Authentication**: Opens Chrome to capture session tokens and anti-bot cookies directly into Orca's encrypted vault. Manual JSON paste is also supported.
 - **Full Conversation Management**: Supports multi-turn session chaining, automatic context-overflow resets, and empty-response retry logic.
-- **Agent Compatible**: Your agents send standard OpenAI API completions; the router translates them to and from web-chat SSE streams transparently.
+- **Standard API Output**: Your coding agents send standard requests and receive clean streaming responses just like a paid API.
 
 ---
 
-## Comprehensive Provider Matrix
+## Supported Providers
 
-**34 pre-configured presets** plus custom endpoint support:
+**34 built-in presets**, plus unlimited custom endpoints and local servers:
 
-- **Flagship Providers**: OpenAI, Anthropic, Google Gemini (AI Studio), OpenRouter, DeepSeek, NVIDIA NIM.
-- **Free Web Subscriptions**: DeepSeek Web (`chat.deepseek.com`), Qwen Web (`chat.qwen.ai`).
-- **Coding & Regional Plans**: OpenCode Go, Xiaomi MiMo (Global, China, Singapore, Europe Token Plans), Kimi Code (Moonshot), Zhipu AI / Z.AI (General & Coding Plans), MiniMax (Global & China), Alibaba Bailian (DashScope), SiliconFlow.
-- **Alternative & Aggregator Endpoints**: Mistral AI, Qiniu AI, Fenno.ai, Infistar, RunAPI, TeamoRouter, Unity2.Ai, code0.ai, claudeapi, Y-API.
-- **Local & Self-Hosted**: Ollama, vLLM, LM Studio, LocalAI, or any standard OpenAI-, Anthropic-, or Gemini-compatible server.
+| Provider | Supported Protocols | Type |
+|---|---|---|
+| **OpenAI** | `openai`, `responses` | API Key / Subscription |
+| **Anthropic** | `anthropic` | API Key / Subscription |
+| **Google Gemini (AI Studio)** | `gemini` | API Key |
+| **OpenRouter** | `openai`, `responses` | Aggregator |
+| **NVIDIA NIM** | `openai` | API Key |
+| **OpenCode Go** | `openai`, `responses`, `anthropic` | Coding Plan |
+| **DeepSeek** | `openai` | API Key |
+| <img src="assets/deepseek-web.png" width="16" height="16" alt="DeepSeek" /> **DeepSeek Web** ⚡ | `openai` | **Free Web Subscription** |
+| <img src="assets/qwen-web.png" width="16" height="16" alt="Qwen" /> **Qwen Web** ⚡ | `openai` | **Free Web Subscription** |
+| **Xiaomi MiMo & Regional Plans** | `openai`, `responses` | China, Singapore, Europe Plans |
+| **Kimi Code (Moonshot)** | `openai` | Coding Plan / API Key |
+| **Zhipu AI & Z.AI** | `openai` | General & Coding Plans |
+| **MiniMax** | `openai` | Global & China Endpoints |
+| **Mistral AI** | `openai` | API Key |
+| **SiliconFlow** | `openai` | Aggregator |
+| **Alibaba Bailian** | `openai` | DashScope Compatible |
+| **Qiniu, Fenno, Infistar, RunAPI** | `openai`, `anthropic` | Specialized Endpoints |
+| **Local Models (Ollama, LM Studio, vLLM)** | `openai`, `anthropic`, `gemini` | Self-Hosted / Localhost |
 
 ---
 
-## Zero-Friction Agent Integration
+## Supported Coding Agents
 
-Orca LLM Router intercepts agent launches via Orca’s `agent.launch.before` lifecycle hook:
-- **Claude Code**: Injects Anthropic-compatible base URL and model mappings (`/model` selects gateway routes).
-- **OpenAI Codex**: Dynamically injects model catalog JSON and publishes managed configuration blocks.
-- **OpenCode**: Publishes standalone gateway configuration for instant connection.
-- **Cursor, Cline, Aider, Pi, & 40+ others**: Seamlessly route through the local gateway with isolated per-session environments.
+Orca LLM Router supports **45+ AI agents** out-of-the-box with individual toggles in the **Agents** tab:
+
+- **Terminal & Autonomous Agents**: Claude Code, Claude Agent Teams, OpenAI Codex, OpenCode, OpenCode 2, Pi, Devin, CodeBuddy, Aider, Goose, Amp, Charm, Hermes, Freebuff.
+- **Editor & IDE Extensions**: Cursor, Cline, Kilocode, Kiro, GitHub Copilot, Continue.
+- **Specialized Assistants**: Gemini CLI, Antigravity, Qwen Code, Kimi, Grok, Mistral Vibe, MiMo Code, Muse.
+
+---
+
+## Opt-In Request Optimization
+
+Save tokens, cut costs, and boost inference speed with three optional optimizations in **Settings → Request optimization**:
+
+1. **Prompt Compression**: Safely trims trailing whitespace, repeated blank lines, and ANSI terminal codes from older tool outputs without touching code blocks, JSON payloads, or recent turns.
+2. **Failover Context Relay**: When switching to a backup provider mid-session, condenses older turns into deterministic one-line handoff digests so the new provider gets clear context without extra summarization latency.
+3. **Response Cache**: Replays exact or semantically similar successful responses locally for identical queries—saving 100% of the token cost.
 
 ---
 
 ## Privacy & Security
 
-- **Localhost Bound**: The gateway binds to `127.0.0.1:18080` by default. No inbound network ports opened.
-- **Encrypted Secret Storage**: All API keys, bearer tokens, and web session cookies are encrypted using Orca’s native `secrets:own` vault.
-- **Zero Secret Leaks**: Config files, runtime logs, error dumps, and upstream request headers never store or print secret keys.
-- **Zero Telemetry**: Completely private with no analytics, tracking, or external phone-home requests.
+- **Localhost Bound**: The gateway listens on `127.0.0.1:18080`. No external network exposure.
+- **Encrypted Secret Storage**: All API keys and browser session cookies are stored in Orca’s encrypted `secrets:own` vault.
+- **Zero Telemetry**: No tracking, analytics, or external calls of any kind. What happens in Orca stays in Orca.
 
 ---
 
-## Quick Start Guide
+## Ready-to-Post Marketing Material
 
-1. **Install Plugin**: Search for **LLM Router** in the Orca Plugin Directory and click **Install**.
-2. **Add a Provider**: Open the **Orca LLM Router** panel, select a preset (e.g., Anthropic, DeepSeek, or Gemini), and paste your key.
-3. **Configure a Route (Optional)**: In **Routing**, create a unified route name (e.g., `fast` or `coding`) and select your preferred backup providers.
-4. **Launch Any Agent**: Launch `claude`, `codex`, or `opencode` directly from Orca. Traffic routes automatically!
-
----
-
-## Part 3: Ready-to-Post Promotional Copy
-
-### Ad Option A: Orca Discord / Community Forum Announcement
+### 1. Orca Community / Discord / Forum Announcement
 
 ```markdown
-🚀 **NEW RELEASE: Orca LLM Router v1.1.0 — Never let rate limits kill your agent workflows!**
+🚀 **Never get blocked by AI rate limits again — Orca LLM Router is here!**
 
-Hey everyone! 👋 
+Hey Orca developers! 👋 
 
-If you use AI coding agents like Claude Code, Codex, or OpenCode inside Orca, you know how painful it is when an upstream provider hits a 429 rate limit or goes down mid-task. 
+If you use coding agents like **Claude Code**, **Codex**, or **OpenCode**, you know how frustrating it is when a 429 rate limit or provider outage kills your agent mid-task. 
 
-We just released **Orca LLM Router v1.1.0** — a lightweight, zero-dependency local gateway built specifically for Orca.
+**Orca LLM Router** connects all your coding agents to every AI subscription, key, and free web account you own through a single, resilient local gateway.
 
-**What it does:**
-⚡ **One local endpoint (`127.0.0.1:18080`)** that automatically wires up 45+ coding agents with zero dotfile edits.
-🔄 **Smart Cross-Provider Failover**: Define a model route like `coding` that tries your fastest provider, then automatically falls over to backups if rate-limited.
-🔑 **Multi-Key Credential Pools**: Weighted rotation, priority tiers, and 24h usage meters.
-🌐 **Native Web-Chat Transports**: Drive free DeepSeek Web and Qwen Web subscriptions directly through standard API endpoints!
-🗜️ **Token Optimization**: Opt-in ANSI/whitespace compression, failover context relay, and response caching.
-🔒 **100% Private**: All keys stay in Orca's encrypted vault. Zero telemetry.
+🔥 **Highlights:**
+• 🔄 **Smart 4-Tier Auto-Failover**: Point agents at model aliases (like `smart` or `coding`) that step down seamlessly (`Free Accounts` → `Flat Subscriptions` → `API Keys` → `Local Models`) when rate-limited.
+• ⚡ **Free Web Chat Integration**: Connect your free DeepSeek Web and Qwen Web accounts via a 1-click browser login and use them inside terminal coding agents.
+• 🔑 **Multi-Key Credential Pools**: Weighted rotation, priority tiers, and 24h usage meters.
+• 🤖 **45+ Agents Supported**: 1-click toggles for Claude Code, Codex, OpenCode, Cursor, Pi, and dozens more. Zero config needed.
+• 🗜️ **Token Optimization**: Cut token costs with prompt compression, context relay, and local response caching.
+• 🔒 **100% Private**: Runs strictly on localhost. Keys stay encrypted in Orca's vault. Zero telemetry.
 
-Check out the live failover proof and grab it from the Orca Plugin Directory:
-👉 Install via Orca: Plugins -> Search "LLM Router"
+Install it directly from the Orca Plugin Directory:
+👉 Install via Orca: https://orca.dev/plugins/addisflava/orca-llm-router
 🔗 GitHub: https://github.com/addisflava/orca-llm-router
 ```
 
 ---
 
-### Ad Option B: Twitter / X Launch Thread
+### 2. Twitter / X Launch Thread
 
 ```text
-🧵 1/5 Tired of coding agents dying mid-refactor because an AI provider rate-limited you?
+🧵 1/5 Tired of coding agents crashing mid-task because an AI provider rate-limited you?
 
-Introducing Orca LLM Router: a native, zero-dependency gateway that routes 45+ agents across 34+ providers with automatic, resilient failover.
+Meet Orca LLM Router: one local gateway that connects 45+ coding agents across 34+ providers with an intelligent 4-tier fallback architecture.
 
-Here’s why it’s a game-changer for Orca devs 👇
+Install now: https://orca.dev/plugins/addisflava/orca-llm-router
 
-2/5 🔄 Seamless Cross-Provider Failover
-Map model names like "smart" to a chain of targets. If your primary provider throws a 429 or 503, the router immediately retries on your backup without dropping the agent turn. 21 failovers handled in our real-world tests with 0 interruptions!
+Here is why it's a game-changer for Orca devs 👇
 
-3/5 🌐 Free Web Subscriptions as API Endpoints
-Got free DeepSeek or Qwen web accounts? Orca LLM Router includes native CDP browser authentication to drive web sessions directly as standard OpenAI-compatible endpoints. Free tokens inside your favorite coding agents.
+2/5 🔄 4-Tier Zero-Downtime Fallback
+Set up automated fallback chains: Free Web Accounts → Flat Subscriptions → Fast API Keys → Local Models. If your primary hits a 429 or 503, the router instantly retries on your backup without dropping your agent session. In our live test: 21 failovers handled with 0 interruptions!
 
-4/5 🔑 Multi-Key Rotation & Prompt Cache Affinity
-Distribute load across multiple keys with weighted round-robin and priority tiers. Session pinning ensures your Anthropic prompt caches stay warm and cost-efficient.
+3/5 ⚡ Free Web Subscriptions as API Endpoints
+Pay for zero tokens! Orca LLM Router lets you connect free DeepSeek Web and Qwen Web subscriptions with a 1-click Chrome login. Use free web models right inside Claude Code, Codex, or OpenCode.
 
-5/5 📦 Ready to install today!
-Works out-of-the-box with Claude Code, Codex, OpenCode, Cursor, Pi, and 40+ more. Encrypted secrets, localhost-only, zero telemetry.
+4/5 🔑 Multi-Key Rotation & Warm Prompt Caching
+Spread traffic across multiple keys per provider with weighted rotation. Session pinning ensures your Anthropic and Gemini prompt caches stay warm and cost-efficient (saving up to 90%).
 
-Available now in the Orca Plugin Directory or on GitHub:
-https://github.com/addisflava/orca-llm-router
+5/5 📦 Zero Config Setup
+No editing dotfiles or bash profiles. Turn agents on with 1-click toggles. Runs 100% on localhost with encrypted secret storage.
+
+Install now via Orca Plugin Directory or GitHub:
+https://orca.dev/plugins/addisflava/orca-llm-router
 ```
 
 ---
 
-### Ad Option C: Reddit / Hacker News (Show Orca / Show HN)
+### 3. Short Marketplace Card Copy (75 Words)
 
-```markdown
-**Title:** Show: Orca LLM Router – Resilient local gateway with cross-provider failover and free web-chat transports for coding agents
-
-**Post Body:**
-Hey everyone,
-
-When running autonomous coding agents (Claude Code, OpenAI Codex, OpenCode) inside our dev workflows, we kept running into the same frustrating problems:
-1. Mid-task 429 rate limits causing agent crashes.
-2. Fragmented API keys and credentials sitting in dotfiles.
-3. Paying for monthly web subscriptions that couldn't be used inside terminal coding agents.
-
-To solve this, we built **Orca LLM Router**—a lightweight local gateway plugin for Orca written with zero runtime npm dependencies (using Node built-ins and native fetch).
-
-**Key Architectural Features:**
-- **Zero-Config Agent Wiring**: Uses Orca's `agent.launch.before` lifecycle hook to inject gateway endpoints and model catalogs into 45+ agents per session without overwriting global dotfiles.
-- **Fastest-Healthy-First Routing**: Measures time-to-first-byte and circuit breaker health to rank targets on the fly, with session affinity to protect prompt cache efficiency.
-- **Native Web-Chat Engine**: Connects via Chrome DevTools Protocol to capture web-chat auth from DeepSeek and Qwen, converting web SSE streams into standard OpenAI chat completion objects.
-- **Opt-in Deterministic Transforms**: Prompt whitespace and ANSI compression, one-line handoff context digests on failover, and local response caching.
-- **Encrypted Storage**: Sensitive tokens never touch logs or config files; all keys reside in Orca's secure secret store.
-
-The code is fully open source (MIT):
-https://github.com/addisflava/orca-llm-router
-
-Feedback and PRs are very welcome!
-```
+> Never let provider rate limits or outages kill an agent workflow again. Orca LLM Router gives you a single local endpoint (`127.0.0.1:18080`) that connects 45+ coding agents (Claude Code, Codex, OpenCode, Cursor, Pi) to 34+ model providers with a 4-tier zero-downtime fallback architecture. Features multi-key credential pools with weighted rotation, native web-chat transports for free DeepSeek and Qwen web accounts, and opt-in token compression. Your keys stay encrypted in Orca’s vault. Zero telemetry.

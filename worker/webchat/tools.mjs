@@ -461,9 +461,10 @@ export function parseToolCall(text, { log = noop } = {}) {
   return null
 }
 
-/** Strip surrogate characters and other problematic Unicode from text. */
+/** Strip lone/invalid surrogates while preserving valid pairs (emoji, CJK ext). */
 export function sanitizeContent(text) {
-  return String(text ?? '').replace(/[\ud800-\udfff]/g, '')
+  return String(text ?? '')
+    .replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, '')
 }
 
 /** Normalize OpenAI / Anthropic / Responses message content to plain text. */

@@ -168,8 +168,12 @@ test('looksLikeToolCallMarkup and sanitizeContent', () => {
   assert.ok(looksLikeToolCallMarkup('||| DSML |||'))
   assert.ok(looksLikeToolCallMarkup('<tool_call>'))
   assert.equal(looksLikeToolCallMarkup('just some text'), false)
-  // strip surrogate characters
+  // strip lone surrogate characters
   assert.equal(sanitizeContent('a\ud800b'), 'ab')
+  assert.equal(sanitizeContent('a\udc00b'), 'ab')
+  // valid surrogate pairs (emoji, CJK extension) must survive
+  assert.equal(sanitizeContent('hi 😀 ok'), 'hi 😀 ok')
+  assert.equal(sanitizeContent('\ud83d\ude00'), '\ud83d\ude00')
 })
 
 test('normalizeMessageContent handles strings, arrays and images', () => {

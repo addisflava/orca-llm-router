@@ -208,8 +208,6 @@ export class DeepSeekWebTransport {
     }
 
     const decoder = new TextDecoder()
-    const lines = []
-    let current = ''
     // processLine handles one complete "data: ..." line.
     const processLine = (line) => {
       if (!line.startsWith('data: ')) return
@@ -243,8 +241,6 @@ export class DeepSeekWebTransport {
       if (lastPath === 'response/finish_reason' && ev.v !== undefined) finishReason = ev.v
       if (lastPath === 'response/status' && ev.v !== undefined && ev.v !== 'FINISHED') finishReason = ev.v
     }
-    void lines
-    void current
 
     // We must consume the async readable synchronously within a promise.
     return (async () => {

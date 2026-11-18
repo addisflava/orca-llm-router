@@ -24,8 +24,11 @@ Core goals:
 - `worker/transforms.mjs` — pure prompt-compression and failover context-relay helpers.
 - `worker/cache.mjs` — canonical cache keys, cosine similarity, and the in-memory response cache.
 - `worker/scheduler.mjs` — pure credential scheduler, circuit-breaker normalization, and `Retry-After` parsing.
-- `worker/orca-agents.mjs` — Orca agent discovery and launch integration.
+- `worker/proxy.mjs` — dependency-free HTTP CONNECT / SOCKS5 tunneling used by routes with a VPN server attached.
+- `worker/orca-agents.mjs` — Orca agent registry and launch integration.
+- `worker/webchat/` — native web-chat transports for free DeepSeek/Qwen web subscriptions. `index.mjs` composes a transport with recovery; `auth.mjs` drives Chrome via CDP and captures credentials; `deepseek.mjs` / `qwen.mjs` implement the two upstream protocols; `pow.mjs`, `models.mjs`, `prompt.mjs`, `tools.mjs`, `session.mjs`, `recovery.mjs` hold pure helpers; `sidecar.mjs` builds synthetic OpenAI responses; `errors.mjs` defines typed upstream errors.
 - `tests/sidecar.test.mjs` — Node test suite for sidecar, scheduler, imports, routing, and protocol translation.
+- `tests/webchat*.test.mjs` — web-chat transport, auth, session, recovery, and gateway integration tests.
 - `tests/panel.test.tsx` — Orca panel tests using `orca/testing`.
 - `tools/import-legacy-config.mjs` — standalone CCR/OmniRoute converter.
 

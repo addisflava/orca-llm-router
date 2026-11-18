@@ -84,6 +84,3 @@ export function createRecoveredWebChat(webchat, { maxEmptyRetries = 2, log = () 
     },
   }
 }
-
-// Re-export the parser check so tests can confirm the same decision logic.
-export { looksLikeToolCallMarkup, parseToolCall }
