@@ -38,6 +38,8 @@ import {
   probeProviderUsage,
   resolveUsageFetch,
   normalizeConfig,
+  extractModelLimits,
+  normalizeModelLimits,
   buildAgentLaunchEnv,
   buildOpenCodeConfig,
   buildCodexModelCatalog,
@@ -338,6 +340,7 @@ function codexConfigPath() {
   const home = process.env.CODEX_HOME || join(homedir(), '.codex')
   return join(home, 'config.toml')
 }
+
 
 function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
@@ -1440,7 +1443,14 @@ export default async function activate(orca) {
       throw error
     }
     const wasPersisting = config?.persistLogs === true
-    await persistConfig(orca, next)
+    // The panel edits a snapshot taken before discovery. Merge the in-memory
+    // window cache last so saving a model list cannot erase what a Fetch
+    // models call just learned.
+    const merged = {
+      ...next,
+      modelWindows: { ...(next?.modelWindows ?? {}), ...(config?.modelWindows ?? {}) }
+    }
+    await persistConfig(orca, merged)
     if (config.persistLogs === true && !wasPersisting) {
       // Seed from the live buffer so enabling the toggle is immediate.
       persistedLogs = (sidecar?.logs ?? []).slice(-MAX_PERSISTED_LOGS)
@@ -1711,8 +1721,9 @@ export default async function activate(orca) {
     } else if (!key && secretKey) {
       key = secretsCache.get(secretKey) ?? undefined
     }
-    const models = await fetchModels({ baseUrl: resolvedBaseUrl, protocols: resolvedProtocols, key })
-    return { ok: true, models, provider: name ?? null }
+    const { models, limits } = await fetchModels({ baseUrl: resolvedBaseUrl, protocols: resolvedProtocols, key })
+    await rememberModelLimits(orca, { provider: name, baseUrl: resolvedBaseUrl, limits })
+    return { ok: true, models, limits, provider: name ?? null }
   })
   orca.panels.handle('router.discoverAllModels', async () => {
     // Pull model ids from every configured provider in one pass, so the panel
@@ -1728,18 +1739,19 @@ export default async function activate(orca) {
         if (!baseUrl) return { provider: provider.name, models: [], error: 'no base URL' }
         const key = (provider.keys ?? []).map((entry) => secretsCache.get(entry.secretKey)).find(Boolean)
         try {
-          const models = await fetchModels({
+          const { models, limits } = await fetchModels({
             baseUrl,
             protocols: provider.protocols ?? provider.capabilities ?? [],
             key
           })
-          return { provider: provider.name, models }
+          return { provider: provider.name, baseUrl, models, limits }
         } catch (cause) {
           return { provider: provider.name, models: [], error: String(cause?.message ?? cause) }
         }
       })
     )
-    return { ok: true, providers: results }
+    await rememberModelLimits(orca, results.map(({ provider, baseUrl, limits }) => ({ provider, baseUrl, limits })))
+    return { ok: true, providers: results.map(({ limits, baseUrl, ...entry }) => entry) }
   })
   orca.panels.handle('router.testUsage', async ({ provider: name, secretKey }) => {
     const provider = config.providers.find((item) => item.name === name)
@@ -1958,7 +1970,10 @@ function providerProbe(provider, key) {
 
 // Ask an endpoint for its model list, using the probe that matches its
 // protocol. Gemini lists under `models[].name` (strip the `models/` prefix),
-// everyone else under `data[].id`. Returns bare model ids.
+// everyone else under `data[].id`. Besides bare model ids this keeps the
+// context/output windows the provider happens to expose; OpenAI does not
+// define them, but OpenRouter, Gemini, vLLM and most gateways do under one of
+// the aliases handled by extractModelLimits().
 async function fetchModels({ baseUrl, protocols, key } = {}) {
   const probe = providerProbe({ baseUrl, protocols: protocols ?? [] }, key)
   const res = await fetch(probe.url, { method: 'GET', headers: probe.headers, signal: AbortSignal.timeout(12000) })
@@ -1968,11 +1983,50 @@ async function fetchModels({ baseUrl, protocols, key } = {}) {
   if (!res.ok) throw new Error(`model list returned ${res.status}`)
   const json = await res.json().catch(() => ({}))
   const raw = json.data ?? json.models ?? []
-  return [...new Set(
-    raw
-      .map((model) => String(model?.id ?? model?.name ?? model ?? '').replace(/^models\//, ''))
-      .filter(Boolean)
-  )].sort()
+  const models = []
+  const limits = {}
+  const seen = new Set()
+  for (const model of raw) {
+    const id = String(model?.id ?? model?.name ?? model ?? '').replace(/^models\//, '')
+    if (!id || seen.has(id)) continue
+    seen.add(id)
+    models.push(id)
+    const extracted = extractModelLimits(model)
+    if (extracted) limits[id] = extracted
+  }
+  return { models: models.sort(), limits }
+}
+
+// Persist discovered windows so launch-time catalogs (OpenCode, Codex) and the
+// gateway's /v1/models can use them without another network call. Saved
+// providers are keyed by name; every fetch is also keyed by URL so a custom
+// provider form that is saved later still finds the metadata. Failures are
+// non-fatal: discovery must still return the model list.
+async function rememberModelLimits(orca, input) {
+  const sources = (Array.isArray(input) ? input : [input]).filter(Boolean)
+  const next = structuredClone(config)
+  next.modelWindows = { ...(next.modelWindows ?? {}) }
+  const at = Date.now()
+  let changed = false
+  for (const { provider, baseUrl, limits } of sources) {
+    const ids = Object.keys(limits ?? {})
+    if (!ids.length) continue
+    const url = String(baseUrl ?? '').replace(/\/+$/, '')
+    for (const id of ids) {
+      const normalized = normalizeModelLimits(limits[id])
+      if (!normalized) continue
+      const entry = { ...normalized, source: 'discovery', at }
+      if (provider) next.modelWindows[`${provider}\u0000${id}`] = entry
+      if (url) next.modelWindows[`url:${url}\u0000${id}`] = entry
+      changed = true
+    }
+  }
+  if (!changed) return
+  try {
+    await persistConfig(orca, next)
+  } catch (cause) {
+    console.warn('[llm-router] could not cache model limits', cause?.message ?? cause)
+  }
 }
 
 async function testProviders(only) {

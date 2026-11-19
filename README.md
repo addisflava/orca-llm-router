@@ -194,6 +194,29 @@ Save tokens, cut costs, and boost inference speed with three optional optimizati
 
 ---
 
+## Model Context Windows
+
+Agents need per-model context and output limits to report usage correctly and to avoid compacting long-context models early. Provider APIs do not agree on this metadata, so the router handles it in three layers:
+
+1. **Discovery** — `Fetch models` keeps the limits exposed by the provider. Common spellings are supported: `context_length` (OpenRouter), `top_provider.max_completion_tokens`, `inputTokenLimit` / `outputTokenLimit` (Gemini), `max_model_len` (vLLM), `max_input_tokens` / `max_output_tokens`, and `context_window` variants.
+2. **Manual override** — in a provider's **Models** box, add two optional columns:
+   ```
+   deepseek-v4.1-flash | 1000000 | 384000
+   kimi-k3 | 262144
+   ```
+   The format is `model-id | context window | max output`. Either column may be omitted.
+3. **Fallback** — models with no known window keep the previous behavior (128k for the Codex catalog; OpenCode gets no `limit` entry).
+
+Precedence is per field: an explicit value on the model entry wins, then the discovery cache (keyed by provider and by base URL), then the fallback. Routes and aliases inherit the smallest known window across their targets so a failover cannot silently overflow a smaller fallback.
+
+Where it lands:
+
+- OpenCode config: `provider["orca-router"].models[id].limit = { context, output }`
+- Codex catalog: per-model `context_window` / `max_context_window`
+- Gateway `GET /v1/models`: `context_length` and `max_output_tokens`
+
+Restart an agent session after changing windows — the catalogs are generated at launch.
+
 ## Privacy & Security
 
 - **Localhost Bound**: The gateway listens on `127.0.0.1:18080`. No external network exposure.
