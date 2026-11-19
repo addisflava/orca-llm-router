@@ -633,11 +633,11 @@ async function addCustomProvider() {
     return
   }
   const protocols = [...new Set(endpoints.flatMap((endpoint) => endpoint.protocols))]
-  const models = read(customModels)
-    .split(/[\n,]/)
-    .map((item) => item.trim())
-    .filter(Boolean)
-    .map((id) => ({ id }))
+  const models = parseModelLines(read(customModels)).map(({ id, contextWindow, maxOutput }) => ({
+    id,
+    ...(contextWindow ? { contextWindow } : {}),
+    ...(maxOutput ? { maxOutput } : {})
+  }))
   set(error, '')
   set(message, '')
   const saved = await saveConfig((next) => {
@@ -991,6 +991,10 @@ function applyPickedModelsTo(target: Atom<string>, label: string) {
   const selected = choices.filter((choice) => choice.checked).map((choice) => choice.id)
   const fetched = new Set(choices.map((choice) => choice.id))
   const selectedSet = new Set(selected)
+  // Keep the full original line (`id | context | output`) for surviving models
+  // so re-picking cannot drop a hand-written window override.
+  const rawLines = read(target).split(/\n/).map((line) => line.trim()).filter(Boolean)
+  const lineById = new Map(rawLines.map((line) => [line.split('|')[0].trim(), line]))
   const next = modelTextIds(read(target)).filter((id) => !fetched.has(id) || selectedSet.has(id))
   const seen = new Set(next)
   for (const id of selected) {
@@ -999,7 +1003,7 @@ function applyPickedModelsTo(target: Atom<string>, label: string) {
     next.push(id)
   }
   set(error, '')
-  set(target, next.join('\n'))
+  set(target, next.map((id) => lineById.get(id) ?? id).join('\n'))
   closeModelPicker()
   set(message, `${label}: ${next.length} model${next.length === 1 ? '' : 's'}`)
 }
@@ -1197,11 +1201,43 @@ async function fetchRouteModels() {
   }
 }
 
+type ParsedModelLine = { id: string; contextWindow?: number; maxOutput?: number }
+
+// A model line is `id`, or `id | contextWindow | maxOutput` for providers whose
+// /v1/models response does not expose limits. The extra columns are optional
+// and stored on the model entry, which takes precedence over discovery data.
+function parseModelLines(text: string): ParsedModelLine[] {
+  const entries: ParsedModelLine[] = []
+  const seen = new Set<string>()
+  for (const raw of text.split(/[\n,]/)) {
+    const line = raw.trim()
+    if (!line) continue
+    const [idPart, contextPart, outputPart] = line.split('|').map((part) => part.trim())
+    const id = idPart ?? ''
+    if (!id || seen.has(id)) continue
+    seen.add(id)
+    const contextWindow = Number.parseInt(contextPart ?? '', 10)
+    const maxOutput = Number.parseInt(outputPart ?? '', 10)
+    entries.push({
+      id,
+      ...(Number.isFinite(contextWindow) && contextWindow > 0 ? { contextWindow } : {}),
+      ...(Number.isFinite(maxOutput) && maxOutput > 0 ? { maxOutput } : {})
+    })
+  }
+  return entries
+}
+
 function modelTextIds(text: string) {
-  return text
-    .split(/[\n,]/)
-    .map((item) => item.trim())
-    .filter(Boolean)
+  return parseModelLines(text).map((entry) => entry.id)
+}
+
+function formatModelLines(models: { id: string; contextWindow?: number; maxOutput?: number }[] | undefined) {
+  return (models ?? [])
+    .map((model) => {
+      if (!model.contextWindow && !model.maxOutput) return model.id
+      return [model.id, model.contextWindow ?? '', model.maxOutput ?? ''].join(' | ').trim()
+    })
+    .join('\n')
 }
 
 // Fill the custom provider's model textarea from its endpoint. The form is not
@@ -1486,7 +1522,7 @@ function startEditProvider(provider: ProviderView) {
   set(providerEditFor, provider.name)
   set(providerEditDisplayName, cfg?.displayName ?? provider.displayName ?? '')
   set(providerEditEndpoints, editEndpointsFor(cfg, provider))
-  set(providerEditModels, (cfg?.models ?? []).map((model) => model.id).join('\n'))
+  set(providerEditModels, formatModelLines(cfg?.models))
   set(usageDraft, {
     endpoint: connector?.endpoint ?? '',
     auth: connector?.auth === 'none' ? 'none' : 'provider-api-key',
@@ -1584,13 +1620,18 @@ async function saveProviderEdit(name: string) {
     set(error, 'Enable at least one protocol')
     return
   }
-  // Keep description/pricing on models that survive the edit.
+  // Keep description/pricing on models that survive the edit. The optional
+  // `| context | output` columns override what discovery cached, and omitting
+  // them clears a previous override.
   const known = new Map((cfg?.models ?? []).map((model) => [model.id, model]))
-  const models = read(providerEditModels)
-    .split(/[\n,]/)
-    .map((item) => item.trim())
-    .filter(Boolean)
-    .map((id) => known.get(id) ?? { id })
+  const models = parseModelLines(read(providerEditModels)).map(({ id, contextWindow, maxOutput }) => {
+    const entry = { ...(known.get(id) ?? { id }), id }
+    if (contextWindow) entry.contextWindow = contextWindow
+    else delete entry.contextWindow
+    if (maxOutput) entry.maxOutput = maxOutput
+    else delete entry.maxOutput
+    return entry
+  })
   const displayName = read(providerEditDisplayName).trim()
   const protocols = [...new Set(endpoints.flatMap((endpoint) => endpoint.protocols))]
   set(error, '')
@@ -3966,11 +4007,11 @@ function ProviderCard({ provider }: { provider: ProviderView }) {
                   </Button>
                 </Row>
               </FormGroup>
-              <FormGroup title="Models" description="Model IDs this provider serves.">
+              <FormGroup title="Models" description="Model IDs, optionally `id | contextWindow | maxOutput`.">
                 <Textarea
                 label="Model IDs"
                 labelHidden
-                placeholder={'gpt-4o\nclaude-sonnet-4-20250514'}
+                placeholder={'gpt-4o | 128000 | 16384\nclaude-sonnet-4-20250514'}
                 rows={4}
                 value={read(providerEditModels)}
                 onChange={(value) => set(providerEditModels, value)}
@@ -4821,11 +4862,11 @@ function Providers() {
                   </Button>
                 </Row>
               </FormGroup>
-              <FormGroup title="Models" description="Model IDs this provider serves.">
+              <FormGroup title="Models" description="Model IDs, optionally `id | contextWindow | maxOutput`.">
                 <Textarea
                   label="Model IDs"
                   labelHidden
-                  placeholder={'gpt-4o\nclaude-sonnet-4-20250514'}
+                  placeholder={'gpt-4o | 128000 | 16384\nclaude-sonnet-4-20250514'}
                   rows={4}
                   value={read(customModels)}
                   onChange={(value) => set(customModels, value)}

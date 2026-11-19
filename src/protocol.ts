@@ -113,7 +113,12 @@ declare module 'orca' {
     'router.clientKeys.revoke': { input: { id: string }; output: { ok: true } }
     'router.discoverModels': {
       input: { provider?: string; baseUrl?: string; protocols?: string[]; secretKey?: string; value?: string }
-      output: { ok: true; models: string[]; provider: string | null }
+      output: {
+        ok: true
+        models: string[]
+        limits?: Record<string, { contextWindow?: number; maxOutput?: number }>
+        provider: string | null
+      }
     }
     'router.discoverAllModels': {
       input: Record<string, never>
@@ -490,6 +495,8 @@ export interface RouterConfig {
   contextRelay?: ContextRelayConfig
   /** Opt-in local response cache, exact or embedding-backed semantic. */
   responseCache?: ResponseCacheConfig
+  /** Context/output windows learned from provider /v1/models responses. */
+  modelWindows?: Record<string, { contextWindow?: number; maxOutput?: number; source?: string; at?: number }>
   /** Legacy custom chains converted into routes. */
   migration?: MigrationEntry[]
   timeoutMs?: number
@@ -539,7 +546,15 @@ export interface ProviderConfig {
   baseUrl: string
   endpoints?: { baseUrl: string; protocols: string[] }[]
   protocols: string[]
-  models: { id: string; description?: string; pricing?: unknown }[]
+  models: {
+    id: string
+    description?: string
+    pricing?: unknown
+    /** Optional override; otherwise discovery metadata is used. */
+    contextWindow?: number
+    /** Optional max completion tokens override. */
+    maxOutput?: number
+  }[]
   keys: { id: string; secretKey: string; enabled?: boolean; priority?: number; weight?: number; limits?: Record<string, unknown> }[]
   enabled?: boolean
   pricing?: Record<string, unknown>
