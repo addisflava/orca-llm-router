@@ -900,6 +900,37 @@ test('restoreCodexGlobal uses the in-memory backup when storage is unavailable',
   }
 })
 
+test('restoreCodexGlobal keeps user lines written after the managed provider block', async () => {
+  const harness = codexGlobalHarness()
+  try {
+    writeFileSync(harness.path, [
+      'model = "gpt-5.5"',
+      '',
+      '[subagents]',
+      'model = "gpt-5.4-mini"',
+      ''
+    ].join('\n'))
+    await applyCodexGlobal(harness.orca, harness.options)
+    // The provider block is appended last, so anything a person (or Codex)
+    // writes afterwards lives after its END marker. It must survive a restore.
+    writeFileSync(harness.path, [
+      readFileSync(harness.path, 'utf8').replace(/\n+$/, ''),
+      '',
+      '[projects."/tmp/added-later"]',
+      'trust_level = "trusted"',
+      ''
+    ].join('\n'))
+    await restoreCodexGlobal(harness.orca)
+    const restored = readFileSync(harness.path, 'utf8')
+    assert.match(restored, /^model = "gpt-5\.5"$/m)
+    assert.match(restored, /\[projects\."\/tmp\/added-later"\]/)
+    assert.match(restored, /^trust_level = "trusted"$/m)
+    assert.doesNotMatch(restored, /orca-router/)
+  } finally {
+    harness.cleanup()
+  }
+})
+
 test('normalizeResponsesCustomTools turns grammar tools into text for third-party providers', () => {
   const body = {
     model: 'm',

@@ -7,9 +7,12 @@
 //                   OpenCode gets a generated OPENCODE_CONFIG so its model
 //                   picker lists the gateway's providers and models; Codex gets
 //                   a generated model catalog plus per-launch `-c` provider
-//                   overrides for terminal launches, and a managed block in
-//                   ~/.codex/config.toml while the gateway runs so Orca's
-//                   native Codex chat sees the same list.
+//                   overrides. Those per-launch overrides cover every agent Orca
+//                   starts. Editing the user's global Codex/OpenCode config is
+//                   opt-in (`routeOutsideOrca`, off by default) and only exists
+//                   for a plain terminal `codex` / `opencode` or Orca's native
+//                   Codex chat; those writes are removed again when the router
+//                   stops, the plugin deactivates, or the setting is turned off.
 //   CLI -> sidecar (worker/sidecar.mjs) -> providers in the config, with
 //                   conditional routing rules, rewrites, aliases, fallback
 //                   chains, retries and per-provider credential pools.
@@ -20,7 +23,7 @@
 // Settings via settings:own and are cached so the launch hook never blocks on
 // a host round-trip.
 
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { delimiter, dirname, join } from 'node:path'
 import { execFileSync } from 'node:child_process'
@@ -84,7 +87,7 @@ let lastLogPersistAt = 0
 let logFlushTimer = null
 let logWrite = Promise.resolve()
 let config = null
-let settings = { enabled: true, port: 18080, bindHost: '127.0.0.1', timeoutMs: 600000, retries: 2, baseDelayMs: 200 }
+let settings = { enabled: true, routeOutsideOrca: false, port: 18080, bindHost: '127.0.0.1', timeoutMs: 600000, retries: 2, baseDelayMs: 200 }
 const secretsCache = new Map()
 const keyUsageCache = new Map()
 const authSessions = new Map() // webchat transport -> auth session state
@@ -289,13 +292,13 @@ function injectOpenCodeStandalone(command) {
   return `${script.slice(0, at)} --standalone${script.slice(at)}`
 }
 
-// Codex reads its provider and model catalog from config. Terminal launches get
-// per-launch `-c key=value` overrides, while Orca's native chat starts its own
-// `codex app-server` that ignores the launch hook. Native chat reads the user's
-// ~/.codex/config.toml directly, so while the router is running we install a
-// marker-delimited managed block there and remove it again when the router
-// stops or the plugin is deactivated. The user's original values are kept in
-// plugin storage so the restore preserves unrelated edits.
+// Codex reads its provider and model catalog from config. Orca launches get
+// per-launch `-c key=value` overrides; only the opt-in `routeOutsideOrca`
+// setting also installs a marker-delimited block in ~/.codex/config.toml for
+// native chat and a plain terminal `codex`. The block is removed when the
+// router stops, the plugin deactivates, or the setting is turned off. The
+// user's original values are kept in plugin storage so the restore preserves
+// unrelated edits.
 const CODEX_CONFIG_MARKER_BEGIN = '# BEGIN Orca LLM Router managed profile'
 const CODEX_CONFIG_MARKER_END = '# END Orca LLM Router managed profile'
 const CODEX_PROVIDER_MARKER_BEGIN = '# BEGIN Orca LLM Router managed Codex provider'
@@ -310,8 +313,6 @@ const CODEX_OWNED_TOP_LEVEL = ['model_provider', 'model_catalog_json']
 const CODEX_CONFIG_BACKUP_KEY = 'router.codexConfigBackup'
 let lastCodexCatalogJson = null
 let activeOrca = null
-let codexConfigGuard = null
-let codexConfigGuardBusy = false
 let lastCodexBackup = null
 
 function writeCodexCatalog(config, { agentId }) {
@@ -347,19 +348,25 @@ function tomlQuoted(value) {
   return `"${tomlString(value)}"`
 }
 
-// Remove a marker-delimited managed block, leaving every other line intact.
+// Remove the marker-delimited managed blocks, leaving every other line intact.
+// Each block is closed only by its own END marker: matching any END (or the
+// wrong one) used to swallow user lines that followed the provider block.
 function stripCodexManagedBlocks(text) {
   const lines = String(text ?? '').split('\n')
   const out = []
-  let skipping = false
+  let endMarker = null
   for (const line of lines) {
     const trimmed = line.trim()
-    if (trimmed === CODEX_CONFIG_MARKER_BEGIN || trimmed === CODEX_PROVIDER_MARKER_BEGIN) {
-      skipping = true
+    if (trimmed === CODEX_CONFIG_MARKER_BEGIN) {
+      endMarker = CODEX_CONFIG_MARKER_END
       continue
     }
-    if (skipping) {
-      if (trimmed === CODEX_CONFIG_MARKER_END) skipping = false
+    if (trimmed === CODEX_PROVIDER_MARKER_BEGIN) {
+      endMarker = CODEX_PROVIDER_MARKER_END
+      continue
+    }
+    if (endMarker) {
+      if (trimmed === endMarker) endMarker = null
       continue
     }
     out.push(line)
@@ -491,10 +498,10 @@ export async function applyCodexGlobal(orca, options) {
         ? lastCodexBackup
         : null
   if (!managed) {
-    // First apply (and every Codex rewrite that drops our block) remembers only
-    // the values we replace. Merge instead of overwrite so a rewrite that drops
-    // one of the person's keys cannot erase it, while a value changed while the
-    // router was stopped still wins.
+    // First apply (and any later apply after Codex rewrote the file and
+    // dropped our block) remembers only the values we replace. Merge instead of
+    // overwrite so a rewrite that drops one of the person's keys cannot erase
+    // it, while a value changed while the router was stopped still wins.
     const mergedKeys = {
       ...(backup?.keys ?? {}),
       ...extractTopLevelKeys(current, CODEX_CAPTURE_TOP_LEVEL)
@@ -566,61 +573,46 @@ export async function restoreCodexGlobal(orca) {
   return true
 }
 
-async function syncCodexGlobal(orca, current) {
-  if (!orca) return null
-  if (!settings.enabled || !current || !sidecar?.status().running) {
-    stopCodexConfigGuard()
-    await restoreCodexGlobal(orca)
-    return null
-  }
+// Writing the user's global Codex/OpenCode config is opt-in. Orca-launched
+// agents already get the gateway through per-launch overrides, so these writes
+// only serve a plain terminal `codex` / `opencode` and Orca's native Codex
+// chat. There is deliberately no periodic re-insert: a block a person deletes
+// stays deleted until the next explicit config change or router start.
+export async function applyGlobalAgentConfig(orca, current) {
+  if (!orca || !current) return false
   const catalog = writeCodexCatalog(current, { agentId: 'codex' })
-  if (!catalog) return null
-  const profile = agentProfileFor(normalizeConfig(current), 'codex')
-  return applyCodexGlobal(orca, {
-    base: gatewayAddress(),
-    token: current.token || 'orca-router',
-    catalogPath: catalog.path,
-    model: catalog.model,
-    reasoningEffort: profile?.reasoningEffort
-  })
-}
-
-// `codex exec` rewrites config.toml when it records a new project trust entry
-// or a migration, and its writer drops keys it did not originate (including the
-// managed block). Native chat's app-server does not rewrite the file, but a
-// person who also uses the Codex CLI would lose router routing after one such
-// command. Re-apply the block while the router is active so the next native
-// chat probe still sees the gateway catalog.
-function stopCodexConfigGuard() {
-  if (codexConfigGuard) {
-    clearInterval(codexConfigGuard)
-    codexConfigGuard = null
+  if (catalog) {
+    const profile = agentProfileFor(normalizeConfig(current), 'codex')
+    await applyCodexGlobal(orca, {
+      base: gatewayAddress(),
+      token: current.token || 'orca-router',
+      catalogPath: catalog.path,
+      model: catalog.model,
+      reasoningEffort: profile?.reasoningEffort
+    }).catch(() => {})
   }
+  syncOpenCodeUserConfig(current, {
+    base: gatewayAddress(),
+    token: current.token || 'orca-router'
+  })
+  return true
 }
 
-function startCodexConfigGuard(orca) {
-  if (codexConfigGuard || !orca || !settings.enabled || !sidecar?.status().running) return
-  codexConfigGuard = setInterval(() => {
-    if (!settings.enabled || !sidecar?.status().running) {
-      stopCodexConfigGuard()
-      return
-    }
-    if (codexConfigGuardBusy) return
-    codexConfigGuardBusy = true
-    void (async () => {
-      try {
-        const { text } = readCodexConfigFile()
-        if (!text.includes(CODEX_CONFIG_MARKER_BEGIN) || !text.includes('[model_providers.orca-router]')) {
-          await syncCodexGlobal(orca, config)
-        }
-      } catch {
-        /* best-effort: Codex may be in the middle of an atomic rewrite */
-      } finally {
-        codexConfigGuardBusy = false
-      }
-    })()
-  }, 2000)
-  codexConfigGuard.unref?.()
+export async function restoreGlobalAgentConfig(orca) {
+  await restoreCodexGlobal(orca).catch(() => {})
+  restoreOpenCodeUserConfig()
+}
+
+function globalAgentConfigActive() {
+  return settings.enabled && settings.routeOutsideOrca && sidecar?.status().running === true
+}
+
+async function syncGlobalAgentConfig(orca, current) {
+  if (!orca || !globalAgentConfigActive()) {
+    await restoreGlobalAgentConfig(orca)
+    return false
+  }
+  return applyGlobalAgentConfig(orca, current)
 }
 
 function shellQuote(value) {
@@ -636,9 +628,9 @@ function tomlString(value) {
 }
 
 // Insert the provider and catalog overrides after the leading codex executable.
-// `-c key=value` is Codex's supported per-launch config override, so a terminal
-// launch never needs to rewrite the user's config file. Native chat, which does
-// not run this hook, is handled by the managed block above.
+// `-c key=value` is Codex's supported per-launch config override, so an Orca
+// launch never needs to rewrite the user's config file. The global block is
+// only installed when `routeOutsideOrca` is enabled.
 export function injectCodexProvider(command, { base, catalogPath, model, reasoningEffort, token = 'orca-router' }) {
   const script = String(command ?? '')
   if (!script || script.includes('model_providers.orca-router')) return script
@@ -662,11 +654,12 @@ export function injectCodexProvider(command, { base, catalogPath, model, reasoni
   return `${script.slice(0, at)} ${args}${script.slice(at)}`
 }
 
-// A person can also open a plain terminal and type `opencode`; that launch has
-// no agent hook to rewrite. OpenCode merges the global config and watches it
-// live, so publish the same provider there. The modification is intentionally
-// narrow: replace the stale CCR provider with ours and repoint model ids,
-// leaving MCP servers, agents, plugins and unrelated providers untouched.
+// A plain terminal `opencode` has no agent hook to rewrite. When the opt-in
+// `routeOutsideOrca` setting is on, OpenCode merges the global config and
+// watches it live, so publish the same provider there. The modification is
+// intentionally narrow: replace the stale CCR provider with ours and repoint
+// model ids, leaving MCP servers, agents, plugins and unrelated providers
+// untouched. Orca-launched agents use a generated OPENCODE_CONFIG instead.
 const OPENCODE_USER_DIR = join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'opencode')
 const OPENCODE_USER_FILE = join(OPENCODE_USER_DIR, 'opencode.jsonc')
 const OPENCODE_USER_BACKUP = `${OPENCODE_USER_FILE}.orca-backup`
@@ -701,6 +694,51 @@ function syncOpenCodeUserConfig(config, { base, token }) {
     return OPENCODE_USER_FILE
   } catch {
     return null
+  }
+}
+
+// Undo the opt-in OpenCode write. The pre-edit file is kept beside it so a
+// restore is byte-for-byte, including any JSONC comments the writer could not
+// round-trip. If the backup is gone, fall back to removing only our provider
+// and the model pins we may have written, leaving unrelated edits in place.
+export function restoreOpenCodeUserConfig() {
+  try {
+    if (existsSync(OPENCODE_USER_BACKUP)) {
+      const original = readFileSync(OPENCODE_USER_BACKUP)
+      const temporary = `${OPENCODE_USER_FILE}.${process.pid}.tmp`
+      writeFileSync(temporary, original)
+      renameSync(temporary, OPENCODE_USER_FILE)
+      rmSync(OPENCODE_USER_BACKUP, { force: true })
+      return true
+    }
+    if (!existsSync(OPENCODE_USER_FILE)) return false
+    const document = JSON.parse(readFileSync(OPENCODE_USER_FILE, 'utf8'))
+    if (!document || typeof document !== 'object') return false
+    let changed = false
+    if (document.provider && typeof document.provider === 'object' && 'orca-router' in document.provider) {
+      delete document.provider['orca-router']
+      changed = true
+    }
+    for (const key of ['model', 'small_model']) {
+      if (typeof document[key] === 'string' && document[key].startsWith('orca-router/')) {
+        delete document[key]
+        changed = true
+      }
+    }
+    if (!changed) return false
+    // If the file was created by us and holds nothing else, remove it entirely.
+    const unrelated = Object.keys(document).filter((key) => !['$schema', 'disabled_providers', 'provider'].includes(key))
+    const emptyProvider = !document.provider || Object.keys(document.provider).length === 0
+    if (!unrelated.length && emptyProvider) {
+      rmSync(OPENCODE_USER_FILE, { force: true })
+      return true
+    }
+    const temporary = `${OPENCODE_USER_FILE}.${process.pid}.tmp`
+    writeFileSync(temporary, `${JSON.stringify(document, null, 2)}\n`)
+    renameSync(temporary, OPENCODE_USER_FILE)
+    return true
+  } catch {
+    return false
   }
 }
 
@@ -878,12 +916,13 @@ function normalizeUsageFetchInput(value) {
 }
 
 async function refreshSettings(orca) {
-  const wasEnabled = settings.enabled
+  const wasGlobal = settings.enabled && settings.routeOutsideOrca
   try {
     const live = await orca.settings.get()
     if (live && typeof live === 'object') {
       settings = {
         enabled: live.enabled ?? true,
+        routeOutsideOrca: live.routeOutsideOrca === true,
         port: live.port ?? 18080,
         bindHost: live.bindHost ?? '127.0.0.1',
         timeoutMs: live.timeoutMs ?? 600000,
@@ -894,11 +933,11 @@ async function refreshSettings(orca) {
   } catch {
     /* keep cache: hook must stay synchronous */
   }
-  if (wasEnabled !== settings.enabled) {
-    if (!settings.enabled) stopCodexConfigGuard()
-    await syncCodexGlobal(orca, config).catch(() => {})
+  // Turning either switch off removes the global blocks; turning both on
+  // publishes them again. Orca-launched agents are unaffected either way.
+  if (wasGlobal !== (settings.enabled && settings.routeOutsideOrca)) {
+    await syncGlobalAgentConfig(orca, config).catch(() => {})
   }
-  if (settings.enabled && sidecar?.status().running) startCodexConfigGuard(orca)
 }
 
 function effectiveConfig() {
@@ -927,29 +966,18 @@ function gatewayAddress() {
   return `http://${host}:${port}`
 }
 
-function syncOpenCodeGlobal(current) {
-  if (!settings.enabled || !current || !sidecar?.status().running) return null
-  return syncOpenCodeUserConfig(current, {
-    base: gatewayAddress(),
-    token: current.token || 'orca-router'
-  })
-}
-
 async function ensureRunning(orca) {
   if (sidecar?.status().running) {
-    syncOpenCodeGlobal(config)
-    await syncCodexGlobal(orca, config)
-    startCodexConfigGuard(orca)
+    await syncGlobalAgentConfig(orca, config)
     return
   }
   try {
     boundAddress = await sidecar.start(settings.bindHost, settings.port)
     await announce(orca, true, boundAddress.port)
-    syncOpenCodeGlobal(config)
-    await syncCodexGlobal(orca, config)
-    startCodexConfigGuard(orca)
+    await syncGlobalAgentConfig(orca, config)
   } catch (error) {
-    stopCodexConfigGuard()
+    // The sidecar is down, so the global writes must not be left behind.
+    await syncGlobalAgentConfig(orca, config).catch(() => {})
     await hostCall(orca, 'notifications.show', {
       title: 'Orca LLM Router',
       body: `Sidecar failed to start: ${error?.message ?? error}`
@@ -958,10 +986,10 @@ async function ensureRunning(orca) {
 }
 
 async function stopSidecar(orca) {
-  stopCodexConfigGuard()
   await sidecar?.stop?.().catch(() => {})
   boundAddress = null
-  await restoreCodexGlobal(orca).catch(() => {})
+  // The sidecar is stopped now, so this always takes the restore path.
+  await syncGlobalAgentConfig(orca, config)
   await announce(orca, false, settings.port)
 }
 
@@ -1024,11 +1052,10 @@ async function persistConfig(orca, next, options = {}) {
   logMigrationSummary(previous, config)
   await orca.storage.set(CONFIG_KEY, config)
   await refreshSecrets(orca)
-  // Keep the model list a plain `opencode` terminal sees in sync with provider
-  // and key changes made in the panel, and refresh Codex native chat too.
-  syncOpenCodeGlobal(config)
-  await syncCodexGlobal(orca, config)
-  startCodexConfigGuard(orca)
+  // When opted in, keep a plain terminal's Codex/OpenCode config in sync with
+  // provider and key changes made in the panel. Otherwise this clears any
+  // stale global block left by an older version.
+  await syncGlobalAgentConfig(orca, config)
   return config
 }
 
@@ -1163,10 +1190,10 @@ export default async function activate(orca) {
 
   if (settings.enabled) await ensureRunning(orca)
   else await announce(orca, false, settings.port)
-  // A previous run may have left the managed Codex block behind after a crash;
-  // restore first, then publish the current provider/catalog.
-  await syncCodexGlobal(orca, config).catch(() => {})
-  startCodexConfigGuard(orca)
+  // A previous run or an older version may have left the global Codex block
+  // or OpenCode provider behind. With the opt-in off this clears them; with it
+  // on the current provider/catalog is (re)published.
+  await syncGlobalAgentConfig(orca, config).catch(() => {})
 
   // --- panel requests ---
   orca.panels.handle('router.status', async () => {
@@ -2033,8 +2060,7 @@ async function testProviders(only) {
 }
 
 export async function deactivate() {
-  stopCodexConfigGuard()
-  await restoreCodexGlobal(activeOrca).catch(() => {})
+  await restoreGlobalAgentConfig(activeOrca)
   // Close any web-chat auth browser and remove its throwaway profiles.
   for (const [, session] of authSessions) {
     try { session?.cdp?.close?.() } catch { /* noop */ }

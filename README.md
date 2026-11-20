@@ -198,6 +198,7 @@ Save tokens, cut costs, and boost inference speed with three optional optimizati
 
 - **Localhost Bound**: The gateway listens on `127.0.0.1:18080`. No external network exposure.
 - **Encrypted Secret Storage**: All API keys and browser session cookies are stored in Orca’s encrypted `secrets:own` vault.
+- **Orca Agents Route by Default**: Agents you launch in Orca are pointed at the gateway through per-launch overrides. Your global Codex/OpenCode config is left untouched unless you enable **Also route Codex and OpenCode outside Orca** in the plugin settings; when enabled, the added entries are removed again when the router stops or the setting is turned off.
 - **Zero Telemetry**: No tracking, analytics, or external calls of any kind. What happens in Orca stays in Orca.
 
 ---
