@@ -11,6 +11,10 @@ import {
   applyCodexGlobal,
   buildCodexManagedConfig,
   injectCodexProvider,
+  modelsDevCandidates,
+  modelsDevIndex,
+  modelsDevLimits,
+  modelsDevWindowsForConfig,
   restoreCodexGlobal
 } from '../worker/main.mjs'
 import {
@@ -20,6 +24,9 @@ import {
   buildAgentLaunchEnv,
   buildOpenCodeConfig,
   buildCodexModelCatalog,
+  extractModelLimits,
+  resolveModelLimits,
+  resolveSelectorLimits,
   mergeOpenCodeConfig,
   convertLegacyConfig,
   convertClaudeCodeRouterConfig,
@@ -3739,3 +3746,278 @@ test('normalizeConfig seeds one sample VPN server only when none were configured
   const cleared = testConfig({ vpnServers: [], vpnSampleDismissed: true })
   assert.deepEqual(cleared.vpnServers, [])
 })
+
+// ---------------------------------------------------------------------------
+// Model context windows
+// ---------------------------------------------------------------------------
+
+test('extractModelLimits reads the common provider spellings', () => {
+  assert.deepEqual(
+    extractModelLimits({ id: 'openrouter/model', context_length: 1_000_000, top_provider: { max_completion_tokens: 65_536 } }),
+    { contextWindow: 1_000_000, maxOutput: 65_536 }
+  )
+  assert.deepEqual(
+    extractModelLimits({ id: 'gemini-pro', inputTokenLimit: 1_048_576, outputTokenLimit: 65_536 }),
+    { contextWindow: 1_048_576, maxOutput: 65_536 }
+  )
+  assert.deepEqual(extractModelLimits({ id: 'vllm', max_model_len: 32_768 }), { contextWindow: 32_768 })
+  assert.deepEqual(
+    extractModelLimits({ id: 'gateway', max_input_tokens: 200_000, max_output_tokens: 8_192 }),
+    { contextWindow: 200_000, maxOutput: 8_192 }
+  )
+  // A plain OpenAI list has no limits, and invalid values are ignored.
+  assert.equal(extractModelLimits({ id: 'gpt' }), null)
+  assert.equal(extractModelLimits({ id: 'bad', context_length: -1, max_output_tokens: 0 }), null)
+  assert.equal(extractModelLimits(null), null)
+})
+
+test('normalizeConfig keeps modelWindows and per-model limit overrides', () => {
+  const config = normalizeConfig({
+    version: 3,
+    providers: [{
+      name: 'cloud',
+      baseUrl: 'https://cloud.example.com/v1',
+      protocols: ['openai_chat_completions'],
+      keys: [],
+      models: [
+        { id: 'large', contextWindow: 1_000_000, maxOutput: 65_536 },
+        { id: 'bare' }
+      ]
+    }],
+    routes: [],
+    aliases: {},
+    modelWindows: {
+      'cloud\u0000bare': { contextWindow: 128_000, maxOutput: 8_192, source: 'discovery', at: 1 },
+      'url:https://legacy.example.com/v1\u0000old': { contextWindow: 32_000 },
+      'cloud\u0000broken': { contextWindow: 0 }
+    }
+  })
+  assert.deepEqual(config.modelWindows['cloud\u0000bare'], {
+    contextWindow: 128_000,
+    maxOutput: 8_192,
+    source: 'discovery',
+    at: 1
+  })
+  assert.deepEqual(config.modelWindows['url:https://legacy.example.com/v1\u0000old'], { contextWindow: 32_000 })
+  assert.equal(config.modelWindows['cloud\u0000broken'], undefined)
+  const large = config.providers[0].models.find((model) => model.id === 'large')
+  assert.equal(large.contextWindow, 1_000_000)
+  assert.equal(large.maxOutput, 65_536)
+})
+
+test('resolveModelLimits prefers the explicit entry, then provider and URL caches', () => {
+  const config = normalizeConfig({
+    version: 3,
+    providers: [{
+      name: 'cloud',
+      baseUrl: 'https://cloud.example.com/v1',
+      protocols: ['openai_chat_completions'],
+      keys: [],
+      models: [
+        { id: 'explicit', contextWindow: 200_000 },
+        { id: 'cached' },
+        { id: 'url-only' },
+        { id: 'partial', maxOutput: 4_096 }
+      ]
+    }],
+    routes: [],
+    aliases: {},
+    modelWindows: {
+      'cloud\u0000explicit': { contextWindow: 999_999, maxOutput: 1 },
+      'cloud\u0000cached': { contextWindow: 128_000, maxOutput: 8_192 },
+      'url:https://cloud.example.com/v1\u0000url-only': { contextWindow: 262_144 },
+      'cloud\u0000partial': { contextWindow: 64_000, maxOutput: 8_192 }
+    }
+  })
+  // Fields merge with the cache: the entry only overrides what it sets.
+  assert.deepEqual(resolveModelLimits(config, 'cloud', 'explicit'), { contextWindow: 200_000, maxOutput: 1 })
+  assert.deepEqual(resolveModelLimits(config, 'cloud', 'cached'), { contextWindow: 128_000, maxOutput: 8_192 })
+  assert.deepEqual(resolveModelLimits(config, 'cloud', 'url-only'), { contextWindow: 262_144 })
+  // Fields merge: an explicit maxOutput still takes the cached context.
+  assert.deepEqual(resolveModelLimits(config, 'cloud', 'partial'), { contextWindow: 64_000, maxOutput: 4_096 })
+  assert.equal(resolveModelLimits(config, 'cloud', 'missing'), null)
+})
+
+test('resolveSelectorLimits handles routes and aliases with a conservative window', () => {
+  const config = normalizeConfig({
+    version: 3,
+    providers: [
+      {
+        name: 'big',
+        baseUrl: 'https://big.example.com/v1',
+        protocols: ['openai_chat_completions'],
+        keys: [],
+        models: [{ id: 'model', contextWindow: 1_000_000, maxOutput: 65_536 }]
+      },
+      {
+        name: 'small',
+        baseUrl: 'https://small.example.com/v1',
+        protocols: ['openai_chat_completions'],
+        keys: [],
+        models: [{ id: 'model', contextWindow: 32_000, maxOutput: 4_096 }]
+      }
+    ],
+    routes: [{
+      name: 'fallback',
+      targets: [{ provider: 'big', model: 'model' }, { provider: 'small', model: 'model' }],
+      strategy: 'ordered'
+    }],
+    aliases: { alias: 'big/model' }
+  })
+  assert.deepEqual(resolveSelectorLimits(config, 'big/model'), { contextWindow: 1_000_000, maxOutput: 65_536 })
+  // A failover route reports the smallest known window across its targets.
+  assert.deepEqual(resolveSelectorLimits(config, 'fallback'), { contextWindow: 32_000, maxOutput: 4_096 })
+  assert.deepEqual(resolveSelectorLimits(config, 'alias'), { contextWindow: 1_000_000, maxOutput: 65_536 })
+  // Bare ids resolve only when a provider owns them.
+  assert.equal(resolveSelectorLimits(config, 'model'), null)
+})
+
+test('buildOpenCodeConfig publishes limits only for models with known windows', () => {
+  const config = testConfig({
+    providers: [
+      {
+        name: 'cloud',
+        baseUrl: 'https://cloud.example.com/v1',
+        protocols: ['openai_chat_completions'],
+        keys: [],
+        models: [{ id: 'known', contextWindow: 1_000_000, maxOutput: 65_536 }, { id: 'unknown' }]
+      }
+    ],
+    modelWindows: { 'cloud\u0000cached': { contextWindow: 262_144 } },
+    routes: [{ name: 'cloud-route', targets: [{ provider: 'cloud', model: 'cached' }], strategy: 'ordered' }]
+  })
+  const { document } = buildOpenCodeConfig(config, { base: 'http://127.0.0.1:18080', token: 'orca-router' })
+  const models = document.provider['orca-router'].models
+  assert.deepEqual(models['cloud/known'].limit, { context: 1_000_000, output: 65_536 })
+  assert.equal(models['cloud/unknown'].limit, undefined)
+  // Routes and aliases inherit the resolved target window.
+  assert.deepEqual(models['cloud-route'].limit, { context: 262_144 })
+})
+
+test('buildCodexModelCatalog sets a per-model context window', () => {
+  const config = testConfig({
+    providers: [{
+      name: 'cloud',
+      baseUrl: 'https://cloud.example.com/v1',
+      protocols: ['openai_chat_completions'],
+      keys: [],
+      models: [{ id: 'large', contextWindow: 1_000_000 }, { id: 'small', contextWindow: 32_000 }, { id: 'unknown' }]
+    }]
+  })
+  const { document } = buildCodexModelCatalog(config, { agentId: 'codex' })
+  const bySlug = new Map(document.models.map((model) => [model.slug, model]))
+  assert.equal(bySlug.get('cloud/large').context_window, 1_000_000)
+  assert.equal(bySlug.get('cloud/large').max_context_window, 1_000_000)
+  assert.equal(bySlug.get('cloud/small').context_window, 32_000)
+  // Unknown models keep the historical fallback.
+  assert.equal(bySlug.get('cloud/unknown').context_window, 128_000)
+})
+
+test('GET /v1/models exposes context_length and max_output_tokens', async () => {
+  const config = testConfig({
+    providers: [{
+      name: 'cloud',
+      baseUrl: 'https://cloud.example.com/v1',
+      protocols: ['openai_chat_completions'],
+      keys: [],
+      models: [{ id: 'known', contextWindow: 1_000_000, maxOutput: 65_536 }, { id: 'unknown' }]
+    }],
+    aliases: { fast: 'cloud/known' }
+  })
+  await withSidecar(config, async () => new Response('{}'), async (base) => {
+    const response = await fetch(`${base}/v1/models`)
+    assert.equal(response.status, 200)
+    const body = await response.json()
+    const byId = new Map(body.data.map((model) => [model.id, model]))
+    assert.equal(byId.get('cloud/known').context_length, 1_000_000)
+    assert.equal(byId.get('cloud/known').max_output_tokens, 65_536)
+    assert.equal(byId.get('cloud/unknown').context_length, undefined)
+    assert.equal(byId.get('fast').context_length, 1_000_000)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// models.dev catalog
+// ---------------------------------------------------------------------------
+
+test('modelsDevCandidates maps dated aliases to catalog ids', () => {
+  assert.deepEqual(modelsDevCandidates('deepseek-v4.1-flash-1017'), [
+    'deepseek-v4.1-flash-1017',
+    'deepseek-v4.1-flash'
+  ])
+  assert.deepEqual(modelsDevCandidates('MiniMax/MiniMax-M3'), ['minimax/minimax-m3', 'minimax-m3'])
+  // A normal id is not truncated: only 3-4 trailing digits look like a date.
+  assert.deepEqual(modelsDevCandidates('gpt-5.5'), ['gpt-5.5'])
+  assert.deepEqual(modelsDevCandidates('model-2026'), ['model-2026', 'model'])
+  assert.deepEqual(modelsDevCandidates(''), [])
+})
+
+test('modelsDevLimits reads models.dev context and output limits', () => {
+  assert.deepEqual(modelsDevLimits({ limit: { context: 1_000_000, output: 384_000 } }), {
+    contextWindow: 1_000_000,
+    maxOutput: 384_000
+  })
+  assert.deepEqual(modelsDevLimits({ limit: { context: 262_144 } }), { contextWindow: 262_144 })
+  assert.deepEqual(modelsDevLimits({ limit: { context: 0, output: -1 } }), {})
+  assert.deepEqual(modelsDevLimits({}), {})
+})
+
+test('modelsDevIndex keys providers by their API URL', () => {
+  const catalog = {
+    'alibaba-token-plan-cn': {
+      api: 'https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/',
+      models: {
+        'deepseek-v4.1-flash': { limit: { context: 1_000_000, output: 384_000 } },
+        'glm-5.3': { limit: { context: 1_000_000, output: 131_072 } },
+        'no-window': { limit: {} }
+      }
+    },
+    'no-api': { models: { x: { limit: { context: 1 } } } }
+  }
+  const index = modelsDevIndex(catalog)
+  assert.deepEqual([...index.keys()], ['https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1'])
+  const provider = index.get('https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1')
+  assert.deepEqual(provider.get('deepseek-v4.1-flash'), { contextWindow: 1_000_000, maxOutput: 384_000 })
+  assert.equal(provider.has('no-window'), false)
+})
+
+test('modelsDevWindowsForConfig matches base URL and dated model ids', () => {
+  const baseUrl = 'https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1'
+  const config = normalizeConfig({
+    version: 3,
+    providers: [{
+      name: 'aliyun',
+      baseUrl,
+      protocols: ['openai_chat_completions'],
+      keys: [],
+      models: [{ id: 'deepseek-v4.1-flash-1017' }, { id: 'glm-5.3' }, { id: 'kimi-k3' }]
+    }],
+    routes: [],
+    aliases: {},
+    modelWindows: {
+      [`url:${baseUrl}\u0000glm-5.3`]: { contextWindow: 999, source: 'discovery', at: 1 }
+    }
+  })
+  const catalog = {
+    'alibaba-token-plan-cn': {
+      api: baseUrl,
+      models: {
+        'deepseek-v4.1-flash': { limit: { context: 1_000_000, output: 384_000 } },
+        'glm-5.3': { limit: { context: 1_000_000, output: 131_072 } }
+      }
+    }
+  }
+  const { windows, providerCount } = modelsDevWindowsForConfig(config, catalog, 42)
+  assert.equal(providerCount, 1)
+  assert.deepEqual(windows[`url:${baseUrl}\u0000deepseek-v4.1-flash-1017`], {
+    contextWindow: 1_000_000,
+    maxOutput: 384_000,
+    source: 'models-dev',
+    at: 42
+  })
+  // An id missing from the catalog stays absent (falls back to 128k).
+  assert.equal(windows[`url:${baseUrl}\u0000kimi-k3`], undefined)
+  // Discovery already learned glm-5.3 and must not be overwritten.
+  assert.equal(windows[`url:${baseUrl}\u0000glm-5.3`], undefined)
+})
+

@@ -452,10 +452,96 @@ function migrateLegacyChains({ policies, routes, aliases, providers, defaultFall
   }
 }
 
+// Context/output limits are not part of the OpenAI /v1/models contract, and
+// every provider spells them differently. Discovery reads the common aliases
+// (OpenRouter, Gemini, vLLM, Anthropic-style gateways) and the gateway falls
+// back to a per-model cache when the agent asks for catalog metadata.
+const MODEL_CONTEXT_FIELDS = [
+  'contextWindow', 'context_length', 'context_window', 'contextLength',
+  'maxContextWindow', 'max_context_window', 'max_context_length', 'maxContextLength',
+  'max_input_tokens', 'maxInputTokens', 'inputTokenLimit', 'input_token_limit',
+  'max_model_len', 'maxModelLen'
+]
+const MODEL_OUTPUT_FIELDS = [
+  'maxOutput', 'max_output_tokens', 'maxOutputTokens', 'outputTokenLimit',
+  'output_token_limit', 'max_completion_tokens', 'maxCompletionTokens'
+]
+export const DEFAULT_MODEL_CONTEXT_WINDOW = 128000
+
+function positiveModelLimit(value) {
+  const number = Number(value)
+  return Number.isFinite(number) && number > 0 ? Math.floor(number) : null
+}
+
+function pickModelLimit(raw, fields) {
+  if (!raw || typeof raw !== 'object') return null
+  for (const field of fields) {
+    const value = positiveModelLimit(raw[field])
+    if (value) return value
+  }
+  return null
+}
+
+// Normalize a single upstream model object from /v1/models into limits.
+export function extractModelLimits(raw) {
+  if (!raw || typeof raw !== 'object') return null
+  let contextWindow = pickModelLimit(raw, MODEL_CONTEXT_FIELDS)
+  let maxOutput = pickModelLimit(raw, MODEL_OUTPUT_FIELDS)
+  // OpenRouter nests the useful numbers under top_provider.
+  const top = raw.top_provider ?? raw.topProvider
+  if (top && typeof top === 'object') {
+    contextWindow ??= pickModelLimit(top, MODEL_CONTEXT_FIELDS)
+    maxOutput ??= pickModelLimit(top, MODEL_OUTPUT_FIELDS)
+  }
+  if (!contextWindow && !maxOutput) return null
+  return {
+    ...(contextWindow ? { contextWindow } : {}),
+    ...(maxOutput ? { maxOutput } : {})
+  }
+}
+
+// Canonicalize a configured/cached limits object.
+export function normalizeModelLimits(value) {
+  if (!value || typeof value !== 'object') return null
+  const contextWindow = pickModelLimit(value, MODEL_CONTEXT_FIELDS)
+  const maxOutput = pickModelLimit(value, MODEL_OUTPUT_FIELDS)
+  if (!contextWindow && !maxOutput) return null
+  return {
+    ...(contextWindow ? { contextWindow } : {}),
+    ...(maxOutput ? { maxOutput } : {})
+  }
+}
+
+function normalizeModelWindows(input) {
+  const result = {}
+  if (!input || typeof input !== 'object') return result
+  for (const [key, value] of Object.entries(input)) {
+    const limits = normalizeModelLimits(value)
+    if (!limits || !key) continue
+    const at = Number(value?.at)
+    result[String(key)] = {
+      ...limits,
+      ...(value?.source ? { source: String(value.source) } : {}),
+      ...(Number.isFinite(at) && at > 0 ? { at } : {})
+    }
+  }
+  return result
+}
+
 function normalizeModelEntry(model) {
   if (typeof model === 'string') return { id: model }
-  if (model && typeof model === 'object' && model.id) return { ...model, id: String(model.id) }
-  return null
+  if (!model || typeof model !== 'object' || !model.id) return null
+  const entry = { ...model, id: String(model.id) }
+  const limits = normalizeModelLimits(model)
+  if (limits?.contextWindow) entry.contextWindow = limits.contextWindow
+  else delete entry.contextWindow
+  if (limits?.maxOutput) entry.maxOutput = limits.maxOutput
+  else delete entry.maxOutput
+  for (const field of [...MODEL_CONTEXT_FIELDS, ...MODEL_OUTPUT_FIELDS]) {
+    if (field === 'contextWindow' || field === 'maxOutput') continue
+    delete entry[field]
+  }
+  return entry
 }
 
 export function normalizeProvider(provider) {
@@ -605,12 +691,79 @@ export function normalizeConfig(input) {
     contextRelay: normalizeContextRelay(source.contextRelay ?? DEFAULT_CONFIG.contextRelay),
     responseCache: normalizeResponseCache(source.responseCache ?? DEFAULT_CONFIG.responseCache),
     modelDescriptions: source.modelDescriptions ?? {},
+    // Discovery-captured context/output windows, keyed by `provider\u0000model`
+    // and `url:<baseUrl>\u0000model`. Kept separate from provider.models so
+    // re-selecting a model in the panel cannot erase what we learned.
+    modelWindows: normalizeModelWindows(source.modelWindows),
     logBodyCapture: ['all', 'errors', 'none'].includes(source.logBodyCapture) ? source.logBodyCapture : 'errors',
     persistLogs: source.persistLogs === true,
     allowUnauthenticatedRemote: source.allowUnauthenticatedRemote === true,
     exposeRoutingHeaders: source.exposeRoutingHeaders === true,
     bindHost: typeof source.bindHost === 'string' ? source.bindHost : undefined
   }
+}
+
+// Resolve the context/output limits for one provider model. Explicit values on
+// the model entry win field-by-field; the discovery cache fills the rest. The
+// URL key keeps windows learned in an unsaved form useful after it is saved.
+export function resolveModelLimits(config, providerName, modelId) {
+  if (!modelId) return null
+  const provider = (config?.providers ?? []).find(
+    (item) => item.name === providerName || slug(item.name) === slug(providerName)
+  )
+  const entry = (provider?.models ?? []).find((model) => model.id === modelId)
+  const explicit = normalizeModelLimits(entry)
+  const cache = config?.modelWindows ?? {}
+  let learned = null
+  const keys = []
+  if (providerName) keys.push(`${providerName}\u0000${modelId}`)
+  const baseUrl = String(provider?.baseUrl ?? provider?.endpoints?.[0]?.baseUrl ?? '').replace(/\/+$/, '')
+  if (baseUrl) keys.push(`url:${baseUrl}\u0000${modelId}`)
+  for (const key of keys) {
+    const hit = normalizeModelLimits(cache[key])
+    if (hit) learned = { ...(learned ?? {}), ...hit }
+  }
+  const merged = { ...(learned ?? {}), ...(explicit ?? {}) }
+  return Object.keys(merged).length ? merged : null
+}
+
+// Resolve a routable selector: `provider/model`, route name, alias, or a bare
+// model id that belongs to exactly one provider. A route reports the smallest
+// known window across its targets, so a failover cannot silently overflow a
+// smaller fallback.
+export function resolveSelectorLimits(config, selector) {
+  const text = String(selector ?? '').trim()
+  if (!text) return null
+  const providers = config?.providers ?? []
+  const route = (config?.routes ?? []).find((item) => item.name === text)
+  if (route) {
+    const known = (route.targets ?? [])
+      .map((target) => resolveModelLimits(config, target.provider, target.model))
+      .filter(Boolean)
+    if (!known.length) return null
+    const contexts = known.map((item) => item.contextWindow).filter(Boolean)
+    const outputs = known.map((item) => item.maxOutput).filter(Boolean)
+    return {
+      ...(contexts.length ? { contextWindow: Math.min(...contexts) } : {}),
+      ...(outputs.length ? { maxOutput: Math.min(...outputs) } : {})
+    }
+  }
+  const aliasTarget = config?.aliases?.[text]
+  if (typeof aliasTarget === 'string' && aliasTarget && aliasTarget !== text) {
+    const resolved = resolveSelectorLimits(config, aliasTarget)
+    if (resolved) return resolved
+  }
+  const slash = text.indexOf('/')
+  if (slash > 0) {
+    const providerName = text.slice(0, slash)
+    const modelId = text.slice(slash + 1)
+    const provider = providers.find(
+      (item) => item.name === providerName || slug(item.name) === slug(providerName)
+    )
+    if (provider) return resolveModelLimits(config, provider.name, modelId)
+  }
+  const owners = providers.filter((provider) => (provider.models ?? []).some((model) => model.id === text))
+  return owners.length === 1 ? resolveModelLimits(config, owners[0].name, text) : null
 }
 
 // ---------------------------------------------------------------------------
@@ -2212,7 +2365,18 @@ export function buildOpenCodeConfig(config, { base, token, agentId = '' } = {}) 
   const { entries, model } = routerModelEntries(normalized, agentId)
   const models = {}
   for (const { selector, description } of entries) {
-    models[selector] = { name: description ? `${selector} — ${description}` : selector }
+    const limits = resolveSelectorLimits(normalized, selector)
+    models[selector] = {
+      name: description ? `${selector} — ${description}` : selector,
+      ...(limits?.contextWindow || limits?.maxOutput
+        ? {
+            limit: {
+              ...(limits?.contextWindow ? { context: limits.contextWindow } : {}),
+              ...(limits?.maxOutput ? { output: limits.maxOutput } : {})
+            }
+          }
+        : {})
+    }
   }
   const provider = 'orca-router'
   const document = {
@@ -2289,13 +2453,19 @@ const CODEX_CATALOG_TEMPLATE = {
 export function buildCodexModelCatalog(config, { agentId = '' } = {}) {
   const normalized = normalizeConfig(config)
   const { entries, model } = routerModelEntries(normalized, agentId)
-  const models = entries.map(({ selector, description }, index) => ({
-    ...CODEX_CATALOG_TEMPLATE,
-    slug: selector,
-    display_name: selector,
-    description: description || `Orca LLM Router model ${selector}`,
-    priority: index + 1
-  }))
+  const models = entries.map(({ selector, description }, index) => {
+    const limits = resolveSelectorLimits(normalized, selector)
+    const contextWindow = limits?.contextWindow ?? CODEX_CATALOG_TEMPLATE.context_window
+    return {
+      ...CODEX_CATALOG_TEMPLATE,
+      slug: selector,
+      display_name: selector,
+      description: description || `Orca LLM Router model ${selector}`,
+      context_window: contextWindow,
+      max_context_window: contextWindow,
+      priority: index + 1
+    }
+  })
   return { document: { models }, model }
 }
 
@@ -4418,13 +4588,29 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
         const id = `${provider.name}/${model.id}`
         if (seen.has(id)) continue
         seen.add(id)
-        data.push({ id, object: 'model', owned_by: provider.name, ...(model.description ? { description: model.description } : {}) })
+        const limits = resolveModelLimits(config, provider.name, model.id)
+        data.push({
+          id,
+          object: 'model',
+          owned_by: provider.name,
+          ...(model.description ? { description: model.description } : {}),
+          ...(limits?.contextWindow ? { context_length: limits.contextWindow } : {}),
+          ...(limits?.maxOutput ? { max_output_tokens: limits.maxOutput } : {})
+        })
       }
     }
     for (const [alias, target] of Object.entries(config.aliases ?? {})) {
       if (!target || seen.has(alias)) continue
       seen.add(alias)
-      data.push({ id: alias, object: 'model', owned_by: 'alias', ...(config.modelDescriptions?.[alias] ? { description: config.modelDescriptions[alias] } : {}) })
+      const limits = resolveSelectorLimits(config, alias)
+      data.push({
+        id: alias,
+        object: 'model',
+        owned_by: 'alias',
+        ...(config.modelDescriptions?.[alias] ? { description: config.modelDescriptions[alias] } : {}),
+        ...(limits?.contextWindow ? { context_length: limits.contextWindow } : {}),
+        ...(limits?.maxOutput ? { max_output_tokens: limits.maxOutput } : {})
+      })
     }
     return { object: 'list', data }
   }

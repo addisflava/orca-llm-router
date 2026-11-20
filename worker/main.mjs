@@ -41,6 +41,8 @@ import {
   probeProviderUsage,
   resolveUsageFetch,
   normalizeConfig,
+  extractModelLimits,
+  normalizeModelLimits,
   buildAgentLaunchEnv,
   buildOpenCodeConfig,
   buildCodexModelCatalog,
@@ -339,6 +341,7 @@ function codexConfigPath() {
   const home = process.env.CODEX_HOME || join(homedir(), '.codex')
   return join(home, 'config.toml')
 }
+
 
 function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
@@ -1194,6 +1197,7 @@ export default async function activate(orca) {
   // or OpenCode provider behind. With the opt-in off this clears them; with it
   // on the current provider/catalog is (re)published.
   await syncGlobalAgentConfig(orca, config).catch(() => {})
+  refreshModelsDev(orca)
 
   // --- panel requests ---
   orca.panels.handle('router.status', async () => {
@@ -1467,7 +1471,14 @@ export default async function activate(orca) {
       throw error
     }
     const wasPersisting = config?.persistLogs === true
-    await persistConfig(orca, next)
+    // The panel edits a snapshot taken before discovery. Merge the in-memory
+    // window cache last so saving a model list cannot erase what a Fetch
+    // models call just learned.
+    const merged = {
+      ...next,
+      modelWindows: { ...(next?.modelWindows ?? {}), ...(config?.modelWindows ?? {}) }
+    }
+    await persistConfig(orca, merged)
     if (config.persistLogs === true && !wasPersisting) {
       // Seed from the live buffer so enabling the toggle is immediate.
       persistedLogs = (sidecar?.logs ?? []).slice(-MAX_PERSISTED_LOGS)
@@ -1738,8 +1749,10 @@ export default async function activate(orca) {
     } else if (!key && secretKey) {
       key = secretsCache.get(secretKey) ?? undefined
     }
-    const models = await fetchModels({ baseUrl: resolvedBaseUrl, protocols: resolvedProtocols, key })
-    return { ok: true, models, provider: name ?? null }
+    const { models, limits } = await fetchModels({ baseUrl: resolvedBaseUrl, protocols: resolvedProtocols, key })
+    await rememberModelLimits(orca, { provider: name, baseUrl: resolvedBaseUrl, limits })
+    refreshModelsDev(orca)
+    return { ok: true, models, limits, provider: name ?? null }
   })
   orca.panels.handle('router.discoverAllModels', async () => {
     // Pull model ids from every configured provider in one pass, so the panel
@@ -1755,18 +1768,20 @@ export default async function activate(orca) {
         if (!baseUrl) return { provider: provider.name, models: [], error: 'no base URL' }
         const key = (provider.keys ?? []).map((entry) => secretsCache.get(entry.secretKey)).find(Boolean)
         try {
-          const models = await fetchModels({
+          const { models, limits } = await fetchModels({
             baseUrl,
             protocols: provider.protocols ?? provider.capabilities ?? [],
             key
           })
-          return { provider: provider.name, models }
+          return { provider: provider.name, baseUrl, models, limits }
         } catch (cause) {
           return { provider: provider.name, models: [], error: String(cause?.message ?? cause) }
         }
       })
     )
-    return { ok: true, providers: results }
+    await rememberModelLimits(orca, results.map(({ provider, baseUrl, limits }) => ({ provider, baseUrl, limits })))
+    refreshModelsDev(orca)
+    return { ok: true, providers: results.map(({ limits, baseUrl, ...entry }) => entry) }
   })
   orca.panels.handle('router.testUsage', async ({ provider: name, secretKey }) => {
     const provider = config.providers.find((item) => item.name === name)
@@ -1985,7 +2000,10 @@ function providerProbe(provider, key) {
 
 // Ask an endpoint for its model list, using the probe that matches its
 // protocol. Gemini lists under `models[].name` (strip the `models/` prefix),
-// everyone else under `data[].id`. Returns bare model ids.
+// everyone else under `data[].id`. Besides bare model ids this keeps the
+// context/output windows the provider happens to expose; OpenAI does not
+// define them, but OpenRouter, Gemini, vLLM and most gateways do under one of
+// the aliases handled by extractModelLimits().
 async function fetchModels({ baseUrl, protocols, key } = {}) {
   const probe = providerProbe({ baseUrl, protocols: protocols ?? [] }, key)
   const res = await fetch(probe.url, { method: 'GET', headers: probe.headers, signal: AbortSignal.timeout(12000) })
@@ -1995,11 +2013,177 @@ async function fetchModels({ baseUrl, protocols, key } = {}) {
   if (!res.ok) throw new Error(`model list returned ${res.status}`)
   const json = await res.json().catch(() => ({}))
   const raw = json.data ?? json.models ?? []
-  return [...new Set(
-    raw
-      .map((model) => String(model?.id ?? model?.name ?? model ?? '').replace(/^models\//, ''))
-      .filter(Boolean)
-  )].sort()
+  const models = []
+  const limits = {}
+  const seen = new Set()
+  for (const model of raw) {
+    const id = String(model?.id ?? model?.name ?? model ?? '').replace(/^models\//, '')
+    if (!id || seen.has(id)) continue
+    seen.add(id)
+    models.push(id)
+    const extracted = extractModelLimits(model)
+    if (extracted) limits[id] = extracted
+  }
+  return { models: models.sort(), limits }
+}
+
+// Persist discovered windows so launch-time catalogs (OpenCode, Codex) and the
+// gateway's /v1/models can use them without another network call. Saved
+// providers are keyed by name; every fetch is also keyed by URL so a custom
+// provider form that is saved later still finds the metadata. Failures are
+// non-fatal: discovery must still return the model list.
+async function rememberModelLimits(orca, input) {
+  const sources = (Array.isArray(input) ? input : [input]).filter(Boolean)
+  const next = structuredClone(config)
+  next.modelWindows = { ...(next.modelWindows ?? {}) }
+  const at = Date.now()
+  let changed = false
+  for (const { provider, baseUrl, limits } of sources) {
+    const ids = Object.keys(limits ?? {})
+    if (!ids.length) continue
+    const url = String(baseUrl ?? '').replace(/\/+$/, '')
+    for (const id of ids) {
+      const normalized = normalizeModelLimits(limits[id])
+      if (!normalized) continue
+      const entry = { ...normalized, source: 'discovery', at }
+      if (provider) next.modelWindows[`${provider}\u0000${id}`] = entry
+      if (url) next.modelWindows[`url:${url}\u0000${id}`] = entry
+      changed = true
+    }
+  }
+  if (!changed) return
+  try {
+    await persistConfig(orca, next)
+  } catch (cause) {
+    console.warn('[llm-router] could not cache model limits', cause?.message ?? cause)
+  }
+}
+
+// --- models.dev catalog -----------------------------------------------------
+// OpenCode and other agents read context windows from models.dev instead of
+// provider /v1/models responses (the OpenAI-compatible endpoints usually only
+// return ids). Fetch the same public catalog and match by the provider's API
+// URL, so a configured provider gets real windows without a third-party file.
+const MODELS_DEV_URL = 'https://models.dev/api.json'
+const MODELS_DEV_SYNC_KEY = 'router.modelsDevSynced'
+const MODELS_DEV_TTL_MS = 24 * 60 * 60 * 1000
+
+function normalizeBaseUrl(value) {
+  return String(value ?? '').trim().replace(/\/+$/, '').toLowerCase()
+}
+
+export function modelsDevCandidates(id) {
+  const base = String(id ?? '').trim().toLowerCase()
+  if (!base) return []
+  const candidates = new Set([base])
+  // A dated alias such as `deepseek-v4.1-flash-1017` maps to the catalog's
+  // `deepseek-v4.1-flash` entry. Only 3–4 digit suffixes are treated as dates.
+  const stripped = base.replace(/-\d{3,4}$/, '')
+  if (stripped !== base) {
+    candidates.add(stripped)
+    candidates.add(stripped.split('/').pop())
+  }
+  candidates.add(base.split('/').pop())
+  return [...candidates].filter(Boolean)
+}
+
+export function modelsDevLimits(model) {
+  const limit = model?.limit ?? {}
+  const contextWindow = Number(limit.context)
+  const maxOutput = Number(limit.output)
+  return {
+    ...(Number.isFinite(contextWindow) && contextWindow > 0 ? { contextWindow: Math.floor(contextWindow) } : {}),
+    ...(Number.isFinite(maxOutput) && maxOutput > 0 ? { maxOutput: Math.floor(maxOutput) } : {})
+  }
+}
+
+// Index models.dev by the provider's API URL. The same public catalog backs
+// OpenCode and other agents; matching the URL avoids provider-name aliases.
+export function modelsDevIndex(catalog) {
+  const byApi = new Map()
+  for (const provider of Object.values(catalog ?? {})) {
+    const api = normalizeBaseUrl(provider?.api)
+    if (!api) continue
+    const index = new Map()
+    for (const [id, model] of Object.entries(provider?.models ?? {})) {
+      const limits = modelsDevLimits(model)
+      if (!limits.contextWindow && !limits.maxOutput) continue
+      index.set(String(id).trim().toLowerCase(), limits)
+      const canonical = String(model?.canonical_model_id ?? '').trim().toLowerCase()
+      if (canonical && !index.has(canonical)) index.set(canonical, limits)
+    }
+    if (index.size) byApi.set(api, index)
+  }
+  return byApi
+}
+
+// Build the cache updates for the configured providers without touching the
+// clock or storage, so the matching rules can be tested in isolation.
+export function modelsDevWindowsForConfig(config, catalog, at = Date.now()) {
+  const byApi = modelsDevIndex(catalog)
+  const windows = {}
+  for (const provider of config?.providers ?? []) {
+    if (isWebChatTransport(provider)) continue
+    const baseUrl = normalizeBaseUrl(provider.baseUrl ?? provider.endpoints?.[0]?.baseUrl)
+    const index = baseUrl ? byApi.get(baseUrl) : null
+    if (!index) continue
+    for (const model of provider.models ?? []) {
+      const key = `url:${baseUrl}\u0000${model.id}`
+      const existing = config?.modelWindows?.[key]
+      // Upstream discovery (and anything a person set explicitly) wins.
+      if (existing?.source && existing.source !== 'models-dev') continue
+      let hit = null
+      for (const candidate of modelsDevCandidates(model.id)) {
+        hit = index.get(candidate)
+        if (hit) break
+      }
+      if (hit) windows[key] = { ...hit, source: 'models-dev', at }
+    }
+  }
+  return { windows, providerCount: byApi.size }
+}
+
+async function syncModelsDevWindows(orca, { force = false } = {}) {
+  const stored = await storageGet(orca, MODELS_DEV_SYNC_KEY)
+  const last = Number(stored.value?.at ?? 0)
+  if (!force && Date.now() - last < MODELS_DEV_TTL_MS) return false
+  let data
+  try {
+    const response = await fetch(MODELS_DEV_URL, { signal: AbortSignal.timeout(20000) })
+    if (!response.ok) throw new Error(`models.dev returned ${response.status}`)
+    data = await response.json()
+  } catch (cause) {
+    console.warn('[llm-router] models.dev refresh failed', cause?.message ?? cause)
+    await orca.storage.set(MODELS_DEV_SYNC_KEY, { at: Date.now(), error: String(cause?.message ?? cause) }).catch(() => {})
+    return false
+  }
+  const at = Date.now()
+  const { windows, providerCount } = modelsDevWindowsForConfig(config, data, at)
+  const next = structuredClone(config)
+  next.modelWindows = { ...(next.modelWindows ?? {}) }
+  let changed = false
+  for (const [key, entry] of Object.entries(windows)) {
+    if (JSON.stringify(next.modelWindows[key]) === JSON.stringify(entry)) continue
+    next.modelWindows[key] = entry
+    changed = true
+  }
+  await orca.storage.set(MODELS_DEV_SYNC_KEY, { at, providers: providerCount }).catch(() => {})
+  if (!changed) return false
+  config = jsonSafe(normalizeConfig(next))
+  await orca.storage.set(CONFIG_KEY, config).catch(() => {})
+  return true
+}
+
+// Refresh in the background: startup and Fetch models must not wait on a
+// multi-megabyte download, but once it lands the published catalogs are
+// rewritten so the next agent launch sees the values.
+function refreshModelsDev(orca) {
+  void syncModelsDevWindows(orca)
+    .then(async (changed) => {
+      if (!changed) return
+      await syncGlobalAgentConfig(orca, config).catch(() => {})
+    })
+    .catch(() => {})
 }
 
 async function testProviders(only) {

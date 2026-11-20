@@ -194,12 +194,36 @@ Save tokens, cut costs, and boost inference speed with three optional optimizati
 
 ---
 
+## Model Context Windows
+
+Agents need per-model context and output limits to report usage correctly and to avoid compacting long-context models early. Provider APIs do not agree on this metadata, so the router handles it in four layers:
+
+1. **Discovery** — `Fetch models` keeps the limits exposed by the provider. Common spellings are supported: `context_length` (OpenRouter), `top_provider.max_completion_tokens`, `inputTokenLimit` / `outputTokenLimit` (Gemini), `max_model_len` (vLLM), `max_input_tokens` / `max_output_tokens`, and `context_window` variants.
+2. **models.dev catalog** — most OpenAI-compatible endpoints only return model ids. The router fetches the same public catalog OpenCode uses (`https://models.dev/api.json`, cached for 24 hours) and matches a provider by its base URL. Model ids are matched exactly first, then with a trailing date suffix removed (`deepseek-v4.1-flash-1017` → `deepseek-v4.1-flash`). This is not tied to any third-party tool or local cache.
+3. **Manual override** — in a provider's **Models** box, add two optional columns:
+   ```
+   deepseek-v4.1-flash | 1000000 | 384000
+   kimi-k3 | 262144
+   ```
+   The format is `model-id | context window | max output`. Either column may be omitted.
+4. **Fallback** — models with no known window keep the previous behavior (128k for the Codex catalog; OpenCode gets no `limit` entry).
+
+Precedence is per field: an explicit value on the model entry wins, then the discovery cache (keyed by provider and by base URL), then models.dev, then the fallback. Routes and aliases inherit the smallest known window across their targets so a failover cannot silently overflow a smaller fallback.
+
+Where it lands:
+
+- OpenCode config: `provider["orca-router"].models[id].limit = { context, output }`
+- Codex catalog: per-model `context_window` / `max_context_window`
+- Gateway `GET /v1/models`: `context_length` and `max_output_tokens`
+
+Restart an agent session after changing windows — the catalogs are generated at launch.
+
 ## Privacy & Security
 
 - **Localhost Bound**: The gateway listens on `127.0.0.1:18080`. No external network exposure.
 - **Encrypted Secret Storage**: All API keys and browser session cookies are stored in Orca’s encrypted `secrets:own` vault.
 - **Orca Agents Route by Default**: Agents you launch in Orca are pointed at the gateway through per-launch overrides. Your global Codex/OpenCode config is left untouched unless you enable **Also route Codex and OpenCode outside Orca** in the plugin settings; when enabled, the added entries are removed again when the router stops or the setting is turned off.
-- **Zero Telemetry**: No tracking, analytics, or external calls of any kind. What happens in Orca stays in Orca.
+- **No Telemetry**: No tracking or analytics. Apart from your configured providers, the only outbound request is the public models.dev catalog lookup (once per 24 hours) used to resolve model context windows.
 
 ---
 
