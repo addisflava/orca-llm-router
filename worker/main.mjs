@@ -8,11 +8,13 @@
 //                   picker lists the gateway's providers and models; Codex gets
 //                   a generated model catalog plus per-launch `-c` provider
 //                   overrides. Those per-launch overrides cover every agent Orca
-//                   starts. Editing the user's global Codex/OpenCode config is
-//                   opt-in (`routeOutsideOrca`, off by default) and only exists
-//                   for a plain terminal `codex` / `opencode` or Orca's native
-//                   Codex chat; those writes are removed again when the router
-//                   stops, the plugin deactivates, or the setting is turned off.
+//                   starts. The Codex/OpenCode toggles in the Agents tab (or the
+//                   `routeOutsideOrca` setting) also publish the same provider
+//                   and full model list to those tools' global configs, so plain
+//                   terminal sessions see the same picker. Both catalogs are
+//                   regenerated whenever a provider's model list is saved. Those
+//                   writes are removed when the router stops, the plugin
+//                   deactivates, or the relevant switch is turned off.
 //   CLI -> sidecar (worker/sidecar.mjs) -> providers in the config, with
 //                   conditional routing rules, rewrites, aliases, fallback
 //                   chains, retries and per-provider credential pools.
@@ -26,7 +28,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { delimiter, dirname, join } from 'node:path'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import {
   DEFAULT_CONFIG,
   PROVIDER_PRESETS,
@@ -46,13 +48,15 @@ import {
   buildAgentLaunchEnv,
   buildOpenCodeConfig,
   buildCodexModelCatalog,
+  routerModelIds,
   mergeOpenCodeConfig,
   agentProfileFor,
   providerFromPreset,
   isWebChatTransport,
   webchatCatalog,
   webchatConfigured,
-  joinUpstreamUrl
+  joinUpstreamUrl,
+  normalizeBaseUrlInput
 } from './sidecar.mjs'
 import { normalizeVpnServer } from './proxy.mjs'
 import {
@@ -67,6 +71,7 @@ import {
 import { DeepSeekWebTransport, normalizeCredential as normalizeDeepSeekCred } from './webchat/deepseek.mjs'
 import { QwenWebTransport, normalizeCredential as normalizeQwenCred } from './webchat/qwen.mjs'
 import { ORCA_AGENTS } from './orca-agents.mjs'
+import { restoreAgentConfigs, writeAgentConfigs, piLaunchInfo, KILO_CONFIG_FILE } from './agent-config.mjs'
 
 const CONFIG_KEY = 'router.config'
 // Usage counters and provider health are runtime state, not settings. They are
@@ -147,6 +152,7 @@ export function panelLogEntry(entry) {
     upstream: entry.upstream ?? null,
     resolvedProvider: entry.resolvedProvider ?? null,
     route: entry.route ?? null,
+    agent: entry.agent ?? null,
     // Only the server's display name is shown; URLs and credentials never are.
     vpn: entry.vpn ?? null,
     credential: entry.credential ?? null,
@@ -174,9 +180,14 @@ export function panelLogEntry(entry) {
     tokens: entry.tokens ? {
       input: Number(entry.tokens.input ?? 0),
       output: Number(entry.tokens.output ?? 0),
-      cache: entry.tokens.cache != null ? Number(entry.tokens.cache) : undefined
+      cache: entry.tokens.cache != null ? Number(entry.tokens.cache) : undefined,
+      cacheRead: entry.tokens.cacheRead != null ? Number(entry.tokens.cacheRead) : undefined,
+      cacheWrite: entry.tokens.cacheWrite != null ? Number(entry.tokens.cacheWrite) : undefined,
+      cacheWrite1h: entry.tokens.cacheWrite1h != null ? Number(entry.tokens.cacheWrite1h) : undefined,
+      reasoning: entry.tokens.reasoning != null ? Number(entry.tokens.reasoning) : undefined
     } : null,
     cost: entry.cost != null ? Number(entry.cost) : null,
+    priceSource: entry.priceSource ?? null,
     compression: entry.compression ?? null,
     relay: entry.relay ?? null,
     cache: entry.cache ?? null,
@@ -203,6 +214,7 @@ const CLAUDE_SETTINGS_ENV_KEYS = [
   'NO_PROXY',
   'no_proxy',
   'CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT',
+  'CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY',
   'ANTHROPIC_MODEL',
   'OPENAI_MODEL',
   'MODEL',
@@ -576,46 +588,107 @@ export async function restoreCodexGlobal(orca) {
   return true
 }
 
-// Writing the user's global Codex/OpenCode config is opt-in. Orca-launched
-// agents already get the gateway through per-launch overrides, so these writes
-// only serve a plain terminal `codex` / `opencode` and Orca's native Codex
-// chat. There is deliberately no periodic re-insert: a block a person deletes
-// stays deleted until the next explicit config change or router start.
-export async function applyGlobalAgentConfig(orca, current) {
+// Orca's structured agent sessions (the Agents tab) read each agent's own
+// config instead of running the per-launch hook, so the Codex and OpenCode
+// toggles in the Agents tab are the opt-in for publishing the provider there.
+// `routeOutsideOrca` still forces both writes for plain terminal sessions and
+// older installs. There is deliberately no periodic re-insert: a block a
+// person deletes stays deleted until the next explicit config change or router
+// start.
+export async function applyGlobalAgentConfig(orca, current, { codex = true, opencode = true } = {}) {
   if (!orca || !current) return false
-  const catalog = writeCodexCatalog(current, { agentId: 'codex' })
-  if (catalog) {
-    const profile = agentProfileFor(normalizeConfig(current), 'codex')
-    await applyCodexGlobal(orca, {
-      base: gatewayAddress(),
-      token: current.token || 'orca-router',
-      catalogPath: catalog.path,
-      model: catalog.model,
-      reasoningEffort: profile?.reasoningEffort
-    }).catch(() => {})
+  if (codex) {
+    const catalog = writeCodexCatalog(current, { agentId: 'codex' })
+    if (catalog) {
+      const profile = agentProfileFor(normalizeConfig(current), 'codex')
+      await applyCodexGlobal(orca, {
+        base: gatewayAddress(),
+        token: current.token || 'orca-router',
+        catalogPath: catalog.path,
+        model: catalog.model,
+        reasoningEffort: profile?.reasoningEffort
+      }).catch(() => {})
+    }
   }
-  syncOpenCodeUserConfig(current, {
-    base: gatewayAddress(),
-    token: current.token || 'orca-router'
-  })
+  if (opencode) {
+    syncOpenCodeUserConfig(current, {
+      base: gatewayAddress(),
+      token: current.token || 'orca-router'
+    })
+  }
   return true
 }
 
-export async function restoreGlobalAgentConfig(orca) {
-  await restoreCodexGlobal(orca).catch(() => {})
-  restoreOpenCodeUserConfig()
+export async function restoreGlobalAgentConfig(orca, { codex = true, opencode = true } = {}) {
+  if (codex) await restoreCodexGlobal(orca).catch(() => {})
+  if (opencode && restoreOpenCodeUserConfig()) reloadOpenCodeConfig()
 }
 
-function globalAgentConfigActive() {
-  return settings.enabled && settings.routeOutsideOrca && sidecar?.status().running === true
+// Orca's structured agent sessions (the Agents tab) read each agent's own
+// config and never run the per-launch hook, so the Agents tab toggle is itself
+// the opt-in for publishing the provider there. `routeOutsideOrca` still forces
+// both on together for plain terminal sessions and older installs.
+export function openCodeProfileRouted(current = config) {
+  const normalized = normalizeConfig(current)
+  const profiles = ['opencode', 'opencode2']
+    .map((agentId) => agentProfileFor(normalized, agentId))
+    .filter(Boolean)
+  return profiles.length ? profiles.some((profile) => profile.enabled !== false) : true
+}
+
+export function codexProfileRouted(current = config) {
+  const profile = agentProfileFor(normalizeConfig(current), 'codex')
+  return profile ? profile.enabled !== false : true
+}
+
+function codexGlobalActive(current = config) {
+  if (!settings.enabled || sidecar?.status().running !== true) return false
+  return settings.routeOutsideOrca || codexProfileRouted(current)
+}
+
+function openCodeGlobalActive(current = config) {
+  if (!settings.enabled || sidecar?.status().running !== true) return false
+  return settings.routeOutsideOrca || openCodeProfileRouted(current)
+}
+
+// Every other agent that reads its provider from its own config file is also
+// opt-in: an enabled Agents-tab profile (or routeOutsideOrca) publishes the
+// router catalog to Gemini, Qwen, Crush, Droid and the rest. Without this the
+// config-file agents would only be written when Codex or OpenCode happened to
+// be enabled too.
+function otherAgentGlobalActive(current = config) {
+  if (!settings.enabled || sidecar?.status().running !== true) return false
+  if (settings.routeOutsideOrca) return true
+  const profiles = normalizeConfig(current).agentProfiles ?? []
+  return profiles.some((profile) => {
+    if (!profile || profile.enabled === false) return false
+    const agent = String(profile.agent ?? '').toLowerCase()
+    return !['codex', 'opencode', 'opencode2'].includes(agent)
+  })
 }
 
 async function syncGlobalAgentConfig(orca, current) {
-  if (!orca || !globalAgentConfigActive()) {
-    await restoreGlobalAgentConfig(orca)
+  if (!orca) return false
+  const codex = codexGlobalActive(current)
+  const opencode = openCodeGlobalActive(current)
+  const others = otherAgentGlobalActive(current)
+  if (!codex) await restoreCodexGlobal(orca).catch(() => {})
+  if (!opencode) restoreOpenCodeUserConfig()
+  if (!codex && !opencode && !others) {
+    restoreAgentConfigs()
     return false
   }
-  return applyGlobalAgentConfig(orca, current)
+  // Publish a fresh model list to agents that read their provider from their own
+  // config file. This runs on every config save, so adding/removing models in the
+  // Providers tab updates their pickers without waiting for a relaunch.
+  try {
+    writeAgentConfigs(current, {
+      base: gatewayAddress(),
+      token: current.token || 'orca-router',
+      modelIds: routerModelIds(current)
+    })
+  } catch { /* an agent config write must never block routing */ }
+  return applyGlobalAgentConfig(orca, current, { codex, opencode })
 }
 
 function shellQuote(value) {
@@ -633,7 +706,8 @@ function tomlString(value) {
 // Insert the provider and catalog overrides after the leading codex executable.
 // `-c key=value` is Codex's supported per-launch config override, so an Orca
 // launch never needs to rewrite the user's config file. The global block is
-// only installed when `routeOutsideOrca` is enabled.
+// installed when the Codex toggle in the Agents tab or `routeOutsideOrca` opts
+// in, and its catalog is refreshed whenever a provider's model list changes.
 export function injectCodexProvider(command, { base, catalogPath, model, reasoningEffort, token = 'orca-router' }) {
   const script = String(command ?? '')
   if (!script || script.includes('model_providers.orca-router')) return script
@@ -657,23 +731,48 @@ export function injectCodexProvider(command, { base, catalogPath, model, reasoni
   return `${script.slice(0, at)} ${args}${script.slice(at)}`
 }
 
-// A plain terminal `opencode` has no agent hook to rewrite. When the opt-in
-// `routeOutsideOrca` setting is on, OpenCode merges the global config and
-// watches it live, so publish the same provider there. The modification is
-// intentionally narrow: replace the stale CCR provider with ours and repoint
-// model ids, leaving MCP servers, agents, plugins and unrelated providers
-// untouched. Orca-launched agents use a generated OPENCODE_CONFIG instead.
+// A plain terminal `opencode` has no agent hook to rewrite. When the OpenCode
+// toggle in the Agents tab (or the `routeOutsideOrca` setting) opts in, OpenCode
+// merges the global config and watches it live, so publish the same provider
+// there. The modification is intentionally narrow: replace the stale CCR
+// provider with ours and repoint model ids, leaving MCP servers, agents,
+// plugins and unrelated providers untouched. Orca-launched agents use a
+// generated OPENCODE_CONFIG instead.
 const OPENCODE_USER_DIR = join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'opencode')
 const OPENCODE_USER_FILE = join(OPENCODE_USER_DIR, 'opencode.jsonc')
 const OPENCODE_USER_BACKUP = `${OPENCODE_USER_FILE}.orca-backup`
 const LEGACY_ROUTER_PROVIDERS = ['claude-code-router']
 
+// OpenCode v2 keeps a background service that loads config once at startup.
+// Rewriting ~/.config/opencode/opencode.jsonc is not enough: without a reload
+// the running service keeps the old provider list and the model picker stays
+// stale until the next full restart. That is why models used to appear only
+// sporadically.
+function reloadOpenCodeConfig() {
+  // Fire-and-forget: OpenCode's background service can take many seconds (or
+  // never) to answer `reload`. Waiting for it here used to block plugin
+  // activation long enough that Orca declared the worker unready and killed it.
+  try {
+    const child = spawn('opencode', ['reload'], { stdio: 'ignore', detached: true })
+    child.on('error', () => {})
+    child.unref()
+    return true
+  } catch {
+    return false
+  }
+}
+
 function syncOpenCodeUserConfig(config, { base, token }) {
-  if (!existsSync(OPENCODE_USER_DIR)) return null
+  // Callers only invoke this after an explicit opt-in (Agents tab toggle or
+  // routeOutsideOrca), so create the config dir/file when OpenCode has not
+  // written one yet. Otherwise its plain-terminal sessions would miss the
+  // router provider and the whole model list.
   let existing = {}
+  let before = ''
   if (existsSync(OPENCODE_USER_FILE)) {
     try {
-      existing = JSON.parse(readFileSync(OPENCODE_USER_FILE, 'utf8'))
+      before = readFileSync(OPENCODE_USER_FILE, 'utf8')
+      existing = JSON.parse(before)
     } catch {
       // JSONC with comments (or a broken file): never rewrite what we cannot
       // round-trip. The per-launch config still covers Orca-started agents.
@@ -681,7 +780,7 @@ function syncOpenCodeUserConfig(config, { base, token }) {
     }
     if (!existsSync(OPENCODE_USER_BACKUP)) {
       try {
-        writeFileSync(OPENCODE_USER_BACKUP, readFileSync(OPENCODE_USER_FILE))
+        writeFileSync(OPENCODE_USER_BACKUP, before)
       } catch {
         /* backup is best-effort */
       }
@@ -689,11 +788,14 @@ function syncOpenCodeUserConfig(config, { base, token }) {
   }
   const { document: generated } = buildOpenCodeConfig(config, { base, token, agentId: 'opencode' })
   const document = mergeOpenCodeConfig(existing, generated, LEGACY_ROUTER_PROVIDERS)
+  const serialized = `${JSON.stringify(document, null, 2)}\n`
+  if (serialized === before) return OPENCODE_USER_FILE
   try {
     mkdirSync(dirname(OPENCODE_USER_FILE), { recursive: true })
     const temporary = `${OPENCODE_USER_FILE}.${process.pid}.tmp`
-    writeFileSync(temporary, `${JSON.stringify(document, null, 2)}\n`)
+    writeFileSync(temporary, serialized)
     renameSync(temporary, OPENCODE_USER_FILE)
+    reloadOpenCodeConfig()
     return OPENCODE_USER_FILE
   } catch {
     return null
@@ -722,6 +824,10 @@ export function restoreOpenCodeUserConfig() {
       delete document.provider['orca-router']
       changed = true
     }
+    if (document.providers && typeof document.providers === 'object' && 'orca-router' in document.providers) {
+      delete document.providers['orca-router']
+      changed = true
+    }
     for (const key of ['model', 'small_model']) {
       if (typeof document[key] === 'string' && document[key].startsWith('orca-router/')) {
         delete document[key]
@@ -730,8 +836,9 @@ export function restoreOpenCodeUserConfig() {
     }
     if (!changed) return false
     // If the file was created by us and holds nothing else, remove it entirely.
-    const unrelated = Object.keys(document).filter((key) => !['$schema', 'disabled_providers', 'provider'].includes(key))
-    const emptyProvider = !document.provider || Object.keys(document.provider).length === 0
+    const unrelated = Object.keys(document).filter((key) => !['$schema', 'disabled_providers', 'provider', 'providers'].includes(key))
+    const emptyProvider = (!document.provider || Object.keys(document.provider).length === 0)
+      && (!document.providers || Object.keys(document.providers).length === 0)
     if (!unrelated.length && emptyProvider) {
       rmSync(OPENCODE_USER_FILE, { force: true })
       return true
@@ -919,7 +1026,8 @@ function normalizeUsageFetchInput(value) {
 }
 
 async function refreshSettings(orca) {
-  const wasGlobal = settings.enabled && settings.routeOutsideOrca
+  const wasCodex = settings.enabled && (settings.routeOutsideOrca || codexProfileRouted())
+  const wasOpenCode = settings.enabled && (settings.routeOutsideOrca || openCodeProfileRouted())
   try {
     const live = await orca.settings.get()
     if (live && typeof live === 'object') {
@@ -936,9 +1044,13 @@ async function refreshSettings(orca) {
   } catch {
     /* keep cache: hook must stay synchronous */
   }
-  // Turning either switch off removes the global blocks; turning both on
-  // publishes them again. Orca-launched agents are unaffected either way.
-  if (wasGlobal !== (settings.enabled && settings.routeOutsideOrca)) {
+  // Turning a switch off removes the matching global block; turning one on
+  // publishes it again. The Agents tab toggle controls OpenCode, the opt-in
+  // setting controls Codex and can also force OpenCode on.
+  if (
+    wasCodex !== (settings.enabled && (settings.routeOutsideOrca || codexProfileRouted())) ||
+    wasOpenCode !== (settings.enabled && (settings.routeOutsideOrca || openCodeProfileRouted()))
+  ) {
     await syncGlobalAgentConfig(orca, config).catch(() => {})
   }
 }
@@ -1055,9 +1167,9 @@ async function persistConfig(orca, next, options = {}) {
   logMigrationSummary(previous, config)
   await orca.storage.set(CONFIG_KEY, config)
   await refreshSecrets(orca)
-  // When opted in, keep a plain terminal's Codex/OpenCode config in sync with
-  // provider and key changes made in the panel. Otherwise this clears any
-  // stale global block left by an older version.
+  // Keep the global Codex/OpenCode configs in sync with provider, key, and
+  // Agents tab changes. Otherwise this clears any stale global block left by
+  // an older version.
   await syncGlobalAgentConfig(orca, config)
   return config
 }
@@ -1738,7 +1850,7 @@ export default async function activate(orca) {
     if (isWebChatTransport(target ?? { transport: null })) {
       return { ok: true, models: webchatCatalog(target).map((m) => m.id), provider: name ?? null }
     }
-    const resolvedBaseUrl = String(baseUrl ?? target?.baseUrl ?? target?.endpoints?.[0]?.baseUrl ?? '').trim()
+    const resolvedBaseUrl = normalizeBaseUrlInput(baseUrl ?? target?.baseUrl ?? target?.endpoints?.[0]?.baseUrl ?? '')
     if (!resolvedBaseUrl) throw new Error('a base URL is required to fetch models')
     const resolvedProtocols = protocols ?? target?.protocols ?? target?.capabilities ?? []
     let key = value
@@ -1764,7 +1876,7 @@ export default async function activate(orca) {
         if (isWebChatTransport(provider)) {
           return { provider: provider.name, models: webchatCatalog(provider).map((m) => m.id) }
         }
-        const baseUrl = String(provider.baseUrl ?? provider.endpoints?.[0]?.baseUrl ?? '').trim()
+        const baseUrl = normalizeBaseUrlInput(provider.baseUrl ?? provider.endpoints?.[0]?.baseUrl ?? '')
         if (!baseUrl) return { provider: provider.name, models: [], error: 'no base URL' }
         const key = (provider.keys ?? []).map((entry) => secretsCache.get(entry.secretKey)).find(Boolean)
         try {
@@ -1971,6 +2083,25 @@ export default async function activate(orca) {
     if (agentId === 'opencode' && opencodeSupportsStandalone()) {
       update.command = injectOpenCodeStandalone(event.command)
     }
+    // Pi reads its provider and full model catalog from the coding-agent dir
+    // we generate, so point it there for this launch.
+    if (agentId === 'pi') {
+      Object.assign(env, piLaunchInfo(routerModelIds(config)).env)
+    }
+    // Kilo is an OpenCode fork: KILO_CONFIG points it at the generated provider
+    // block so every router model appears in its picker.
+    if (agentId === 'kilo') {
+      if (!existsSync(KILO_CONFIG_FILE)) {
+        try {
+          writeAgentConfigs(config, {
+            base,
+            token: config.token || 'orca-router',
+            modelIds: routerModelIds(config)
+          })
+        } catch { /* the launch still works without the generated file */ }
+      }
+      env.KILO_CONFIG = KILO_CONFIG_FILE
+    }
     orca.log(`route ${event.agent} via ${base}${model ? ` as ${model}` : ''}`)
     return next(update)
   })
@@ -1985,7 +2116,7 @@ export default async function activate(orca) {
 // back to a reachability check when the endpoint is absent. URL joining is
 // shared with the gateway so /v1 is never duplicated.
 function providerProbe(provider, key) {
-  const baseUrl = String(provider.baseUrl ?? provider.endpoints?.[0]?.baseUrl ?? '').replace(/\/+$/, '')
+  const baseUrl = normalizeBaseUrlInput(provider.baseUrl ?? provider.endpoints?.[0]?.baseUrl ?? '')
   const protocols = (provider.protocols ?? provider.capabilities ?? []).map(String)
   const onlyGemini = protocols.includes('gemini') && !['openai', 'anthropic', 'responses', 'passthrough'].some((p) => protocols.includes(p))
   if (onlyGemini) {
@@ -2008,7 +2139,11 @@ async function fetchModels({ baseUrl, protocols, key } = {}) {
   const probe = providerProbe({ baseUrl, protocols: protocols ?? [] }, key)
   const res = await fetch(probe.url, { method: 'GET', headers: probe.headers, signal: AbortSignal.timeout(12000) })
   if (res.status === 401 || res.status === 403) {
-    throw new Error(res.status === 401 ? 'invalid API key' : 'access forbidden')
+    throw new Error(
+      res.status === 401
+        ? 'invalid or missing API key - add this provider\'s key under Keys, then fetch models again'
+        : 'access forbidden - check this provider\'s API key'
+    )
   }
   if (!res.ok) throw new Error(`model list returned ${res.status}`)
   const json = await res.json().catch(() => ({}))
@@ -2245,6 +2380,7 @@ async function testProviders(only) {
 
 export async function deactivate() {
   await restoreGlobalAgentConfig(activeOrca)
+  restoreAgentConfigs()
   // Close any web-chat auth browser and remove its throwaway profiles.
   for (const [, session] of authSessions) {
     try { session?.cdp?.close?.() } catch { /* noop */ }

@@ -35,6 +35,7 @@ import {
   Skeleton,
   Stack,
   Switch,
+  Table,
   Text,
   Textarea,
   update,
@@ -97,6 +98,9 @@ const usage = atom<{
   outputTokens: number
   totalTokens: number
   cost: number
+  unpricedRequests?: number
+  cachedTokens?: number
+  uncachedTokens?: number
   avgLatencyMs: number
   cacheHits?: number
   cacheSavedTokens?: number
@@ -105,6 +109,12 @@ const usage = atom<{
   relayEvents?: number
   byProvider: { provider: string; count: number }[]
   byModel: { model: string; count: number }[]
+  byRoute?: { route: string; requests: number; cost: number; failovers: number }[]
+  byAgent?: { agent: string; requests: number; cost: number; failovers: number }[]
+  byKey?: { credential: string; requests: number; cost: number; failovers: number }[]
+  byProviderSpend?: { provider: string; requests: number; cost: number; failovers: number }[]
+  daily?: DailyUsage[]
+  modelUsage?: { model: string; requests: number; input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }[]
 } | null>(null)
 const message = atom('')
 const error = atom('')
@@ -281,6 +291,7 @@ const SECTIONS = [
   { value: 'providers', label: 'Providers' },
   { value: 'routing', label: 'Routing' },
   { value: 'profiles', label: 'Agents' },
+  { value: 'usage', label: 'Usage' },
   { value: 'logs', label: 'Logs' },
   { value: 'settings', label: 'Settings' }
 ]
@@ -555,6 +566,18 @@ function parseMaybe(value: string) {
   }
 }
 
+// `modelWindows` is populated by the worker (model discovery and the models.dev
+// sync), never edited here, and re-merged from the worker's live copy on save.
+// It grows with every discovered model, so round-tripping the whole cache
+// through the panel can exceed Orca's panel-message size limit (64 KB) and make
+// every save fail with "Message exceeds the size limit." Send everything the
+// panel actually owns, but leave that cache out of the wire payload.
+function configSavePayload(next: RouterConfig): RouterConfig {
+  const payload = { ...next } as RouterConfig & { modelWindows?: unknown }
+  delete payload.modelWindows
+  return payload
+}
+
 async function saveConfig(mutator: (next: RouterConfig) => void) {
   const current = read(config)
   if (!current) {
@@ -564,7 +587,7 @@ async function saveConfig(mutator: (next: RouterConfig) => void) {
   const next = structuredClone(current)
   mutator(next)
   try {
-    await plugin.request('router.config.save', { config: next })
+    await plugin.request('router.config.save', { config: configSavePayload(next) })
     set(config, next)
     await refresh()
     return true
@@ -2973,6 +2996,71 @@ function InfoBanner({
   )
 }
 
+type DailyUsage = {
+  day: string
+  requests: number
+  input: number
+  output: number
+  cacheRead: number
+  cacheWrite: number
+  cost: number
+  cacheHits: number
+  failovers: number
+}
+
+// Orca panels cannot render DOM/SVG, so charts use the same Box bar pattern
+// Orca's own usage meters use. Boxes carry theme tones and scale with the panel.
+function TrendBar({ label, value, max, display, tone = 'accent' }: { label: string; value: number; max: number; display: string; tone?: Tone }) {
+  const percent = max > 0 ? Math.min(100, Math.max(0, (value / max) * 100)) : 0
+  return (
+    <Box direction="row" align="center" gap="xs">
+      <Box width={52} shrink={false}>
+        <Text size="xs" muted truncate>{label}</Text>
+      </Box>
+      <Box background="muted" radius="full" height={8} width="100%">
+        <Box background={tone} radius="full" height={8} width={`${percent}%`} />
+      </Box>
+      <Box width={64} shrink={false}>
+        <Text size="xs" muted truncate>{display}</Text>
+      </Box>
+    </Box>
+  )
+}
+
+function StatChip({ label, value, tone, hint }: { label: string; value: string; tone?: Tone; hint?: string }) {
+  return (
+    <Box background="muted" radius="md" padding="xs">
+      <Stack gap="xs">
+        <Text size="xs" muted truncate>{label}</Text>
+        <Text size="sm" weight="semibold" tone={tone} truncate>{value}</Text>
+        {hint ? <Text size="xs" muted truncate>{hint}</Text> : null}
+      </Stack>
+    </Box>
+  )
+}
+
+function UsageRankList({
+  title,
+  items,
+  tone
+}: {
+  title: string
+  items: { label: string; count: number }[]
+  tone: Tone
+}) {
+  return (
+    <Stack gap="xs">
+      <Text size="xs" weight="semibold" muted>{title}</Text>
+      {items.map((item) => (
+        <Row key={item.label} justify="between" align="center" gap="sm">
+          <Text size="xs" truncate>{item.label}</Text>
+          <Badge tone={tone}>{formatNumber(item.count)}</Badge>
+        </Row>
+      ))}
+    </Stack>
+  )
+}
+
 function Metric({ label, value, tone, hint }: { label: string; value: string; tone?: Tone; hint?: string }) {
   return (
     <Stack gap="xs">
@@ -3043,7 +3131,7 @@ function logSearchText(entry: LogEntry) {
 // AND binds tighter than OR, and adjacent terms imply AND. Quoted values allow
 // spaces, e.g. error="all keys exhausted". Numeric fields accept >, >=, <, <=.
 const LOG_QUERY_FIELDS = new Set([
-  'provider', 'route', 'model', 'request', 'requestmodel', 'target', 'resolved',
+  'provider', 'route', 'agent', 'model', 'request', 'requestmodel', 'target', 'resolved',
   'key', 'credential', 'status', 'error', 'code', 'errorcode', 'policy', 'protocol', 'stream',
   'latency', 'tokens', 'input', 'output', 'cost', 'bytes', 'attempts', 'cache'
 ])
@@ -3149,6 +3237,7 @@ function logFieldValue(entry: LogEntry, field: string) {
   switch (field) {
     case 'provider': return entry.resolvedProvider ?? entry.upstream ?? ''
     case 'route': return entry.route ?? ''
+    case 'agent': return entry.agent ?? ''
     case 'model': return [entry.resolvedModel, entry.model, entry.requestModel].filter(Boolean).join(' ')
     case 'request':
     case 'requestmodel': return entry.requestModel ?? ''
@@ -3231,12 +3320,12 @@ function csvCell(value: unknown) {
 function exportLogsCsv() {
   const rows = [...read(logs)].reverse()
   if (!rows.length) return
-  const header = ['time', 'status', 'errorCode', 'route', 'vpn', 'requestModel', 'provider', 'resolvedModel', 'credential', 'protocol', 'stream', 'latencyMs', 'tokensIn', 'tokensOut', 'cost', 'cache', 'policyId', 'error']
+  const header = ['time', 'status', 'errorCode', 'route', 'agent', 'vpn', 'requestModel', 'provider', 'resolvedModel', 'credential', 'protocol', 'stream', 'latencyMs', 'tokensIn', 'tokensOut', 'cost', 'cache', 'policyId', 'error']
   const lines = [header.join(',')]
   for (const entry of rows) {
     const parts = tokenParts(entry)
     lines.push([
-      new Date(entry.at).toISOString(), entry.status, entry.errorCode, entry.route, entry.vpn, entry.requestModel,
+      new Date(entry.at).toISOString(), entry.status, entry.errorCode, entry.route, entry.agent, entry.vpn, entry.requestModel,
       entry.resolvedProvider ?? entry.upstream, entry.resolvedModel ?? entry.model, entry.credential,
       entry.protocol, entry.stream ? 'yes' : 'no', entry.latencyMs, parts?.input, parts?.output,
       entry.cost, entry.cache, entry.policyId, entry.error
@@ -3482,14 +3571,38 @@ function Loading() {
 function Overview() {
   const ups = read(providers)
   const metric = read(usage)
+  const mixInput = Math.max(0, (metric?.uncachedTokens ?? 0) - (metric?.outputTokens ?? 0))
+  const mixOutput = metric?.outputTokens ?? 0
+  const mixCached = metric?.cachedTokens ?? 0
+  const mixTotal = mixInput + mixOutput + mixCached || 1
+  const mixSegments: { key: string; label: string; value: number; tone: Tone }[] = [
+    { key: 'input', label: 'Input', value: mixInput, tone: 'accent' },
+    { key: 'output', label: 'Output', value: mixOutput, tone: 'success' },
+    { key: 'cached', label: 'Cached', value: mixCached, tone: 'warning' }
+  ]
+  const hasTraffic = metric != null && metric.requests > 0
+  const totalFailovers = (metric?.byRoute ?? []).reduce((sum, row) => sum + row.failovers, 0)
+  const topProviders = [...(metric?.byProvider ?? [])]
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 3)
+    .map((item) => ({ label: item.provider, count: item.count }))
+  const topModels = [...(metric?.byModel ?? [])]
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 3)
+    .map((item) => ({ label: item.model, count: item.count }))
+  const successTone: Tone | undefined = metric && hasTraffic
+    ? metric.successRate >= 0.95
+      ? 'success'
+      : metric.successRate >= 0.8
+        ? 'warning'
+        : 'danger'
+    : undefined
   const gateway = `http://${read(host)}:${read(port)}`
   const routeCount = read(mergedRoutesView).length
-  const keyCount = read(clientKeys).length
   const routedAgents = read(agentList).filter((agent) => agent.enabled).length
   const policyCount = read(policies).length
   const modelCount = ups.reduce((total, provider) => total + (provider.models?.length ?? 0), 0)
   const recent = read(logs).slice(-4).reverse()
-  const hasTraffic = metric != null && metric.requests > 0
 
   return (
     <Stack gap="md">
@@ -3529,71 +3642,79 @@ function Overview() {
         </Stack>
       </InfoBanner>
 
-      <Box background="muted" radius="lg" padding="md">
-        <Stack gap="md">
-          <Grid columns={3} gap="md">
-            <Metric label="Providers" value={String(ups.length)} tone={ups.length ? 'success' : 'warning'} />
-            <Metric label="Agents" value={String(routedAgents)} />
-            <Metric label="Policies" value={String(policyCount)} />
-            <Metric label="Routes" value={String(routeCount)} />
-            <Metric label="Client keys" value={String(keyCount)} />
-            <Metric label="Models" value={String(modelCount)} tone={modelCount ? undefined : 'warning'} />
+      <Card title="Overview">
+        <Stack gap="sm">
+          <Grid columns={3} gap="xs">
+            <StatChip label="Providers" value={String(ups.length)} tone={ups.length ? 'success' : 'warning'} />
+            <StatChip label="Models" value={String(modelCount)} tone={modelCount ? undefined : 'warning'} />
+            <StatChip label="Agents" value={String(routedAgents)} />
+            <StatChip label="Policies" value={String(policyCount)} />
+            <StatChip label="Routes" value={String(routeCount)} />
           </Grid>
 
-          <Separator />
-
-          <Grid columns={3} gap="md">
-            <Metric label="Requests" value={metric ? String(metric.requests) : '—'} />
-            <Metric
+          <Grid columns={3} gap="xs">
+            <StatChip label="Requests" value={metric ? formatNumber(metric.requests) : '—'} />
+            <StatChip
               label="Success"
               value={metric && hasTraffic ? `${(metric.successRate * 100).toFixed(1)}%` : '—'}
-              tone={
-                metric && hasTraffic
-                  ? metric.successRate >= 0.95
-                    ? 'success'
-                    : metric.successRate >= 0.8
-                      ? 'warning'
-                      : 'danger'
-                  : undefined
-              }
+              tone={successTone}
             />
-            <Metric
+            <StatChip
               label="Errors"
-              value={metric ? String(metric.errors) : '—'}
+              value={metric ? formatNumber(metric.errors) : '—'}
               tone={metric && hasTraffic ? (metric.errors ? 'danger' : 'success') : undefined}
             />
-            <Metric
-              label="Tokens"
-              value={metric ? formatNumber(metric.totalTokens) : '—'}
-              hint={metric && hasTraffic ? `${formatNumber(metric.inputTokens)} in · ${formatNumber(metric.outputTokens)} out` : undefined}
+            <StatChip
+              label="Failovers"
+              value={metric ? formatNumber(totalFailovers) : '—'}
+              tone={totalFailovers ? 'warning' : undefined}
             />
-            <Metric label="Cost" value={metric ? formatUsd(metric.cost) : '—'} />
-            <Metric label="Avg latency" value={metric ? `${metric.avgLatencyMs.toFixed(0)} ms` : '—'} />
+            <StatChip label="Avg latency" value={metric && hasTraffic ? formatLatency(metric.avgLatencyMs) : '—'} />
           </Grid>
         </Stack>
-      </Box>
+      </Card>
 
-      {metric && ((metric.cacheHits ?? 0) > 0 || (metric.compressionSavedChars ?? 0) > 0 || (metric.relayEvents ?? 0) > 0) ? (
-        <Text muted size="xs">
-          Optimization: {formatNumber(metric.cacheHits ?? 0)} cache hits · {formatNumber(metric.cacheSavedTokens ?? 0)} tokens saved
-          ({formatUsd(metric.cacheSavedCost ?? 0)}) · {formatNumber(metric.compressionSavedChars ?? 0)} chars compressed ·{' '}
-          {formatNumber(metric.relayEvents ?? 0)} relays
-        </Text>
-      ) : null}
+      {metric ? (
+        <Card>
+          <Stack gap="sm">
+            <Text size="sm" weight="semibold">Token usage</Text>
+            <Grid columns={2} gap="xs">
+              <StatChip label="Total tokens" value={formatNumber(metric.totalTokens)} />
+              <StatChip label="Estimated cost" value={formatUsd(metric.cost)} tone="success" />
+            </Grid>
 
-      {metric && (metric.byProvider.length || metric.byModel.length) ? (
-        <Stack gap="xs">
-          {metric.byProvider.length ? (
-            <Text muted size="xs">
-              Top providers: {metric.byProvider.slice(0, 3).map((item) => `${item.provider} ${item.count}`).join(' · ')}
-            </Text>
-          ) : null}
-          {metric.byModel.length ? (
-            <Text muted size="xs">
-              Top models: {metric.byModel.slice(0, 3).map((item) => `${item.model} ${item.count}`).join(' · ')}
-            </Text>
-          ) : null}
-        </Stack>
+            <Stack gap="xs">
+              <Box direction="row" gap="md" wrap>
+                {mixSegments.map((segment) => (
+                  <Row key={segment.key} align="center" gap="xs">
+                    <Box background={segment.tone} radius="full" height={6} width={6} />
+                    <Text size="xs" muted>{segment.label}</Text>
+                    <Text size="xs" weight="semibold">{formatNumber(segment.value)}</Text>
+                    <Text size="xs" muted>{((segment.value / mixTotal) * 100).toFixed(0)}%</Text>
+                  </Row>
+                ))}
+              </Box>
+              <Box direction="row" height={8} width="100%" background="muted" radius="full">
+                {mixSegments.map((segment) => segment.value > 0 ? (
+                  <Box key={segment.key} background={segment.tone} height={8} width={`${(segment.value / mixTotal) * 100}%`} />
+                ) : null)}
+              </Box>
+            </Stack>
+
+            {topProviders.length || topModels.length ? (
+              <Grid columns={2} gap="md">
+                {topProviders.length ? <UsageRankList title="Top providers" items={topProviders} tone="accent" /> : null}
+                {topModels.length ? <UsageRankList title="Top models" items={topModels} tone="success" /> : null}
+              </Grid>
+            ) : null}
+
+            {(metric.unpricedRequests ?? 0) > 0 ? (
+              <Text size="xs" muted>
+                {formatNumber(metric.unpricedRequests ?? 0)} requests unpriced — cost is a lower bound.
+              </Text>
+            ) : null}
+          </Stack>
+        </Card>
       ) : null}
 
       {!metric ? (
@@ -4678,6 +4799,104 @@ function SchedulerSettings() {
         </Text>
       </Stack>
     </Card>
+  )
+}
+
+function Usage() {
+  const metric = read(usage)
+  const dailyRows = metric?.daily?.slice(-7) ?? []
+  const providerSpendRows = [...(metric?.byProviderSpend ?? [])].sort((a, b) => b.cost - a.cost).slice(0, 5)
+  const maxDailyTokens = Math.max(1, ...dailyRows.map((day) => day.input + day.output + day.cacheRead + day.cacheWrite))
+  const maxDailyCost = Math.max(0.000001, ...dailyRows.map((day) => day.cost))
+  const maxProviderCost = Math.max(0.000001, ...providerSpendRows.map((row) => row.cost))
+  const attribution: { label: string; value: string }[] = [
+    ...(metric?.byRoute?.length ? [{ label: 'Route', value: metric.byRoute.slice(0, 3).map((item) => `${item.route} ${formatUsd(item.cost)}${item.failovers ? ` (${item.failovers} failovers)` : ''}`).join(' · ') }] : []),
+    ...(metric?.byAgent?.length ? [{ label: 'Agent', value: metric.byAgent.slice(0, 3).map((item) => `${item.agent} ${formatUsd(item.cost)}`).join(' · ') }] : []),
+    ...(metric?.byKey?.length ? [{ label: 'Key', value: metric.byKey.slice(0, 3).map((item) => `${item.credential} ${formatUsd(item.cost)}`).join(' · ') }] : [])
+  ]
+  if (!metric || (!dailyRows.length && !providerSpendRows.length && !attribution.length)) {
+    return <EmptyState title="No usage recorded" description="Send a request through the gateway and refresh to see usage here." />
+  }
+  const modelRows = (metric.modelUsage ?? []).slice(0, 8).map((row) => ({
+    key: row.model,
+    model: row.model,
+    input: formatNumber(row.input),
+    output: formatNumber(row.output),
+    cache: formatNumber(row.cacheRead + row.cacheWrite),
+    cost: formatUsd(row.cost)
+  }))
+  return (
+    <Stack gap="md">
+      <Card title="Overview">
+        <Grid columns={2} gap="md">
+          <Metric
+            label="Tokens"
+            value={formatNumber(metric.totalTokens)}
+            hint={`${formatNumber(metric.inputTokens)} in · ${formatNumber(metric.outputTokens)} out`}
+          />
+          <Metric label="Cost" value={formatUsd(metric.cost)} />
+        </Grid>
+      </Card>
+      {modelRows.length ? (
+        <Card title="Tokens by model">
+          <Table
+            label="Tokens by model"
+            columns={[
+              { key: 'model', label: 'Model' },
+              { key: 'input', label: 'In' },
+              { key: 'output', label: 'Out' },
+              { key: 'cache', label: 'Cache' },
+              { key: 'cost', label: 'Cost' }
+            ]}
+            rows={modelRows}
+            emptyText="No model usage yet"
+          />
+        </Card>
+      ) : null}
+      {providerSpendRows.length ? (
+        <Card title="Cost by provider" description="Estimated spend in this window">
+          <Stack gap="xs">
+            {providerSpendRows.map((row) => (
+              <TrendBar key={row.provider} label={row.provider} value={row.cost} max={maxProviderCost} display={formatUsd(row.cost)} tone="warning" />
+            ))}
+          </Stack>
+        </Card>
+      ) : null}
+      {attribution.length ? (
+        <Card title="Spend attribution" description="Which route, agent and key spent it">
+          <KeyValue items={attribution} />
+        </Card>
+      ) : null}
+      {dailyRows.length ? (
+        <Card title="Daily activity" description="Last 7 days with traffic">
+          <Stack gap="md">
+            <Stack gap="xs">
+              <Text muted size="xs">Tokens by day</Text>
+              {dailyRows.map((day) => {
+                const total = day.input + day.output + day.cacheRead + day.cacheWrite
+                return <TrendBar key={day.day} label={day.day.slice(5)} value={total} max={maxDailyTokens} display={formatNumber(total)} />
+              })}
+            </Stack>
+            <Stack gap="xs">
+              <Text muted size="xs">Cost by day</Text>
+              {dailyRows.map((day) => (
+                <TrendBar key={`cost-${day.day}`} label={day.day.slice(5)} value={day.cost} max={maxDailyCost} display={formatUsd(day.cost)} tone="success" />
+              ))}
+              {dailyRows.some((day) => day.failovers > 0) ? (
+                <Text muted size="xs">
+                  Failovers on {dailyRows.reduce((sum, day) => sum + day.failovers, 0)} requests in this window.
+                </Text>
+              ) : null}
+            </Stack>
+          </Stack>
+        </Card>
+      ) : null}
+      {metric && (metric.unpricedRequests ?? 0) > 0 ? (
+        <Text muted size="xs">
+          {formatNumber(metric.unpricedRequests ?? 0)} requests used a model with no known price — cost is a lower bound.
+        </Text>
+      ) : null}
+    </Stack>
   )
 }
 
@@ -6187,7 +6406,7 @@ function Logs() {
             <Text muted size="xs">Numeric fields take &gt;, &gt;=, &lt; and &lt;=.</Text>
           </Stack>
           <Text muted size="xs">
-            Fields: provider, route, model, request, target, key, status, error, code, policy, protocol, stream,
+            Fields: provider, route, agent, model, request, target, key, status, error, code, policy, protocol, stream,
             latency, tokens, input, output, cost, bytes, attempts, cache. Quote values with spaces, e.g.{' '}
             <Code>error="all keys exhausted"</Code>.
           </Text>
@@ -6253,7 +6472,7 @@ function Logs() {
       ) : shown.length === 0 ? (
         <EmptyState
           title="No matching requests"
-          description="Fields: provider, route, model, request, target, key, status, error, code, policy, protocol, stream, latency, tokens, input, output, cost, bytes, attempts, cache. Combine with AND / OR / NOT, parentheses and numeric comparisons."
+          description="Fields: provider, route, agent, model, request, target, key, status, error, code, policy, protocol, stream, latency, tokens, input, output, cost, bytes, attempts, cache. Combine with AND / OR / NOT, parentheses and numeric comparisons."
           icon="search"
         >
           <Button variant="outline" onPress={() => {
@@ -6735,6 +6954,7 @@ function Section() {
   if (active === 'providers') return <Providers />
   if (active === 'routing') return <Routing />
   if (active === 'profiles') return <Profiles />
+  if (active === 'usage') return <Usage />
   if (active === 'logs') return <Logs />
   if (active === 'settings') return <Settings />
   return <Overview />

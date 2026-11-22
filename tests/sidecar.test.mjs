@@ -40,8 +40,12 @@ import {
   probeProviderUsage,
   resolveUsageFetch,
   safeCaptureBody,
+  dayKey,
   geminiResponseToOpenAI,
+  identifyAgent,
   joinUpstreamUrl,
+  normalizeBaseUrlInput,
+  normalizeProvider,
   matchRoute,
   normalizeConfig,
   normalizeResponsesCustomTools,
@@ -121,6 +125,33 @@ function testConfig(overrides = {}) {
 test('joinUpstreamUrl strips a duplicate /v1', () => {
   assert.equal(joinUpstreamUrl('https://api.openai.com/v1/', '/v1/chat/completions'), 'https://api.openai.com/v1/chat/completions')
   assert.equal(joinUpstreamUrl('https://api.anthropic.com', '/v1/messages'), 'https://api.anthropic.com/v1/messages')
+})
+
+test('normalizeBaseUrlInput recovers a base URL from a pasted chat endpoint', () => {
+  assert.equal(
+    normalizeBaseUrlInput('https://api.numes.ai/api/v1/chat/completions'),
+    'https://api.numes.ai/api/v1'
+  )
+  assert.equal(normalizeBaseUrlInput('https://api.openai.com/v1/'), 'https://api.openai.com/v1')
+  assert.equal(normalizeBaseUrlInput('https://api.anthropic.com/v1/messages'), 'https://api.anthropic.com/v1')
+  assert.equal(normalizeBaseUrlInput(' https://api.numes.ai/api/v1/chat/completions/ '), 'https://api.numes.ai/api/v1')
+})
+
+test('normalizeProvider rewrites endpoint paths pasted into base URLs', () => {
+  const provider = normalizeProvider({
+    name: 'numes',
+    baseUrl: 'https://api.numes.ai/api/v1/chat/completions',
+    protocols: ['openai'],
+    models: [],
+    keys: []
+  })
+  assert.equal(provider.baseUrl, 'https://api.numes.ai/api/v1')
+  assert.deepEqual(provider.endpoints, [{ baseUrl: 'https://api.numes.ai/api/v1', protocols: ['openai'] }])
+  // The recovered base URL produces the documented /api/v1/models endpoint.
+  assert.equal(
+    joinUpstreamUrl(provider.baseUrl, '/v1/models'),
+    'https://api.numes.ai/api/v1/models'
+  )
 })
 
 test('matchRoute: wildcard, prefix and exact (legacy helper)', () => {
@@ -602,6 +633,13 @@ test('buildOpenCodeConfig publishes the gateway providers and model list', () =>
     'deepseek/deepseek-chat',
     'openai/gpt-4o'
   ])
+  // OpenCode v2 ignores the deprecated `provider` key and reads `providers`
+  // with a `settings` block instead of `options`.
+  const modern = document.providers['orca-router']
+  assert.equal(modern.package, '@ai-sdk/openai-compatible')
+  assert.equal(modern.settings.baseURL, 'http://127.0.0.1:18080/v1')
+  assert.equal(modern.settings.apiKey, 'orca-router')
+  assert.deepEqual(Object.keys(modern.models), Object.keys(published.models))
 })
 
 test('buildOpenCodeConfig honors aliases, profiles and disabled providers', () => {
@@ -1332,6 +1370,159 @@ test('proxies chat completions directly to the resolved provider and logs the ro
   })
 })
 
+test('spend is attributed to the requested route, agent and key across a failover', async () => {
+  const config = testConfig({
+    providers: [
+      anthropicProvider,
+      { ...deepseekProvider, keys: [{ id: 'backup-key', secretKey: 'backup-secret', enabled: true }] }
+    ],
+    routes: [{
+      name: 'backup-route',
+      targets: [
+        { provider: 'anthropic', model: 'claude-sonnet-4-20250514' },
+        { provider: 'deepseek', model: 'deepseek-chat' }
+      ],
+      strategy: 'ordered',
+      retries: 0
+    }]
+  })
+  const completion = {
+    id: 'chatcmpl-failover', object: 'chat.completion', created: 0, model: 'deepseek-chat',
+    choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 1000, completion_tokens: 100, total_tokens: 1100 }
+  }
+  await withSidecar(
+    config,
+    async (url) => url.includes('anthropic.com')
+      ? new Response('bad gateway', { status: 502, headers: { 'content-type': 'text/plain' } })
+      : new Response(JSON.stringify(completion), { status: 200, headers: { 'content-type': 'application/json' } }),
+    async (base, sidecar) => {
+      const res = await fetch(`${base}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-orca-agent': 'Claude Code', 'user-agent': 'node' },
+        body: JSON.stringify({ model: 'backup-route', messages: [{ role: 'user', content: 'hi' }] })
+      })
+      assert.equal(res.status, 200)
+      const entry = sidecar.logs[0]
+      assert.equal(entry.route, 'backup-route', 'the requested route is kept even though the backup served it')
+      assert.equal(entry.agent, 'claude-code')
+      assert.equal(entry.credential, 'backup-key')
+      assert.equal(entry.failedOver, true)
+      assert.match(entry.attempts.at(-1), /deepseek/)
+
+      const usage = sidecar.usage()
+      assert.equal(usage.byRoute.length, 1)
+      assert.equal(usage.byRoute[0].route, 'backup-route')
+      assert.equal(usage.byRoute[0].requests, 1)
+      assert.equal(usage.byRoute[0].failovers, 1)
+      assert.ok(usage.byRoute[0].cost > 0)
+      assert.equal(usage.byAgent[0].agent, 'claude-code')
+      assert.ok(Math.abs(usage.byAgent[0].cost - usage.byRoute[0].cost) < 1e-12)
+      assert.equal(usage.byKey[0].credential, 'backup-key')
+      assert.ok(Math.abs(usage.byKey[0].cost - usage.byRoute[0].cost) < 1e-12)
+    },
+    { 'backup-secret': 'sk-test' }
+  )
+})
+
+test('usage buckets tokens and cost by local day and by provider', async () => {
+  let clock = new Date(2026, 10, 20, 10, 0, 0).getTime()
+  const sidecar = createSidecar({
+    getConfig: () => testConfig(),
+    getSecret: () => null,
+    fetchImpl: async () => new Response(JSON.stringify({
+      id: 'chatcmpl-day', object: 'chat.completion', created: 0, model: 'deepseek-chat',
+      choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 1000, completion_tokens: 100, total_tokens: 1100 }
+    }), { status: 200, headers: { 'content-type': 'application/json' } }),
+    now: () => clock,
+    onLog: () => {}
+  })
+  const addr = await sidecar.start('127.0.0.1', 0)
+  try {
+    const base = `http://127.0.0.1:${addr.port}`
+    const send = async () => {
+      const res = await fetch(`${base}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'deepseek/deepseek-chat', messages: [{ role: 'user', content: 'hi' }] })
+      })
+      assert.equal(res.status, 200)
+      await res.text()
+    }
+    await send()
+    clock = new Date(2026, 10, 21, 9, 0, 0).getTime()
+    await send()
+
+    const usage = sidecar.usage({ window: '7d', now: clock })
+    assert.deepEqual(usage.daily.map((day) => day.day), ['2026-11-20', '2026-11-21'])
+    assert.equal(usage.daily[0].requests, 1)
+    assert.equal(usage.daily[0].input, 1000)
+    assert.equal(usage.daily[0].output, 100)
+    assert.ok(usage.daily[0].cost > 0)
+    assert.equal(usage.daily[1].input, 1000)
+    assert.equal(usage.cachedTokens, 0)
+    assert.equal(usage.uncachedTokens, 2200)
+    assert.equal(usage.modelUsage.length, 1)
+    assert.equal(usage.modelUsage[0].model, 'deepseek-chat')
+    assert.equal(usage.modelUsage[0].requests, 2)
+    assert.equal(usage.modelUsage[0].input, 2000)
+    assert.equal(usage.modelUsage[0].output, 200)
+    assert.equal(usage.byProviderSpend[0].provider, 'deepseek')
+    assert.equal(usage.byProviderSpend[0].requests, 2)
+    assert.ok(Math.abs(usage.byProviderSpend[0].cost - usage.daily[0].cost - usage.daily[1].cost) < 1e-12)
+  } finally {
+    await sidecar.stop()
+  }
+})
+
+test('prices a request from the catalog and flags unpriced models', async () => {
+  const completion = (cached) => ({
+    id: 'chatcmpl-test', object: 'chat.completion', created: 0, model: 'deepseek-chat',
+    choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+    usage: {
+      prompt_tokens: 1000, completion_tokens: 100, total_tokens: 1100,
+      ...(cached ? { prompt_tokens_details: { cached_tokens: 500 } } : {})
+    }
+  })
+  await withSidecar(testConfig(), async () => new Response(JSON.stringify(completion(true)), {
+    status: 200, headers: { 'content-type': 'application/json' }
+  }), async (base, sidecar) => {
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'deepseek/deepseek-chat', messages: [{ role: 'user', content: 'hi' }] })
+    })
+    assert.equal(res.status, 200)
+    assert.equal(sidecar.logs[0].priceSource, 'catalog')
+    // prompt_tokens includes the 500 cached tokens: 500 billed input + 100
+    // output + 500 cached reads at deepseek-chat's listed rates.
+    assert.ok(Math.abs(sidecar.logs[0].cost - (500 * 0.29 + 100 * 1.16 + 500 * 0.29) / 1e6) < 1e-12)
+    assert.deepEqual(sidecar.logs[0].tokens, { input: 1000, output: 100, cache: 500, cacheRead: 500 })
+    assert.equal(sidecar.usage().unpricedRequests, 0)
+  })
+  const unpricedProvider = {
+    name: 'unknown-vendor',
+    baseUrl: 'https://example.test/v1',
+    protocols: ['openai'],
+    models: [{ id: 'not-in-the-catalog-xyz' }],
+    keys: []
+  }
+  await withSidecar(testConfig({ providers: [unpricedProvider] }), async () => new Response(JSON.stringify(completion(false)), {
+    status: 200, headers: { 'content-type': 'application/json' }
+  }), async (base, sidecar) => {
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'unknown-vendor/not-in-the-catalog-xyz', messages: [{ role: 'user', content: 'hi' }] })
+    })
+    assert.equal(res.status, 200)
+    assert.equal(sidecar.logs[0].priceSource, null)
+    assert.equal(sidecar.logs[0].cost, null)
+    assert.equal(sidecar.usage().unpricedRequests, 1)
+  })
+})
+
 test('records usage from a same-protocol streaming response', async () => {
   const sse = [
     'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":11,"output_tokens":0}}}\n\n',
@@ -2045,6 +2236,22 @@ test('deriveAffinityKey prefers explicit headers, then body ids, then a stable p
   assert.equal(first, reordered)
   assert.notEqual(first, deriveAffinityKey({}, { ...body, messages: [{ role: 'user', content: 'bye' }] }))
   assert.equal(deriveAffinityKey({}, { model: 'm' }), '')
+})
+
+test('dayKey buckets timestamps into local calendar days', () => {
+  const date = new Date(2026, 10, 20, 23, 59, 59)
+  assert.equal(dayKey(date.getTime()), '2026-11-20')
+  assert.equal(dayKey(new Date(2026, 10, 21, 0, 0, 1).getTime()), '2026-11-21')
+  assert.equal(dayKey(new Date(2026, 0, 2, 12).getTime()), '2026-01-02')
+})
+
+test('identifyAgent uses explicit headers, session hints and User-Agent', () => {
+  assert.equal(identifyAgent({ 'x-orca-agent': 'My Agent' }), 'my-agent')
+  assert.equal(identifyAgent({ 'x-router-agent': 'codex' }), 'codex')
+  assert.equal(identifyAgent({ 'x-claude-code-session-id': 'abc' }), 'claude-code')
+  assert.equal(identifyAgent({ 'user-agent': 'Claude-Code/1.2' }), 'claude-code')
+  assert.equal(identifyAgent({ 'user-agent': 'node' }, { metadata: { agent: 'Cursor' } }), 'cursor')
+  assert.equal(identifyAgent({}), null)
 })
 
 test('circuit breaker normalization is bounded', () => {
@@ -3872,7 +4079,7 @@ test('resolveSelectorLimits handles routes and aliases with a conservative windo
   assert.equal(resolveSelectorLimits(config, 'model'), null)
 })
 
-test('buildOpenCodeConfig publishes limits only for models with known windows', () => {
+test('buildOpenCodeConfig publishes complete limits for every model', () => {
   const config = testConfig({
     providers: [
       {
@@ -3889,9 +4096,10 @@ test('buildOpenCodeConfig publishes limits only for models with known windows', 
   const { document } = buildOpenCodeConfig(config, { base: 'http://127.0.0.1:18080', token: 'orca-router' })
   const models = document.provider['orca-router'].models
   assert.deepEqual(models['cloud/known'].limit, { context: 1_000_000, output: 65_536 })
-  assert.equal(models['cloud/unknown'].limit, undefined)
+  // OpenCode v1 drops models without a complete limit object.
+  assert.deepEqual(models['cloud/unknown'].limit, { context: 128_000, output: 8_192 })
   // Routes and aliases inherit the resolved target window.
-  assert.deepEqual(models['cloud-route'].limit, { context: 262_144 })
+  assert.deepEqual(models['cloud-route'].limit, { context: 262_144, output: 8_192 })
 })
 
 test('buildCodexModelCatalog sets a per-model context window', () => {

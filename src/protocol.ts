@@ -46,6 +46,10 @@ declare module 'orca' {
         outputTokens: number
         totalTokens: number
         cost: number
+        /** Successful requests with usage but no known price; cost is a lower bound. */
+        unpricedRequests?: number
+        cachedTokens?: number
+        uncachedTokens?: number
         avgLatencyMs: number
         cacheHits?: number
         cacheSavedTokens?: number
@@ -54,6 +58,14 @@ declare module 'orca' {
         relayEvents?: number
         byProvider: { provider: string; count: number }[]
         byModel: { model: string; count: number }[]
+        /** Spend grouped by the route the agent requested, including failovers. */
+        byRoute?: { route: string; requests: number; cost: number; failovers: number }[]
+        byAgent?: { agent: string; requests: number; cost: number; failovers: number }[]
+        byKey?: { credential: string; requests: number; cost: number; failovers: number }[]
+        byProviderSpend?: { provider: string; requests: number; cost: number; failovers: number }[]
+        /** Successful requests bucketed by local calendar day, oldest first. */
+        daily?: { day: string; requests: number; input: number; output: number; cacheRead: number; cacheWrite: number; cost: number; cacheHits: number; failovers: number }[]
+        modelUsage?: { model: string; requests: number; input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }[]
         totals: Record<string, unknown>
       }
     }
@@ -598,6 +610,8 @@ export interface LogEntry {
   upstream: string | null
   resolvedProvider?: string | null
   route?: string | null
+  /** Best-effort agent label from an explicit header, session header or User-Agent. */
+  agent?: string | null
   /** Display name of the VPN server used for this request, when any. */
   vpn?: string | null
   credential?: string | null
@@ -616,8 +630,10 @@ export interface LogEntry {
   failures?: { provider: string; model?: string; status?: number; error?: string; code?: string }[]
   delaysMs?: number[]
   bytes?: number
-  tokens?: { input: number; output: number; cache?: number } | null
+  tokens?: { input: number; output: number; cache?: number; cacheRead?: number; cacheWrite?: number; cacheWrite1h?: number; reasoning?: number } | null
   cost?: number | null
+  /** Where the cost came from: override, catalog, cache, or null when unpriced. */
+  priceSource?: string | null
   error?: string
   compression?: { mode: string; before: number; after: number; saved: number } | null
   relay?: { before: number; after: number; relayed: number } | null

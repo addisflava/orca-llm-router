@@ -356,6 +356,8 @@ test('overview groups configuration and traffic stats with the missing error and
         inputTokens: 1_200,
         outputTokens: 800,
         totalTokens: 2_000,
+        cachedTokens: 0,
+        uncachedTokens: 2_000,
         cost: 0.05,
         avgLatencyMs: 420
       },
@@ -370,7 +372,9 @@ test('overview groups configuration and traffic stats with the missing error and
   try {
     assert.ok(app.find({ text: 'Models' }), 'the model count is on the dashboard')
     assert.ok(app.find({ text: 'Errors' }), 'the error count is on the dashboard')
-    assert.ok(app.find({ text: '1.2K in · 800 out' }), 'the token split is visible under the total')
+    assert.ok(app.find({ text: 'Token usage' }), 'the token breakdown is on the dashboard')
+    assert.ok(app.find({ text: '1.2K' }), 'the input token count is visible')
+    assert.ok(app.find({ text: 'Total tokens' }), 'the total token count is visible')
   } finally {
     await app.unmount()
   }
@@ -1145,6 +1149,50 @@ test('custom provider saves its grouped endpoints and usage connector', async ()
     )
     assert.deepEqual(provider.protocols, ['openai'], 'the enabled protocol is saved')
     assert.equal(usageSaved?.provider, 'gateway', 'the usage connector is saved with the provider')
+  } finally {
+    await app.unmount()
+  }
+})
+
+test('config save omits the worker-owned modelWindows cache', async () => {
+  // A provider whose /v1/models returns a large catalog can add thousands of
+  // entries to modelWindows. That cache is owned by the worker, so the panel
+  // must not round-trip it on save or the message exceeds Orca's size limit.
+  const modelWindows: Record<string, { contextWindow: number }> = {}
+  for (let index = 0; index < 2000; index += 1) {
+    modelWindows[`url:https://api.numes.ai\u0000model-${index}`] = { contextWindow: 128000 }
+  }
+  const configWithWindows: RouterConfig = { ...config, modelWindows }
+  let saved: RouterConfig | null = null
+  const host = mockHost({
+    requests: {
+      'router.status': status as never,
+      'router.config.get': () => ({ config: saved ?? configWithWindows }),
+      'router.usage': usage,
+      'router.presets': { presets: [] },
+      'router.keyUsage': { providers: [] },
+      'router.config.save': (input) => {
+        saved = input.config
+        return { ok: true }
+      }
+    }
+  })
+  const app = await mount(panel, { host, persisted: { plugin: { tab: 'providers' } } })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  await app.settled()
+
+  try {
+    await app.press({ text: 'Add provider' })
+    await app.press({ text: 'Custom provider' })
+    await app.settled()
+    await app.type({ label: 'Name' }, 'numes', { replace: true })
+    await app.type({ label: 'Base URL' }, 'https://api.numes.ai', { replace: true })
+    await app.press(app.findAll({ text: 'Add provider' }).at(-1)!)
+    await app.settled()
+
+    assert.ok(saved, 'the provider is persisted')
+    assert.ok(saved.providers.find((item) => item.name === 'numes'), 'the new provider exists')
+    assert.equal(saved.modelWindows, undefined, 'the worker-owned cache is not sent back on save')
   } finally {
     await app.unmount()
   }

@@ -292,6 +292,9 @@ const usage = {
   outputTokens: 62_140,
   totalTokens: 246_460,
   cost: 1.87,
+  unpricedRequests: 2,
+  cachedTokens: 12_400,
+  uncachedTokens: 234_060,
   avgLatencyMs: 940,
   cacheHits: 9,
   cacheSavedTokens: 12_400,
@@ -307,6 +310,31 @@ const usage = {
     { model: 'claude-sonnet-4-5', count: 71 },
     { model: 'gpt-5', count: 44 },
     { model: 'gpt-5-mini', count: 8 }
+  ],
+  byRoute: [
+    { route: 'coding', requests: 80, cost: 1.24, failovers: 2 },
+    { route: 'direct', requests: 48, cost: 0.63, failovers: 0 }
+  ],
+  byAgent: [{ agent: 'claude-code', requests: 90, cost: 1.4, failovers: 2 }],
+  byKey: [{ credential: 'key-1', requests: 128, cost: 1.87, failovers: 2 }],
+  modelUsage: [
+    { model: 'claude-sonnet-4-5', requests: 71, input: 120_000, output: 40_000, cacheRead: 8_000, cacheWrite: 1_000, cost: 1.24 },
+    { model: 'gpt-5', requests: 44, input: 80_000, output: 20_000, cacheRead: 3_000, cacheWrite: 500, cost: 0.58 },
+    { model: 'gpt-5-mini', requests: 8, input: 12_000, output: 2_140, cacheRead: 400, cacheWrite: 0, cost: 0.05 }
+  ],
+  byProviderSpend: [
+    { provider: 'anthropic', requests: 71, cost: 1.24, failovers: 2 },
+    { provider: 'openai', requests: 52, cost: 0.58, failovers: 0 },
+    { provider: 'openrouter', requests: 5, cost: 0.05, failovers: 0 }
+  ],
+  daily: [
+    { day: '2026-11-14', requests: 12, input: 18_000, output: 6_000, cacheRead: 2_000, cacheWrite: 500, cost: 0.21, cacheHits: 1, failovers: 0 },
+    { day: '2026-11-15', requests: 19, input: 26_000, output: 9_000, cacheRead: 1_500, cacheWrite: 800, cost: 0.29, cacheHits: 2, failovers: 1 },
+    { day: '2026-11-16', requests: 14, input: 21_000, output: 7_000, cacheRead: 3_000, cacheWrite: 400, cost: 0.24, cacheHits: 1, failovers: 0 },
+    { day: '2026-11-17', requests: 22, input: 34_000, output: 11_000, cacheRead: 2_200, cacheWrite: 900, cost: 0.38, cacheHits: 2, failovers: 0 },
+    { day: '2026-11-18', requests: 17, input: 24_000, output: 8_000, cacheRead: 1_100, cacheWrite: 300, cost: 0.26, cacheHits: 1, failovers: 0 },
+    { day: '2026-11-19', requests: 25, input: 38_000, output: 13_000, cacheRead: 1_800, cacheWrite: 700, cost: 0.32, cacheHits: 1, failovers: 1 },
+    { day: '2026-11-20', requests: 19, input: 23_320, output: 8_140, cacheRead: 800, cacheWrite: 400, cost: 0.17, cacheHits: 1, failovers: 0 }
   ],
   totals: {}
 }
@@ -394,6 +422,10 @@ export default defineCheck({
   'settings': {
     ...populated,
     persisted: { plugin: { tab: 'settings' } }
+  },
+  usage: {
+    ...populated,
+    persisted: { plugin: { tab: 'usage' } }
   },
   profiles: {
     ...populated,
