@@ -96,7 +96,20 @@ test('Grok gets a model-list URL for its picker and CodeBuddy gets its own base 
   }).env
   assert.equal(codebuddy.CODEBUDDY_BASE_URL, BASE)
   assert.equal(codebuddy.CODEBUDDY_API_KEY, TOKEN)
-  assert.equal(codebuddy.ORCA_ROUTER_API_KEY, TOKEN)
+  assert.equal(codebuddy.LLM_ROUTER_API_KEY, TOKEN)
+})
+
+test('launch env never uses an env name Orca reserves for itself', () => {
+  const config = normalizeConfig(structuredClone(DEFAULT_CONFIG))
+  for (const { id } of ORCA_AGENTS) {
+    const { env } = buildAgentLaunchEnv(config, id, { base: BASE, token: TOKEN, eventEnv: {} })
+    for (const key of Object.keys(env)) {
+      // Orca's agent.launch.before schema rejects the entire env change when
+      // one key starts with ORCA_, which silently unroutes every agent.
+      assert.ok(!key.toUpperCase().startsWith('ORCA_'), `${id}: ${key} uses Orca's reserved prefix`)
+      assert.match(key, /^[A-Za-z_][A-Za-z0-9_]*$/, `${id}: ${key} is not a valid env name`)
+    }
+  }
 })
 
 test('agents with no explicit toggle entry still route by default', () => {
