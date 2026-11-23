@@ -1,7 +1,7 @@
 # Orca LLM Router — Marketplace Listing & Marketing Showcase
 
 [![Orca Plugin Directory](https://img.shields.io/badge/Orca%20Plugin-Install%20on%20orca.dev-6366f1?style=for-the-badge&logo=orca)](https://orca.dev/plugins/addisflava/orca-llm-router)
-[![Version: 1.1.0](https://img.shields.io/badge/Version-1.1.0-blue?style=for-the-badge)](package.json)
+[![Version: 1.3.5](https://img.shields.io/badge/Version-1.3.5-blue?style=for-the-badge)](package.json)
 [![Providers: 34+](https://img.shields.io/badge/Providers-34%2B%20Presets-success?style=for-the-badge)](#supported-providers)
 [![Agents: 45+](https://img.shields.io/badge/Agents-45%2B%20Supported-purple?style=for-the-badge)](#supported-coding-agents)
 [![Free Web Chat](https://img.shields.io/badge/Free%20Web%20Chat-DeepSeek%20%7C%20Qwen-emerald?style=for-the-badge)](#free-web-chat-transports-)
