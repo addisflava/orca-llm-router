@@ -183,7 +183,7 @@ test('provider editor exposes every endpoint and protocol, including gemini', as
   await app.settled()
   assert.ok(app.find({ label: 'Base URL 1' }), 'the first endpoint is editable')
   assert.ok(app.find({ label: 'Base URL 2' }), 'a second endpoint is editable')
-  assert.ok(app.find({ label: 'Gemini' }), 'the gemini protocol is exposed')
+  assert.ok(app.find({ text: '✓ Gemini' }), 'the gemini protocol is exposed')
   await app.type({ label: 'Base URL 2' }, 'https://gateway.test/api', { replace: true })
   await app.press({ text: 'Save changes' })
   await app.settled()
@@ -356,6 +356,8 @@ test('overview groups configuration and traffic stats with the missing error and
         inputTokens: 1_200,
         outputTokens: 800,
         totalTokens: 2_000,
+        cachedTokens: 0,
+        uncachedTokens: 2_000,
         cost: 0.05,
         avgLatencyMs: 420
       },
@@ -370,7 +372,9 @@ test('overview groups configuration and traffic stats with the missing error and
   try {
     assert.ok(app.find({ text: 'Models' }), 'the model count is on the dashboard')
     assert.ok(app.find({ text: 'Errors' }), 'the error count is on the dashboard')
-    assert.ok(app.find({ text: '1.2K in · 800 out' }), 'the token split is visible under the total')
+    assert.ok(app.find({ text: 'Token usage' }), 'the token breakdown is on the dashboard')
+    assert.ok(app.find({ text: '1.2K' }), 'the input token count is visible')
+    assert.ok(app.find({ text: 'Total tokens' }), 'the total token count is visible')
   } finally {
     await app.unmount()
   }
@@ -638,6 +642,59 @@ test('routing shows the routes list and creates a route', async () => {
 
     await app.press({ text: 'New route' })
     assert.ok(app.find({ label: 'Model alias' }), 'the top action opens the route editor')
+  } finally {
+    await app.unmount()
+  }
+})
+
+test('route editor hides the ordered chain in fastest mode and reorders in ordered mode', async () => {
+  let saved: RouterConfig | null = null
+  const host = mockHost({
+    requests: {
+      'router.status': status as never,
+      'router.config.get': () => ({ config: saved ?? config }),
+      'router.usage': usage,
+      'router.presets': { presets: [] },
+      'router.config.save': (input) => {
+        saved = input.config
+        return { ok: true }
+      }
+    }
+  })
+  const app = await mount(panel, { host, persisted: { plugin: { tab: 'routing' } } })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  await app.settled()
+
+  try {
+    await app.press({ text: 'New route' })
+    await app.type({ label: 'Model alias' }, 'smart', { replace: true })
+
+    // Fastest first: order is decided at request time, so no reorder list is shown.
+    await app.toggle({ label: 'anthropic/existing-model' })
+    await app.toggle({ label: 'anthropic/custom-extra' })
+    assert.equal(app.find({ text: 'Resolved chain' }), null, 'the resolved chain preview is gone')
+    assert.ok(app.find({ text: 'Resolved order' }), 'the order section is always visible')
+    assert.equal(app.findAll({ text: '↓' }).length, 0, 'fastest mode has no reorder controls')
+
+    // Ordered mode: the reorder list appears and the dropdown can switch back.
+    await app.select({ label: 'Try sequence' }, 'ordered')
+    assert.ok(app.find({ label: 'Try sequence' }), 'the sequence dropdown sits beside the order title')
+    const tree = JSON.stringify(app.tree())
+    assert.ok(!tree.includes('["1","."]'), 'the index renders as one text node so its period cannot wrap')
+
+    const downs = app.findAll({ text: '↓' })
+    assert.equal(downs.length, 2, 'each selected target has a move-down control')
+    await app.press(downs[0])
+    await app.press({ text: 'Add route' })
+
+    assert.deepEqual(
+      saved?.routes.find((entry) => entry.name === 'smart')?.targets,
+      [
+        { provider: 'anthropic', model: 'custom-extra' },
+        { provider: 'anthropic', model: 'existing-model' }
+      ],
+      'move-down reorders the saved targets'
+    )
   } finally {
     await app.unmount()
   }
@@ -968,5 +1025,396 @@ test('providers tab no longer owns scheduling policy', async () => {
     assert.ok(app.find({ text: 'Response avg 180 ms / 6 reqs' }), 'the provider card combines the average and request count')
   } finally {
     await app.unmount()
+  }
+})
+
+test('a provider whose last outcome failed does not keep reading ok', async () => {
+  const failedHealth = {
+    state: 'degraded',
+    latencyMs: 1635,
+    samples: 642,
+    failures: 1,
+    lastSuccessAt: Date.now() - 53 * 60_000,
+    lastFailureAt: Date.now() - 60_000
+  }
+  const host = mockHost({
+    requests: {
+      'router.status': { ...status, providers: [{ ...status.providers[0], health: failedHealth }] } as never,
+      'router.config.get': { config },
+      'router.usage': usage,
+      'router.presets': { presets: [] },
+      'router.keyUsage': { providers: [] }
+    }
+  })
+  const app = await mount(panel, { host, persisted: { plugin: { tab: 'providers' } } })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  await app.settled()
+
+  try {
+    assert.ok(app.find({ text: 'Response avg 1635 ms / 642 reqs' }), 'the metrics line is rendered')
+    assert.ok(app.find({ text: /^failed / }), 'the trailing status reports the recent failure')
+    assert.equal(app.find({ text: /^ok \d/ }), null, 'it no longer pairs a failure with ok')
+  } finally {
+    await app.unmount()
+  }
+})
+
+test('custom provider form uses the same grouped sections as the editor', async () => {
+  const host = mockHost({
+    requests: {
+      'router.status': status as never,
+      'router.config.get': { config },
+      'router.usage': usage,
+      'router.presets': { presets: [] },
+      'router.keyUsage': { providers: [] }
+    }
+  })
+  const app = await mount(panel, { host, persisted: { plugin: { tab: 'providers' } } })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  await app.settled()
+
+  try {
+    await app.press({ text: 'Add provider' })
+    await app.press({ text: 'Custom provider' })
+    await app.settled()
+
+    assert.ok(app.find({ text: 'Provider name' }), 'name sits inline above the groups')
+    assert.ok(app.find({ label: 'Base URL' }), 'the Endpoint group exposes the base URL')
+    assert.ok(app.find({ text: 'Protocol' }), 'the Endpoint group exposes the protocol chips')
+    assert.ok(app.find({ text: 'Usage source' }), 'the Usage source group is present')
+    assert.ok(app.findAll({ text: 'Add endpoint' }).length, 'multiple endpoints can be added')
+
+    await app.press({ text: 'Add endpoint' })
+    await app.settled()
+    assert.ok(app.find({ label: 'Base URL 2' }), 'a second endpoint can be edited')
+  } finally {
+    await app.unmount()
+  }
+})
+
+test('custom provider saves its grouped endpoints and usage connector', async () => {
+  let saved: RouterConfig | null = null
+  let usageSaved: { provider?: string; usageFetch?: { connectors: { endpoint: string }[] } } | null = null
+  const host = mockHost({
+    requests: {
+      'router.status': status as never,
+      'router.config.get': () => ({ config: saved ?? config }),
+      'router.usage': usage,
+      'router.presets': { presets: [] },
+      'router.keyUsage': { providers: [] },
+      'router.config.save': (input) => {
+        saved = input.config
+        return { ok: true }
+      },
+      'router.provider.usage': (input) => {
+        usageSaved = input
+        return { ok: true }
+      }
+    }
+  })
+  const app = await mount(panel, { host, persisted: { plugin: { tab: 'providers' } } })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  await app.settled()
+
+  try {
+    await app.press({ text: 'Add provider' })
+    await app.press({ text: 'Custom provider' })
+    await app.settled()
+    await app.type({ label: 'Name' }, 'gateway', { replace: true })
+    await app.type({ label: 'Base URL' }, 'https://one.test/v1', { replace: true })
+    await app.press({ text: 'Add endpoint' })
+    await app.settled()
+    await app.type({ label: 'Base URL 2' }, 'https://two.test', { replace: true })
+    await app.press({ text: 'OpenAI' })
+    await app.type(
+      { label: 'Usage endpoint' },
+      'https://one.test/credits',
+      { replace: true }
+    )
+    await app.type(
+      { label: 'Meters JSON' },
+      '[{"id":"balance","label":"Balance","remaining":"$.balance","unit":"USD"}]',
+      { replace: true }
+    )
+    await app.press(app.findAll({ text: 'Add provider' }).at(-1)!)
+    await app.settled()
+
+    assert.ok(saved, 'the provider is persisted')
+    const provider = saved.providers.find((item) => item.name === 'gateway')
+    assert.ok(provider, 'the new provider exists')
+    assert.deepEqual(
+      provider.endpoints?.map((endpoint) => endpoint.baseUrl),
+      ['https://one.test/v1', 'https://two.test'],
+      'both grouped endpoints are saved'
+    )
+    assert.deepEqual(provider.protocols, ['openai'], 'the enabled protocol is saved')
+    assert.equal(usageSaved?.provider, 'gateway', 'the usage connector is saved with the provider')
+  } finally {
+    await app.unmount()
+  }
+})
+
+test('config save omits the worker-owned modelWindows cache', async () => {
+  // A provider whose /v1/models returns a large catalog can add thousands of
+  // entries to modelWindows. That cache is owned by the worker, so the panel
+  // must not round-trip it on save or the message exceeds Orca's size limit.
+  const modelWindows: Record<string, { contextWindow: number }> = {}
+  for (let index = 0; index < 2000; index += 1) {
+    modelWindows[`url:https://api.numes.ai\u0000model-${index}`] = { contextWindow: 128000 }
+  }
+  const configWithWindows: RouterConfig = { ...config, modelWindows }
+  let saved: RouterConfig | null = null
+  const host = mockHost({
+    requests: {
+      'router.status': status as never,
+      'router.config.get': () => ({ config: saved ?? configWithWindows }),
+      'router.usage': usage,
+      'router.presets': { presets: [] },
+      'router.keyUsage': { providers: [] },
+      'router.config.save': (input) => {
+        saved = input.config
+        return { ok: true }
+      }
+    }
+  })
+  const app = await mount(panel, { host, persisted: { plugin: { tab: 'providers' } } })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  await app.settled()
+
+  try {
+    await app.press({ text: 'Add provider' })
+    await app.press({ text: 'Custom provider' })
+    await app.settled()
+    await app.type({ label: 'Name' }, 'numes', { replace: true })
+    await app.type({ label: 'Base URL' }, 'https://api.numes.ai', { replace: true })
+    await app.press(app.findAll({ text: 'Add provider' }).at(-1)!)
+    await app.settled()
+
+    assert.ok(saved, 'the provider is persisted')
+    assert.ok(saved.providers.find((item) => item.name === 'numes'), 'the new provider exists')
+    assert.equal(saved.modelWindows, undefined, 'the worker-owned cache is not sent back on save')
+  } finally {
+    await app.unmount()
+  }
+})
+
+const webchatProviderView = {
+  name: 'deepseek-web',
+  displayName: 'DeepSeek Web',
+  baseUrl: '',
+  protocols: ['openai'],
+  models: ['deepseek-chat', 'deepseek-reasoner'],
+  keyCount: 1,
+  transport: 'deepseek-web'
+} as never
+
+async function openWebChatDialog(app: Awaited<ReturnType<typeof mount>>) {
+  await app.press({ text: 'Add provider' })
+  await app.settled()
+  await app.press({ text: 'Web chat' })
+  await app.settled()
+}
+
+test('add provider dialog offers to add both free web providers', async () => {
+  const calls: string[] = []
+  const host = mockHost({
+    requests: {
+      'router.status': status as never,
+      'router.config.get': () => ({ config }),
+      'router.usage': usage,
+      'router.presets': { presets: [] },
+      'router.webchat.auth.status': ({ provider }: { provider: string }) => ({
+        ok: true,
+        configured: false,
+        secretKey: `webchat:${provider}:auth`,
+        session: null
+      }),
+      'router.webchat.setup': ({ transport }: { transport: string }) => {
+        calls.push(`setup:${transport}`)
+        return { ok: true, provider: transport, created: true, secretKey: `webchat:${transport}:auth` }
+      },
+      'router.webchat.auth.start': ({ provider }: { provider: string }) => {
+        calls.push(`start:${provider}`)
+        return { ok: true, mode: 'launch', port: 9222, profileDir: '', source: '', reused: false, secretKey: `webchat:${provider}:auth` }
+      }
+    }
+  })
+  const app = await mount(panel, { host, persisted: { plugin: { tab: 'providers' } } })
+  try {
+    await app.settled()
+    await openWebChatDialog(app)
+    const tree = JSON.stringify(app.tree())
+    assert.ok(tree.includes('deepseek-web.png'), 'the DeepSeek logo is rendered')
+    assert.ok(tree.includes('qwen-web.png'), 'the Qwen logo is rendered')
+    assert.equal(app.findAll({ text: 'Add as a provider' }).length, 2, 'both web services can be added')
+    await app.press(app.findAll({ text: 'Add as a provider' })[0])
+    await app.settled()
+    assert.deepEqual(calls, ['start:deepseek-web'], 'adding a service only starts the browser login; the provider is created after verification')
+  } finally {
+    await app.unmount()
+  }
+})
+
+test('add provider dialog exposes login, paste and session actions for a configured provider', async () => {
+  const calls: string[] = []
+  const host = mockHost({
+    requests: {
+      'router.status': { ...status, providers: [webchatProviderView] } as never,
+      'router.config.get': () => ({ config }),
+      'router.usage': usage,
+      'router.presets': { presets: [] },
+      'router.webchat.auth.status': () => ({
+        ok: true,
+        configured: true,
+        secretKey: 'webchat:deepseek-web:auth',
+        session: null
+      }),
+      'router.webchat.auth.start': ({ provider }: { provider: string }) => {
+        calls.push(`start:${provider}`)
+        return { ok: true, mode: 'launch', port: 9222, profileDir: '', source: '', reused: false, secretKey: `webchat:${provider}:auth` }
+      }
+    }
+  })
+  const app = await mount(panel, { host, persisted: { plugin: { tab: 'providers' } } })
+  try {
+    await app.settled()
+    await openWebChatDialog(app)
+    assert.ok(app.find({ text: 'Connected' }), 'a signed-in provider shows a Connected badge')
+    assert.ok(app.find({ text: 'Reconnect' }), 'a connected provider offers Reconnect, not the setup buttons')
+    assert.ok(!app.find({ text: 'Paste auth JSON' }), 'setup buttons are hidden until reconnect is chosen')
+    assert.ok(!app.find({ text: 'Test connection' }), 'duplicate provider actions are not shown in the dialog')
+    await app.press({ text: 'Reconnect' })
+    await app.settled()
+    assert.ok(app.find({ text: 'Web login' }), 'the reconnect dialog offers Web login')
+    assert.ok(app.find({ text: 'Paste auth JSON' }), 'the reconnect dialog offers paste auth')
+    await app.press({ text: 'Web login' })
+    await app.settled()
+    assert.deepEqual(calls, ['start:deepseek-web'], 'Web login calls the auth start handler')
+    assert.ok(app.find({ text: 'Capture credentials' }), 'the capture step appears after login starts')
+  } finally {
+    await app.unmount()
+  }
+})
+
+test('Show all is part of the collapsed model summary', async () => {
+  const host = mockHost({
+    requests: {
+      'router.status': {
+        ...status,
+        providers: [
+          { ...status.providers[0], models: ['m1', 'm2', 'm3', 'm4', 'm5', 'm6', 'm7', 'm8'] }
+        ]
+      } as never,
+      'router.config.get': () => ({ config }),
+      'router.usage': usage,
+      'router.presets': { presets: [] }
+    }
+  })
+  const app = await mount(panel, { host, persisted: { plugin: { tab: 'providers' } } })
+  try {
+    await app.settled()
+    assert.ok(app.find({ text: 'Show all' }), 'the model summary offers Show all')
+    await app.press({ text: 'Show all' })
+    assert.ok(app.find({ text: 'Show less' }), 'the expanded model list can collapse again')
+  } finally {
+    await app.unmount()
+  }
+})
+
+test('route cards use compact strategy badges', async () => {
+  const host = mockHost({
+    requests: {
+      'router.status': status as never,
+      'router.config.get': () => ({
+        config: {
+          ...config,
+          routes: [
+            ...config.routes,
+            {
+              name: 'ordered',
+              targets: [{ provider: 'anthropic', model: 'existing-model' }],
+              strategy: 'ordered',
+              enabled: true
+            }
+          ]
+        }
+      }),
+      'router.usage': usage,
+      'router.presets': { presets: [] }
+    }
+  })
+  const app = await mount(panel, { host, persisted: { plugin: { tab: 'routing' } } })
+  try {
+    await app.settled()
+    assert.ok(app.find({ text: 'fastest' }), 'a fastest route shows a fastest badge')
+    assert.ok(app.find({ text: 'in order' }), 'an ordered route shows an in order badge')
+  } finally {
+    await app.unmount()
+  }
+})
+
+test('VPN servers live in Settings and can be attached to a route', async () => {
+  const vpnConfig: RouterConfig = {
+    ...config,
+    vpnServers: [
+      { id: 'sample-us-proxy', name: 'Free US proxy (sample)', type: 'http', host: '47.85.161.37', port: 3128 },
+      { id: 'vpn-main', name: 'Home SOCKS', type: 'socks5', host: '127.0.0.1', port: 1080 }
+    ],
+    routes: [{ ...config.routes[0], vpn: 'vpn-main' }]
+  }
+  let savedVpn: Record<string, unknown> | null = null
+  const host = mockHost({
+    requests: {
+      'router.status': status as never,
+      'router.config.get': () => ({ config: vpnConfig }),
+      'router.usage': usage,
+      'router.presets': { presets: [] },
+      'router.vpn.save': (input) => {
+        savedVpn = input
+        return { ok: true, server: { id: 'vpn-2', ...input.server } }
+      }
+    }
+  })
+  const app = await mount(panel, { host, persisted: { plugin: { tab: 'settings' } } })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  await app.settled()
+  try {
+    assert.ok(app.find({ label: 'VPN / proxy servers' }), 'VPN card is under settings')
+    assert.ok(app.find({ text: 'Home SOCKS' }), 'configured server is listed')
+    assert.ok(app.find({ text: 'Free US proxy (sample)' }), 'the sample US proxy is listed too')
+    await app.press(app.findAll({ text: 'Add VPN server' })[0])
+    await app.type({ label: 'Server name' }, 'Work HTTP')
+    await app.select({ label: 'Protocol' }, 'http')
+    await app.type({ label: 'Server host' }, 'proxy.example')
+    await app.type({ label: 'Server port' }, '3128')
+    await app.type({ label: 'Proxy username' }, 'alice')
+    await app.type({ label: 'Proxy password' }, 'secret')
+    await app.press(app.findAll({ text: 'Add VPN server' })[0])
+    assert.ok(savedVpn, 'the worker received the new server')
+    assert.deepEqual(savedVpn?.server, { name: 'Work HTTP', type: 'http', host: 'proxy.example', port: 3128 })
+    assert.equal(savedVpn?.username, 'alice')
+    assert.equal(savedVpn?.password, 'secret')
+  } finally {
+    await app.unmount()
+  }
+
+  const routingHost = mockHost({
+    requests: {
+      'router.status': status as never,
+      'router.config.get': () => ({ config: vpnConfig }),
+      'router.usage': usage,
+      'router.presets': { presets: [] }
+    }
+  })
+  const routing = await mount(panel, { host: routingHost, persisted: { plugin: { tab: 'routing' } } })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  await routing.settled()
+  try {
+    assert.ok(routing.find({ text: 'VPN: Home SOCKS' }), 'the route shows its VPN badge')
+    await routing.press({ label: 'Edit route fast' })
+    await routing.settled()
+    assert.equal(routing.valueOf({ label: 'VPN / proxy' }), 'vpn-main', 'route editor loads the attached server')
+  } finally {
+    await routing.unmount()
   }
 })

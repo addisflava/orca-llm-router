@@ -18,6 +18,8 @@ declare module 'orca' {
         agentProfiles: AgentProfile[]
         agents: AgentRoute[]
         logs: LogEntry[]
+        routeFailovers?: Record<string, number>
+        routeRequests?: Record<string, number>
       }
     }
     'router.start': { input: Record<string, never>; output: { running: boolean; port: number } }
@@ -44,6 +46,10 @@ declare module 'orca' {
         outputTokens: number
         totalTokens: number
         cost: number
+        /** Successful requests with usage but no known price; cost is a lower bound. */
+        unpricedRequests?: number
+        cachedTokens?: number
+        uncachedTokens?: number
         avgLatencyMs: number
         cacheHits?: number
         cacheSavedTokens?: number
@@ -52,6 +58,14 @@ declare module 'orca' {
         relayEvents?: number
         byProvider: { provider: string; count: number }[]
         byModel: { model: string; count: number }[]
+        /** Spend grouped by the route the agent requested, including failovers. */
+        byRoute?: { route: string; requests: number; cost: number; failovers: number }[]
+        byAgent?: { agent: string; requests: number; cost: number; failovers: number }[]
+        byKey?: { credential: string; requests: number; cost: number; failovers: number }[]
+        byProviderSpend?: { provider: string; requests: number; cost: number; failovers: number }[]
+        /** Successful requests bucketed by local calendar day, oldest first. */
+        daily?: { day: string; requests: number; input: number; output: number; cacheRead: number; cacheWrite: number; cost: number; cacheHits: number; failovers: number }[]
+        modelUsage?: { model: string; requests: number; input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }[]
         totals: Record<string, unknown>
       }
     }
@@ -111,7 +125,12 @@ declare module 'orca' {
     'router.clientKeys.revoke': { input: { id: string }; output: { ok: true } }
     'router.discoverModels': {
       input: { provider?: string; baseUrl?: string; protocols?: string[]; secretKey?: string; value?: string }
-      output: { ok: true; models: string[]; provider: string | null }
+      output: {
+        ok: true
+        models: string[]
+        limits?: Record<string, { contextWindow?: number; maxOutput?: number }>
+        provider: string | null
+      }
     }
     'router.discoverAllModels': {
       input: Record<string, never>
@@ -143,6 +162,77 @@ declare module 'orca' {
       input: { provider: string; usageFetch?: UsageFetchConfig | null }
       output: { ok: true }
     }
+    'router.vpn.save': {
+      input: {
+        server: { id?: string; name: string; type: 'http' | 'socks5'; host: string; port: number; enabled?: boolean }
+        username?: string
+        password?: string
+      }
+      output: { ok: true; server: VpnServerConfig }
+    }
+    'router.vpn.remove': { input: { id: string }; output: { ok: true } }
+    'router.webchat.setup': {
+      input: { transport: 'deepseek-web' | 'qwen-web' }
+      output: { ok: true; provider: string; created: boolean; secretKey: string }
+    }
+    'router.webchat.resetSession': {
+      input: { provider?: string; affinityKey?: string; keyIdentity?: string; all?: boolean }
+      output: { ok: true; removed: boolean | number; key: string }
+    }
+    'router.webchat.sessions': {
+      input: Record<string, never>
+      output: {
+        ok: true
+        sessions: {
+          key: string
+          session_id: string | null
+          message_count: number
+          history_size: number
+          age_ms: number | null
+          idle_ms: number
+        }[]
+      }
+    }
+    'router.webchat.auth.start': {
+      input: { provider: string; port?: number }
+      output: {
+        ok: true
+        mode: 'attach' | 'launch'
+        port: number
+        profileDir: string
+        reused: boolean
+        secretKey: string
+      }
+    }
+    'router.webchat.auth.status': {
+      input: { provider: string }
+      output: {
+        ok: true
+        configured: boolean
+        secretKey: string
+        headersCaptured: boolean
+        session: { mode: string; port: number; startedAt: number } | null
+      }
+    }
+    'router.webchat.auth.capture': {
+      input: { provider: string; secretKey?: string; silent?: boolean; attempts?: number }
+      output: {
+        ok: boolean
+        secretKey: string
+        summary: { token: string; cookie: string; hif?: string; bx?: string } | null
+        verified?: boolean
+        reason?: 'verification_failed'
+        message?: string
+      }
+    }
+    'router.webchat.auth.cancel': {
+      input: { provider: string }
+      output: { ok: true }
+    }
+    'router.webchat.auth.paste': {
+      input: { provider: string; json: string | Record<string, unknown>; secretKey?: string }
+      output: { ok: true; secretKey: string; summary: { token: string; cookie: string; hif?: string; bx?: string } }
+    }
   }
   interface PluginPanelEvents {
     'router.statusChanged': { running: boolean; port: number }
@@ -172,6 +262,8 @@ export interface ProviderPreset {
   capabilities: string[]
   defaultModels: string[]
   websiteUrl?: string
+  /** Native web-chat transport id (deepseek-web | qwen-web), when the preset drives a web subscription. */
+  transport?: 'deepseek-web' | 'qwen-web'
   usage?: { endpoint: string; auth: string; mapping: { meters: unknown[] } }
 }
 
@@ -247,6 +339,8 @@ export interface ProviderView {
   health?: ProviderHealthView
   /** True when a usage connector is configured (or matched from a preset). */
   usageSource?: boolean
+  /** Native web-chat transport id when this provider drives a web subscription. */
+  transport?: 'deepseek-web' | 'qwen-web'
 }
 
 export interface PolicyCondition {
@@ -290,6 +384,22 @@ export interface ModelRoute {
   enabled?: boolean
   /** Attempts per target (plus the first). Defaults to the router retry count. */
   retries?: number
+  /** Id of a reusable VPN/proxy server; absent means a direct connection. */
+  vpn?: string
+}
+
+/**
+ * A reusable HTTP CONNECT or SOCKS5 server. Credentials are stored in Orca's
+ * secret store under `secretKey`; only the name lives in config.
+ */
+export interface VpnServerConfig {
+  id: string
+  name: string
+  type: 'http' | 'socks5'
+  host: string
+  port: number
+  enabled?: boolean
+  secretKey?: string
 }
 
 /** One legacy custom chain auto-migrated into a route. */
@@ -377,6 +487,10 @@ export interface RouterConfig {
   /** Routes (the failover unit). Model names agents send map to these. */
   routes: ModelRoute[]
   aliases: Record<string, string>
+  /** Reusable VPN/proxy servers attachable to routes. */
+  vpnServers?: VpnServerConfig[]
+  /** True once the sample server has been offered, so an empty list stays empty. */
+  vpnSampleDismissed?: boolean
   /** Global policies. Legacy `routes` (v2) is accepted at runtime and normalized here. */
   policies: RequestPolicy[]
   defaultModel?: string
@@ -393,12 +507,16 @@ export interface RouterConfig {
   contextRelay?: ContextRelayConfig
   /** Opt-in local response cache, exact or embedding-backed semantic. */
   responseCache?: ResponseCacheConfig
+  /** Context/output windows learned from provider /v1/models responses. */
+  modelWindows?: Record<string, { contextWindow?: number; maxOutput?: number; source?: string; at?: number }>
   /** Legacy custom chains converted into routes. */
   migration?: MigrationEntry[]
   timeoutMs?: number
   retries?: number
   baseDelayMs?: number
   logBodyCapture?: 'all' | 'errors' | 'none'
+  /** Opt-in: keep the request log in Orca storage across worker restarts. */
+  persistLogs?: boolean
   exposeRoutingHeaders?: boolean
   allowUnauthenticatedRemote?: boolean
 }
@@ -440,11 +558,21 @@ export interface ProviderConfig {
   baseUrl: string
   endpoints?: { baseUrl: string; protocols: string[] }[]
   protocols: string[]
-  models: { id: string; description?: string; pricing?: unknown }[]
+  models: {
+    id: string
+    description?: string
+    pricing?: unknown
+    /** Optional override; otherwise discovery metadata is used. */
+    contextWindow?: number
+    /** Optional max completion tokens override. */
+    maxOutput?: number
+  }[]
   keys: { id: string; secretKey: string; enabled?: boolean; priority?: number; weight?: number; limits?: Record<string, unknown> }[]
   enabled?: boolean
   pricing?: Record<string, unknown>
   usageFetch?: UsageFetchConfig
+  /** Native web-chat transport id when the provider drives a web subscription. */
+  transport?: 'deepseek-web' | 'qwen-web'
 }
 
 /** One meter read from a provider usage response. Expressions are JSON paths (`$.a.b`). */
@@ -481,19 +609,31 @@ export interface LogEntry {
   at: number
   upstream: string | null
   resolvedProvider?: string | null
+  route?: string | null
+  /** Best-effort agent label from an explicit header, session header or User-Agent. */
+  agent?: string | null
+  /** Display name of the VPN server used for this request, when any. */
+  vpn?: string | null
   credential?: string | null
   requestModel?: string
   resolvedModel?: string
   model: string
   protocol: string
+  stream?: boolean
+  /** A retry or failover happened before this response succeeded. */
+  failedOver?: boolean
+  errorCode?: string | null
+  policyId?: string | null
   status: number
   latencyMs: number | null
   attempts: string[]
-  failures?: { provider: string; status?: number; error?: string; code?: string }[]
+  failures?: { provider: string; model?: string; status?: number; error?: string; code?: string }[]
   delaysMs?: number[]
   bytes?: number
-  tokens?: { input: number; output: number; cache?: number } | null
+  tokens?: { input: number; output: number; cache?: number; cacheRead?: number; cacheWrite?: number; cacheWrite1h?: number; reasoning?: number } | null
   cost?: number | null
+  /** Where the cost came from: override, catalog, cache, or null when unpriced. */
+  priceSource?: string | null
   error?: string
   compression?: { mode: string; before: number; after: number; saved: number } | null
   relay?: { before: number; after: number; relayed: number } | null
