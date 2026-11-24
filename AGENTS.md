@@ -161,3 +161,17 @@ Do not add these unless a task explicitly changes the scope:
 - Only non-default key priority, weight, and limit metadata is shown in the row.
 - Request logs identify the provider credential used for each request.
 - Route targets are edited with a searchable multi-select with a resolved-order preview. A provider target with a blank model is a warning and blocks saving instead of being dropped silently. Bare model/alias targets remain valid.
+
+## Orca community directory: listing and review findings (empirical)
+
+These are **observed** behaviors from controlled tag tests against `stablyai/orca-community-plugins` in November 2026, not documented policy. The public docs do not explain the `under-review` categories, so verify against `status.json` and the plugin page whenever this matters.
+
+- The directory reads the newest `vX.Y.Z` tag. `version` in `orca-plugin.json` must be plain semver — a leading `v` (e.g. `"v1.3.13"`) is rejected with `version: must be semver`, which puts the entry in `state: rejected` and removes it from the catalog until a valid newer tag is published.
+- A release with no code delta from the currently listed release (version/manifest/badge-only changes) auto-lists: v1.3.2 and v1.3.4 both listed within one indexer pass.
+- Two independent `under-review` flags were observed:
+  - `code` — triggered by `worker/proxy.mjs` (raw HTTP CONNECT / SOCKS5 tunneling with `node:net` / `node:tls`). It fired even when the file was unreferenced and even after removing the WASM PoW, generated price table, `worker/webchat/*`, `worker/agent-config.mjs`, and the pricing group. Removing `worker/proxy.mjs` cleared it: v1.3.26 (no webchat, no proxy) auto-listed; v1.3.29 (same base, updated core files) dropped from `code, update` to `update` only.
+  - `update` — triggered by changing existing code files of an already-listed release (v1.3.29 changed `worker/main.mjs`, `worker/sidecar.mjs`, `src/panel.tsx`, `src/protocol.ts`, `src/panel.check.ts`, and tests vs the listed v1.3.26). Manifest-only changes did not trigger it (v1.3.4).
+- Directory status lives in `status.json`; the installable release and `contentHash` are pinned in `orca-catalog.json` and `releases.lock.json`. The website can serve a stale cached page after the catalog updates.
+- A prior maintainer fix (`oscarbotteri/orca-db-studio#68`) showed another concrete `code` trigger: long runs of escaped non-ASCII bytes (`\xA0\xA1…`) in a minified vendor bundle. No such pattern exists in this repo.
+
+**For future agents:** if you learn something materially different from the notes above (different trigger, changed directory behavior, a maintainer explanation, or a release that contradicts these observations), update this section immediately with the tag/version, date, exact `status.json` detail, and evidence. Do not rely on chat history; keep this file current.
