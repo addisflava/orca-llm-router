@@ -343,7 +343,7 @@ export function writeAgentConfigs(config, { base, token, modelIds = [] } = {}) {
       'orca-router': {
         type: 'openai-compat',
         base_url: v1,
-        api_key: '$ORCA_ROUTER_API_KEY',
+        api_key: '$LLM_ROUTER_API_KEY',
         models: modelIds.map((id) => ({ id, name: id }))
       }
     }
@@ -410,7 +410,7 @@ export function writeAgentConfigs(config, { base, token, modelIds = [] } = {}) {
     'custom_providers:',
     '  - name: orca-router',
     `    base_url: ${v1}`,
-    '    key_env: ORCA_ROUTER_API_KEY',
+    '    key_env: LLM_ROUTER_API_KEY',
     '    models:',
     ...(modelIds.length ? modelIds.map((id) => `      ${JSON.stringify(id)}: {}`) : ['      {}']),
     ...(first ? [
@@ -419,7 +419,7 @@ export function writeAgentConfigs(config, { base, token, modelIds = [] } = {}) {
       '  provider: orca-router'
     ] : [])
   ])
-  applyEnvFile(targets.hermes.env, [['ORCA_ROUTER_API_KEY', token]])
+  applyEnvFile(targets.hermes.env, [['LLM_ROUTER_API_KEY', token]])
   // jcode keeps a single pinned provider profile in TOML.
   applyYaml(targets.jcode.toml, [
     '[providers.orca-router]',

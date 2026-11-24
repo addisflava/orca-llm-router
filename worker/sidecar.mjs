@@ -2330,7 +2330,9 @@ export function buildAgentLaunchEnv(config, agentId, { base, token, eventEnv = {
     GOOGLE_GEMINI_BASE_URL: base,
     GEMINI_API_KEY: token,
     // Crush's provider config stores an env reference instead of the key.
-    ORCA_ROUTER_API_KEY: token,
+    // Never prefix a launch-hook variable with ORCA_: Orca reserves that prefix
+    // for itself and rejects the whole env change when a hook tries to set one.
+    LLM_ROUTER_API_KEY: token,
     // CodeBuddy is a Claude Code fork but reads its own base-url variables.
     CODEBUDDY_BASE_URL: base,
     CODEBUDDY_API_KEY: token,
