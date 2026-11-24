@@ -3576,10 +3576,31 @@ function Overview() {
   const mixCached = metric?.cachedTokens ?? 0
   const mixTotal = mixInput + mixOutput + mixCached || 1
   const mixSegments: { key: string; label: string; value: number; tone: Tone }[] = [
-    { key: 'input', label: 'Input', value: mixInput, tone: 'accent' },
+    { key: 'input', label: 'Input', value: mixInput, tone: 'warning' },
     { key: 'output', label: 'Output', value: mixOutput, tone: 'success' },
-    { key: 'cached', label: 'Cached', value: mixCached, tone: 'warning' }
+    { key: 'cached', label: 'Cached', value: mixCached, tone: 'danger' }
   ]
+  const hasMix = mixInput + mixOutput + mixCached > 0
+  const mixPercentages = mixSegments.map((segment) => hasMix ? Math.round((segment.value / mixTotal) * 100) : 0)
+  const mixRemainder = hasMix ? 100 - mixPercentages.reduce((sum, percent) => sum + percent, 0) : 0
+  if (mixRemainder) {
+    const largest = mixPercentages.indexOf(Math.max(...mixPercentages))
+    mixPercentages[largest] = Math.max(0, mixPercentages[largest] + mixRemainder)
+  }
+  // A tiny slice (for example a 4% input share) should still be visible.
+  // Give every non-zero slice a minimum width and scale the rest to fill 100%.
+  const mixMinWidth = 6
+  const visibleMixCount = mixPercentages.filter((percent) => percent > 0).length
+  const mixBarPercentages = visibleMixCount && visibleMixCount * mixMinWidth <= 100
+    ? mixPercentages.map((percent) => percent > 0
+      ? Math.round(mixMinWidth + (percent / 100) * (100 - visibleMixCount * mixMinWidth))
+      : 0)
+    : mixPercentages
+  const barRemainder = hasMix ? 100 - mixBarPercentages.reduce((sum, percent) => sum + percent, 0) : 0
+  if (barRemainder) {
+    const largest = mixBarPercentages.indexOf(Math.max(...mixBarPercentages))
+    mixBarPercentages[largest] = Math.max(0, mixBarPercentages[largest] + barRemainder)
+  }
   const hasTraffic = metric != null && metric.requests > 0
   const totalFailovers = (metric?.byRoute ?? []).reduce((sum, row) => sum + row.failovers, 0)
   const topProviders = [...(metric?.byProvider ?? [])]
@@ -3685,18 +3706,18 @@ function Overview() {
 
             <Stack gap="xs">
               <Box direction="row" gap="md" wrap>
-                {mixSegments.map((segment) => (
+                {mixSegments.map((segment, index) => (
                   <Row key={segment.key} align="center" gap="xs">
-                    <Box background={segment.tone} radius="full" height={6} width={6} />
+                    <Box background={segment.tone} radius="full" height={10} width={10} />
                     <Text size="xs" muted>{segment.label}</Text>
                     <Text size="xs" weight="semibold">{formatNumber(segment.value)}</Text>
-                    <Text size="xs" muted>{((segment.value / mixTotal) * 100).toFixed(0)}%</Text>
+                    <Text size="xs" muted>{mixPercentages[index]}%</Text>
                   </Row>
                 ))}
               </Box>
-              <Box direction="row" height={8} width="100%" background="muted" radius="full">
-                {mixSegments.map((segment) => segment.value > 0 ? (
-                  <Box key={segment.key} background={segment.tone} height={8} width={`${(segment.value / mixTotal) * 100}%`} />
+              <Box direction="row" height={14} width="100%" background="muted" radius="full">
+                {mixSegments.map((segment, index) => mixBarPercentages[index] > 0 ? (
+                  <Box key={segment.key} background={segment.tone} height={14} width={`${mixBarPercentages[index]}%`} />
                 ) : null)}
               </Box>
             </Stack>
