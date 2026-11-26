@@ -23,6 +23,7 @@
 //     fallback?: {mode:'off'|'retry'|'model-chain'|'provider-chain', models?, retryCount?} }
 
 import { SAMPLE_VPN_SERVER } from './proxy.mjs'
+import { DeepSeekWebTransport } from './webchat/deepseek.mjs'
 import { createServer } from 'node:http'
 import { createDecipheriv, scryptSync, createHash } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
