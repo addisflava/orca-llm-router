@@ -29,7 +29,25 @@ import { join, dirname } from 'node:path'
 import { homedir } from 'node:os'
 import { createSchedulerState, normalizeCircuitBreaker, normalizeProviderHealth, normalizeScheduler, rankProviderTargets, retryAfterMs, selectScheduledKey } from './scheduler.mjs'
 import { COMPRESSION_MODES, bodyCharLength, compressChatBody, normalizeCompression, normalizeContextRelay, relayChatBody } from './transforms.mjs'
-import { canonicalCacheKey, createResponseCache, extractPromptText, normalizeResponseCache, semanticParamsKey, shouldCacheRequest } from './cache.mjs'
+import { canonicalCacheKey, createResponseCache, extractPromptText, normalizeResponseCache, semanticParamsKey, shouldCacheRequest, stableStringify } from './cache.mjs'
+import { SAMPLE_VPN_SERVER, createProxyFetch, findVpnServer, normalizeVpnServers } from './proxy.mjs'
+import { quoteCost } from './pricing.mjs'
+import { claudeGatewayModels, decodeSyntheticModelId } from './agent-catalog.mjs'
+import { WebChatSessionStore } from './webchat/session.mjs'
+import { DeepSeekWebTransport } from './webchat/deepseek.mjs'
+import { QwenWebTransport } from './webchat/qwen.mjs'
+import { createWebChatProvider } from './webchat/index.mjs'
+import { createRecoveredWebChat } from './webchat/recovery.mjs'
+import { solvePOW as solvePOWFn } from './webchat/pow.mjs'
+import {
+  isWebChatTransport,
+  webchatCatalog,
+  webchatConfigured,
+  webchatSessionKey,
+  buildWebChatSuccessResponse,
+  buildWebChatErrorResponse,
+} from './webchat/sidecar.mjs'
+export { isWebChatTransport, webchatCatalog, webchatConfigured } from './webchat/sidecar.mjs'
 
 export const SIDECAR_MAX_BODY_BYTES = 64 * 1024 * 1024 // 64 MiB, the Orca cap
 const RETRYABLE_STATUSES = new Set([408, 409, 429, 500, 502, 503, 504])
@@ -48,9 +66,9 @@ const KEY_LIMIT_WINDOWS = [
 const DOWNSTREAM_FALLBACK_STATUSES = (s) => s >= 400 && s < 600
 
 // ---------------------------------------------------------------------------
-// Provider presets. Endpoints, protocols and default models are the same as
-// Provider presets are ported from common gateway defaults.
-// are mapped to the sidecar's own protocol names when a provider is created.
+// Provider presets. Endpoints, protocols and default models are ported from
+// common gateway defaults and mapped to the sidecar's own protocol names when
+// a provider is created.
 // ---------------------------------------------------------------------------
 export const PROVIDER_PRESETS = [
   { id: 'openai', name: 'OpenAI', baseUrl: 'https://api.openai.com/v1', capabilities: ['openai_chat_completions', 'openai_responses'], defaultModels: ['gpt-4o'], websiteUrl: 'https://openai.com/' },
@@ -101,18 +119,13 @@ export const PROVIDER_PRESETS = [
   { id: 'unity2', name: 'Unity2.Ai', baseUrl: 'https://unity2.ai/v1', capabilities: ['openai_chat_completions'], defaultModels: [], websiteUrl: 'https://unity2.ai/' },
   { id: 'code0', name: 'code0.ai', baseUrl: 'https://console.code0.ai', capabilities: ['openai_chat_completions', 'openai_responses', 'anthropic_messages'], defaultModels: [], websiteUrl: 'https://code0.ai/' },
   { id: 'claudeapi', name: 'claudeapi', baseUrl: 'https://gw.claudeapi.com', capabilities: ['anthropic_messages'], defaultModels: [], websiteUrl: 'https://console.claudeapi.com/' },
-  { id: 'y-api', name: 'Y-API', baseUrl: 'https://api.y-api.bestvirtualgoods.com/v1', capabilities: ['openai_chat_completions', 'anthropic_messages'], defaultModels: [], websiteUrl: 'https://y-api.bestvirtualgoods.com/' }
+  { id: 'y-api', name: 'Y-API', baseUrl: 'https://api.y-api.bestvirtualgoods.com/v1', capabilities: ['openai_chat_completions', 'anthropic_messages'], defaultModels: [], websiteUrl: 'https://y-api.bestvirtualgoods.com/' },
+  // Native web-chat transports. These drive the free web subscriptions directly
+  // (no HTTP gateway to reach); the router supplies the auth credential via a
+  // `secrets:own` secret. baseUrl is unused and kept empty.
+  { id: 'deepseek-web', name: 'DeepSeek Web', baseUrl: '', transport: 'deepseek-web', capabilities: ['openai_chat_completions'], defaultModels: ['deepseek-chat', 'deepseek-reasoner', 'deepseek-reasoner-search', 'deepseek-v4-pro'], websiteUrl: 'https://chat.deepseek.com/' },
+  { id: 'qwen-web', name: 'Qwen Web', baseUrl: '', transport: 'qwen-web', capabilities: ['openai_chat_completions'], defaultModels: ['qwen3-max', 'qwen3-max-thinking', 'qwen3-plus', 'qwen3-plus-thinking'], websiteUrl: 'https://chat.qwen.ai/' }
 ]
-
-export const SUPPORTED_PROTOCOLS = ['anthropic', 'openai', 'responses', 'gemini', 'passthrough']
-
-const LEGACY_TO_SIDECAR_PROTOCOL = {
-  anthropic_messages: 'anthropic',
-  openai_chat_completions: 'openai',
-  openai_responses: 'responses',
-  gemini_generate_content: 'gemini',
-  gemini_interactions: 'gemini'
-}
 
 function mapLegacyProtocol(proto) {
   if (!proto) return 'openai'
@@ -121,7 +134,7 @@ function mapLegacyProtocol(proto) {
   if (normalized.includes('responses')) return 'responses'
   if (normalized.includes('gemini') || normalized.includes('google')) return 'gemini'
   if (normalized.includes('openai') || normalized.includes('chat')) return 'openai'
-  return LEGACY_TO_SIDECAR_PROTOCOL[proto] ?? proto
+  return proto
 }
 
 export function providerFromPreset(presetId, { name, apiKeySecretKey } = {}) {
@@ -138,6 +151,7 @@ export function providerFromPreset(presetId, { name, apiKeySecretKey } = {}) {
     protocols: protocols.length ? protocols : ['openai'],
     models: (preset.defaultModels ?? []).map((id) => ({ id })),
     keys,
+    transport: preset.transport,
     usageFetch: preset.usage
       ? { enabled: true, connectors: [{ id: preset.id, type: 'http-json', ...preset.usage }] }
       : undefined
@@ -169,6 +183,12 @@ export const DEFAULT_CONFIG = {
   // for imported single-target aliases and older configs.
   routes: [],
   aliases: {},
+  // Reusable VPN / proxy servers. Routes reference one by id; a route without
+  // a reference stays on the direct connection. A working public US proxy is
+  // seeded for a first-run trial; it is never attached to a route.
+  vpnServers: [SAMPLE_VPN_SERVER],
+  // Set once the sample has been offered, so clearing the list is respected.
+  vpnSampleDismissed: false,
   // Global policies: ordered request matchers that rewrite or redirect.
   policies: [],
   defaultModel: '',
@@ -231,20 +251,27 @@ export const DEFAULT_CONFIG = {
     maxTemperature: 0
   },
   logBodyCapture: 'errors',
+  persistLogs: false,
   exposeRoutingHeaders: false,
   allowUnauthenticatedRemote: false
 }
 
 const LOG_BODY_LIMIT = 4096
 const MAX_WINDOW_ENTRIES = 5000
+// Runtime usage/health snapshots are written at most this often. A trailing
+// timer flushes the tail of a burst; main.mjs also flushes on a slower interval
+// and on deactivate so an ungraceful exit loses no more than one window.
+const RUNTIME_PERSIST_THROTTLE_MS = 5000
+const RUNTIME_STATE_VERSION = 1
 
 const slug = (value) => String(value ?? '').trim().toLowerCase().replace(/[^a-z0-9-_]+/g, '-')
 
 // Route names are selectors agents send verbatim, so they keep their
 // case and punctuation. Only provider names are slugged.
-function normalizeRoutes(input) {
+function normalizeRoutes(input, vpnServers = []) {
   const routes = []
   const seen = new Set()
+  const vpnIds = new Set(vpnServers.filter((server) => server.enabled !== false).map((server) => server.id))
   for (const raw of Array.isArray(input) ? input : []) {
     if (!raw || typeof raw !== 'object') continue
     const name = String(raw.name ?? '').trim()
@@ -264,7 +291,9 @@ function normalizeRoutes(input) {
       targets,
       strategy: raw.strategy === 'ordered' ? 'ordered' : 'fastest',
       enabled: raw.enabled !== false,
-      retries: normalizeRetries(raw.retries, 2)
+      retries: normalizeRetries(raw.retries, 2),
+      // A dangling or disabled reference degrades to a direct connection.
+      ...(vpnIds.has(String(raw.vpn ?? '')) ? { vpn: String(raw.vpn) } : {})
     })
   }
   return routes
@@ -425,15 +454,121 @@ function migrateLegacyChains({ policies, routes, aliases, providers, defaultFall
   }
 }
 
-function normalizeModelEntry(model) {
-  if (typeof model === 'string') return { id: model }
-  if (model && typeof model === 'object' && model.id) return { ...model, id: String(model.id) }
+// Context/output limits are not part of the OpenAI /v1/models contract, and
+// every provider spells them differently. Discovery reads the common aliases
+// (OpenRouter, Gemini, vLLM, Anthropic-style gateways) and the gateway falls
+// back to a per-model cache when the agent asks for catalog metadata.
+const MODEL_CONTEXT_FIELDS = [
+  'contextWindow', 'context_length', 'context_window', 'contextLength',
+  'maxContextWindow', 'max_context_window', 'max_context_length', 'maxContextLength',
+  'max_input_tokens', 'maxInputTokens', 'inputTokenLimit', 'input_token_limit',
+  'max_model_len', 'maxModelLen'
+]
+const MODEL_OUTPUT_FIELDS = [
+  'maxOutput', 'max_output_tokens', 'maxOutputTokens', 'outputTokenLimit',
+  'output_token_limit', 'max_completion_tokens', 'maxCompletionTokens'
+]
+export const DEFAULT_MODEL_CONTEXT_WINDOW = 128000
+
+function positiveModelLimit(value) {
+  const number = Number(value)
+  return Number.isFinite(number) && number > 0 ? Math.floor(number) : null
+}
+
+function pickModelLimit(raw, fields) {
+  if (!raw || typeof raw !== 'object') return null
+  for (const field of fields) {
+    const value = positiveModelLimit(raw[field])
+    if (value) return value
+  }
   return null
 }
 
+// Normalize a single upstream model object from /v1/models into limits.
+export function extractModelLimits(raw) {
+  if (!raw || typeof raw !== 'object') return null
+  let contextWindow = pickModelLimit(raw, MODEL_CONTEXT_FIELDS)
+  let maxOutput = pickModelLimit(raw, MODEL_OUTPUT_FIELDS)
+  // OpenRouter nests the useful numbers under top_provider.
+  const top = raw.top_provider ?? raw.topProvider
+  if (top && typeof top === 'object') {
+    contextWindow ??= pickModelLimit(top, MODEL_CONTEXT_FIELDS)
+    maxOutput ??= pickModelLimit(top, MODEL_OUTPUT_FIELDS)
+  }
+  if (!contextWindow && !maxOutput) return null
+  return {
+    ...(contextWindow ? { contextWindow } : {}),
+    ...(maxOutput ? { maxOutput } : {})
+  }
+}
+
+// Canonicalize a configured/cached limits object.
+export function normalizeModelLimits(value) {
+  if (!value || typeof value !== 'object') return null
+  const contextWindow = pickModelLimit(value, MODEL_CONTEXT_FIELDS)
+  const maxOutput = pickModelLimit(value, MODEL_OUTPUT_FIELDS)
+  if (!contextWindow && !maxOutput) return null
+  return {
+    ...(contextWindow ? { contextWindow } : {}),
+    ...(maxOutput ? { maxOutput } : {})
+  }
+}
+
+function normalizeModelWindows(input) {
+  const result = {}
+  if (!input || typeof input !== 'object') return result
+  for (const [key, value] of Object.entries(input)) {
+    const limits = normalizeModelLimits(value)
+    if (!limits || !key) continue
+    const at = Number(value?.at)
+    result[String(key)] = {
+      ...limits,
+      ...(value?.source ? { source: String(value.source) } : {}),
+      ...(Number.isFinite(at) && at > 0 ? { at } : {})
+    }
+  }
+  return result
+}
+
+function normalizeModelEntry(model) {
+  if (typeof model === 'string') return { id: model }
+  if (!model || typeof model !== 'object' || !model.id) return null
+  const entry = { ...model, id: String(model.id) }
+  const limits = normalizeModelLimits(model)
+  if (limits?.contextWindow) entry.contextWindow = limits.contextWindow
+  else delete entry.contextWindow
+  if (limits?.maxOutput) entry.maxOutput = limits.maxOutput
+  else delete entry.maxOutput
+  for (const field of [...MODEL_CONTEXT_FIELDS, ...MODEL_OUTPUT_FIELDS]) {
+    if (field === 'contextWindow' || field === 'maxOutput') continue
+    delete entry[field]
+  }
+  return entry
+}
+
+// People often paste the full chat endpoint from a provider's docs (".../v1/
+// chat/completions") into the base URL field. The gateway appends those paths
+// itself, so a trailing endpoint would be doubled in both discovery and chat
+// requests. Peel off a known endpoint suffix to recover the base URL.
+const UPSTREAM_ENDPOINT_SUFFIXES = ['/chat/completions', '/responses', '/messages', '/embeddings']
+
+export function normalizeBaseUrlInput(value) {
+  const base = String(value ?? '').trim().replace(/\/+$/, '')
+  const lower = base.toLowerCase()
+  for (const suffix of UPSTREAM_ENDPOINT_SUFFIXES) {
+    if (lower.endsWith(suffix)) {
+      return base.slice(0, -suffix.length).replace(/\/+$/, '')
+    }
+  }
+  return base
+}
+
 export function normalizeProvider(provider) {
-  const endpoints = Array.isArray(provider.endpoints) ? provider.endpoints : null
-  const baseUrl = provider.baseUrl ?? endpoints?.[0]?.baseUrl ?? ''
+  const storedEndpoints = Array.isArray(provider.endpoints) ? provider.endpoints : null
+  const baseUrl = normalizeBaseUrlInput(provider.baseUrl ?? storedEndpoints?.[0]?.baseUrl ?? '')
+  const endpoints = storedEndpoints
+    ? storedEndpoints.map((endpoint) => ({ ...endpoint, baseUrl: normalizeBaseUrlInput(endpoint.baseUrl) }))
+    : null
   const protocols = provider.protocols ?? provider.capabilities ?? []
   const keys = (provider.keys ?? []).map((key, index) => ({
     id: key.id ?? `key-${index + 1}`,
@@ -460,7 +595,10 @@ export function normalizeProvider(provider) {
     usageFetch: provider.usageFetch,
     // Most third-party Responses endpoints reject Codex's Lark-constrained
     // custom tools; only providers that explicitly opt in keep the grammar.
-    supportsCustomToolGrammar: provider.supportsCustomToolGrammar === true
+    supportsCustomToolGrammar: provider.supportsCustomToolGrammar === true,
+    // Web-chat native transports (deepseek-web | qwen-web) bypass the HTTP
+    // endpoint and drive the web subscription directly. Absent for HTTP providers.
+    transport: provider.transport
   }
   return normalized
 }
@@ -525,7 +663,13 @@ export function normalizeConfig(input) {
       return !legacyReference
     })
   const aliases = source.aliases && typeof source.aliases === 'object' ? source.aliases : {}
-  const routes = mergeLegacyAliases(normalizeRoutes(rawRoutes), aliases, providers ?? [])
+  // Configs predating VPN support, and configs whose list was never populated,
+  // get one working sample server so the feature can be tried immediately.
+  // The flag records that the offer was made, so clearing the list is final.
+  const vpnDismissed = source.vpnSampleDismissed === true
+  const seedSampleVpn = !vpnDismissed && (!Array.isArray(source.vpnServers) || source.vpnServers.length === 0)
+  const vpnServers = normalizeVpnServers(seedSampleVpn ? [SAMPLE_VPN_SERVER] : source.vpnServers)
+  const routes = mergeLegacyAliases(normalizeRoutes(rawRoutes, vpnServers), aliases, providers ?? [])
   const normalizedPolicies = policies.map((policy, index) => ({
     id: policy.id ?? `policy-${index + 1}`,
     name: policy.name ?? `Policy ${index + 1}`,
@@ -552,6 +696,8 @@ export function normalizeConfig(input) {
     providers: providers ?? [],
     routes: migrated.routes,
     aliases,
+    vpnServers,
+    vpnSampleDismissed: vpnDismissed || seedSampleVpn,
     policies: migrated.policies,
     defaultFallback: migrated.defaultFallback,
     migration: migrated.migration,
@@ -567,11 +713,79 @@ export function normalizeConfig(input) {
     contextRelay: normalizeContextRelay(source.contextRelay ?? DEFAULT_CONFIG.contextRelay),
     responseCache: normalizeResponseCache(source.responseCache ?? DEFAULT_CONFIG.responseCache),
     modelDescriptions: source.modelDescriptions ?? {},
+    // Discovery-captured context/output windows, keyed by `provider\u0000model`
+    // and `url:<baseUrl>\u0000model`. Kept separate from provider.models so
+    // re-selecting a model in the panel cannot erase what we learned.
+    modelWindows: normalizeModelWindows(source.modelWindows),
     logBodyCapture: ['all', 'errors', 'none'].includes(source.logBodyCapture) ? source.logBodyCapture : 'errors',
+    persistLogs: source.persistLogs === true,
     allowUnauthenticatedRemote: source.allowUnauthenticatedRemote === true,
     exposeRoutingHeaders: source.exposeRoutingHeaders === true,
     bindHost: typeof source.bindHost === 'string' ? source.bindHost : undefined
   }
+}
+
+// Resolve the context/output limits for one provider model. Explicit values on
+// the model entry win field-by-field; the discovery cache fills the rest. The
+// URL key keeps windows learned in an unsaved form useful after it is saved.
+export function resolveModelLimits(config, providerName, modelId) {
+  if (!modelId) return null
+  const provider = (config?.providers ?? []).find(
+    (item) => item.name === providerName || slug(item.name) === slug(providerName)
+  )
+  const entry = (provider?.models ?? []).find((model) => model.id === modelId)
+  const explicit = normalizeModelLimits(entry)
+  const cache = config?.modelWindows ?? {}
+  let learned = null
+  const keys = []
+  if (providerName) keys.push(`${providerName}\u0000${modelId}`)
+  const baseUrl = String(provider?.baseUrl ?? provider?.endpoints?.[0]?.baseUrl ?? '').replace(/\/+$/, '')
+  if (baseUrl) keys.push(`url:${baseUrl}\u0000${modelId}`)
+  for (const key of keys) {
+    const hit = normalizeModelLimits(cache[key])
+    if (hit) learned = { ...(learned ?? {}), ...hit }
+  }
+  const merged = { ...(learned ?? {}), ...(explicit ?? {}) }
+  return Object.keys(merged).length ? merged : null
+}
+
+// Resolve a routable selector: `provider/model`, route name, alias, or a bare
+// model id that belongs to exactly one provider. A route reports the smallest
+// known window across its targets, so a failover cannot silently overflow a
+// smaller fallback.
+export function resolveSelectorLimits(config, selector) {
+  const text = String(selector ?? '').trim()
+  if (!text) return null
+  const providers = config?.providers ?? []
+  const route = (config?.routes ?? []).find((item) => item.name === text)
+  if (route) {
+    const known = (route.targets ?? [])
+      .map((target) => resolveModelLimits(config, target.provider, target.model))
+      .filter(Boolean)
+    if (!known.length) return null
+    const contexts = known.map((item) => item.contextWindow).filter(Boolean)
+    const outputs = known.map((item) => item.maxOutput).filter(Boolean)
+    return {
+      ...(contexts.length ? { contextWindow: Math.min(...contexts) } : {}),
+      ...(outputs.length ? { maxOutput: Math.min(...outputs) } : {})
+    }
+  }
+  const aliasTarget = config?.aliases?.[text]
+  if (typeof aliasTarget === 'string' && aliasTarget && aliasTarget !== text) {
+    const resolved = resolveSelectorLimits(config, aliasTarget)
+    if (resolved) return resolved
+  }
+  const slash = text.indexOf('/')
+  if (slash > 0) {
+    const providerName = text.slice(0, slash)
+    const modelId = text.slice(slash + 1)
+    const provider = providers.find(
+      (item) => item.name === providerName || slug(item.name) === slug(providerName)
+    )
+    if (provider) return resolveModelLimits(config, provider.name, modelId)
+  }
+  const owners = providers.filter((provider) => (provider.models ?? []).some((model) => model.id === text))
+  return owners.length === 1 ? resolveModelLimits(config, owners[0].name, text) : null
 }
 
 // ---------------------------------------------------------------------------
@@ -1367,8 +1581,14 @@ function containsDeep(value, needle) {
   return String(value ?? '').includes(String(needle ?? ''))
 }
 
+const globRegexCache = new Map()
 function globMatch(pattern, value) {
-  const regex = new RegExp(`^${String(pattern).replace(/[.*+?^${'{}'}()|[\]\\]/g, '\\$&').replace(/\\\*/g, '.*')}$`)
+  let regex = globRegexCache.get(pattern)
+  if (!regex) {
+    regex = new RegExp(`^${String(pattern).replace(/[.*+?^${'{}'}()|[\]\\]/g, '\\$&').replace(/\\\*/g, '.*')}$`)
+    if (globRegexCache.size > 500) globRegexCache.clear()
+    globRegexCache.set(pattern, regex)
+  }
   return regex.test(String(value ?? ''))
 }
 
@@ -1690,6 +1910,74 @@ export function responsesToOpenAI(body) {
   }
 }
 
+// Translate an OpenAI chat request into the Responses API shape. Needed when a
+// provider declares only `responses` but an agent speaks chat completions or
+// messages. OpenAI chat remains the common denominator, so this mirrors
+// responsesToOpenAI above.
+export function openAIToResponses(body) {
+  if (!body || typeof body !== 'object') return { ...(body ?? {}) }
+  if (!Array.isArray(body.messages)) return { ...body }
+  const instructions = []
+  const input = []
+  let sawConversation = false
+  for (const message of body.messages) {
+    if (!message || typeof message !== 'object') continue
+    const text = contentText(message.content)
+    if ((message.role === 'system' || message.role === 'developer') && !sawConversation) {
+      if (text) instructions.push(text)
+      continue
+    }
+    sawConversation = true
+    if (message.role === 'tool') {
+      input.push({ type: 'function_call_output', call_id: String(message.tool_call_id ?? ''), output: text })
+      continue
+    }
+    if (message.role === 'assistant' && Array.isArray(message.tool_calls)) {
+      for (const call of message.tool_calls) {
+        if (!call?.function?.name) continue
+        input.push({ type: 'function_call', call_id: String(call.id ?? ''), name: call.function.name, arguments: call.function.arguments ?? '{}' })
+      }
+    }
+    if (text) {
+      const role = message.role === 'assistant' ? 'assistant'
+        : message.role === 'system' || message.role === 'developer' ? 'developer' : 'user'
+      input.push({ type: 'message', role, content: [{ type: role === 'assistant' ? 'output_text' : 'input_text', text }] })
+    }
+  }
+  const tools = (body.tools ?? []).map((tool) => {
+    if (tool?.type === 'function' && tool.function?.name) {
+      return {
+        type: 'function',
+        name: tool.function.name,
+        description: tool.function.description ?? '',
+        parameters: tool.function.parameters ?? { type: 'object' }
+      }
+    }
+    return tool
+  })
+  const choice = body.tool_choice
+  const toolChoice = !choice ? undefined
+    : typeof choice === 'string' ? choice
+      : choice?.type === 'function' && choice.function?.name ? { type: 'function', name: choice.function.name }
+        : choice
+  const effort = body.reasoning_effort ?? body.reasoning?.effort
+  const maxOutput = body.max_output_tokens ?? body.max_completion_tokens ?? body.max_tokens
+  return {
+    model: body.model,
+    ...(instructions.length ? { instructions: instructions.join('\n\n') } : {}),
+    input,
+    ...(maxOutput ? { max_output_tokens: maxOutput } : {}),
+    ...(body.temperature != null ? { temperature: body.temperature } : {}),
+    ...(body.top_p != null ? { top_p: body.top_p } : {}),
+    ...(body.stream != null ? { stream: body.stream } : {}),
+    ...(effort ? { reasoning: { effort } } : {}),
+    ...(tools.length ? { tools } : {}),
+    ...(toolChoice ? { tool_choice: toolChoice } : {}),
+    ...(body.parallel_tool_calls != null ? { parallel_tool_calls: body.parallel_tool_calls } : {}),
+    ...(body.metadata ? { metadata: body.metadata } : {})
+  }
+}
+
 export function openAIResponseToResponses(raw, model) {
   const choice = raw?.choices?.[0] ?? {}
   const message = choice.message ?? {}
@@ -1722,6 +2010,48 @@ export function openAIResponseToResponses(raw, model) {
       output_tokens: raw?.usage?.completion_tokens ?? 0,
       total_tokens: raw?.usage?.total_tokens ?? ((raw?.usage?.prompt_tokens ?? 0) + (raw?.usage?.completion_tokens ?? 0))
     }
+  }
+}
+
+// Reverse of openAIResponseToResponses: lets a Responses-only provider serve a
+// chat-completions or messages client instead of leaking a Responses body.
+export function responsesResponseToOpenAI(raw, model) {
+  const output = Array.isArray(raw?.output) ? raw.output : []
+  let text = ''
+  const toolCalls = []
+  for (const item of output) {
+    if (!item || typeof item !== 'object') continue
+    if (item.type === 'message') {
+      for (const part of item.content ?? []) {
+        if (part?.type === 'output_text' || typeof part?.text === 'string') text += part.text ?? ''
+      }
+    } else if (item.type === 'function_call' || item.type === 'custom_tool_call') {
+      const args = item.type === 'custom_tool_call'
+        ? JSON.stringify({ input: item.input ?? '' })
+        : (item.arguments ?? '{}')
+      toolCalls.push({
+        id: item.call_id ?? item.id ?? '',
+        type: 'function',
+        function: { name: item.name ?? '', arguments: args }
+      })
+    }
+  }
+  const status = raw?.status
+  const finishReason = status === 'incomplete' ? 'length'
+    : status === 'failed' ? 'stop'
+      : toolCalls.length ? 'tool_calls' : 'stop'
+  const input = raw?.usage?.input_tokens ?? 0
+  const outputTokens = raw?.usage?.output_tokens ?? 0
+  return {
+    id: raw?.id ?? `chatcmpl-${Date.now()}`,
+    object: 'chat.completion',
+    model: model ?? raw?.model,
+    choices: [{
+      index: 0,
+      finish_reason: finishReason,
+      message: { role: 'assistant', content: text || null, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) }
+    }],
+    usage: { prompt_tokens: input, completion_tokens: outputTokens, total_tokens: input + outputTokens }
   }
 }
 
@@ -1855,7 +2185,6 @@ export function buildOpenAISse(completion) {
   const chunks = []
   const base = { id: completion.id, object: 'chat.completion.chunk', model: completion.model }
   const emit = (delta, finishReason = null) => chunks.push(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta, finish_reason: finishReason }] })}\n\n`)
-  let first = true
   if (message.content || !message.tool_calls?.length) emit({ role: 'assistant', content: message.content ?? '' })
   for (const call of message.tool_calls ?? []) {
     emit({ role: 'assistant', tool_calls: [{ index: chunks.length, id: call.id, type: 'function', function: { name: call.function?.name, arguments: call.function?.arguments ?? '{}' } }] })
@@ -1917,12 +2246,14 @@ function findRoute(normalized, name) {
 
 function resolveSelector(normalized, selector, fallbackModel = '') {
   if (!selector) return null
-  const text = normalized.aliases[selector] ?? selector
+  const text = decodeSyntheticModelId(normalized.aliases[selector] ?? selector)
   const slash = text.indexOf('/')
   if (slash > 0) {
     const provider = providerByName(normalized, text.slice(0, slash))
     if (provider) return { provider, model: text.slice(slash + 1) }
-    return null
+    // A model id may itself contain a slash (e.g. `qwen/qwen3-max`). When the
+    // prefix is not a provider name, fall through to an exact model-id match
+    // instead of dropping the selector — otherwise such catalogs are unusable.
   }
   const owner = findModelOwner(normalized, text)
   if (owner) return { provider: owner, model: text }
@@ -1931,28 +2262,13 @@ function resolveSelector(normalized, selector, fallbackModel = '') {
   return null
 }
 
-function resolveRouteTarget(normalized, target, fallbackModel = '') {
+function resolveRouteTarget(normalized, target, fallbackModel = '', vpn = '') {
   if (!target) return null
+  const withVpn = (resolved) => (resolved && vpn ? { ...resolved, vpn } : resolved)
   const provider = target.provider ? providerByName(normalized, target.provider) : null
-  if (provider) return { provider, model: target.model || fallbackModel }
-  if (target.model) return resolveSelector(normalized, target.model, fallbackModel)
+  if (provider) return withVpn({ provider, model: target.model || fallbackModel })
+  if (target.model) return withVpn(resolveSelector(normalized, target.model, fallbackModel))
   return null
-}
-
-function resolveProviderTargetNormalized(normalized, selector, fallbackModel = '') {
-  const route = findRoute(normalized, selector)
-  if (route) {
-    for (const target of route.targets) {
-      const resolved = resolveRouteTarget(normalized, target, fallbackModel)
-      if (resolved) return resolved
-    }
-    return null
-  }
-  return resolveSelector(normalized, selector, fallbackModel)
-}
-
-export function resolveProviderTarget(config, selector, fallbackModel = '') {
-  return resolveProviderTargetNormalized(normalizeConfig(config), selector, fallbackModel)
 }
 
 export function agentProfileFor(normalized, agentId) {
@@ -2007,11 +2323,39 @@ export function buildAgentLaunchEnv(config, agentId, { base, token, eventEnv = {
     ANTHROPIC_API_KEY: claudeAgent ? '' : token,
     OPENAI_BASE_URL: `${base}/v1`,
     OPENAI_API_KEY: token,
+    // Alternate env names used by Aider/LiteLLM, Goose and Gemini CLI. These are
+    // root URLs (those clients append their own /v1 or /v1beta path).
+    OPENAI_API_BASE: base,
+    OPENAI_HOST: base,
+    GOOGLE_GEMINI_BASE_URL: base,
+    GEMINI_API_KEY: token,
+    // Crush's provider config stores an env reference instead of the key.
+    // Never prefix a launch-hook variable with ORCA_: Orca reserves that prefix
+    // for itself and rejects the whole env change when a hook tries to set one.
+    LLM_ROUTER_API_KEY: token,
+    // CodeBuddy is a Claude Code fork but reads its own base-url variables.
+    CODEBUDDY_BASE_URL: base,
+    CODEBUDDY_API_KEY: token,
+    // Grok CLI builds its picker from GROK_MODELS_LIST_URL (CCR's approach).
+    ...(/grok/i.test(String(agentId ?? '')) ? {
+      GROK_MODELS_BASE_URL: `${base}/v1`,
+      GROK_MODELS_LIST_URL: `${base}/v1/models`,
+      XAI_API_KEY: token,
+      GROK_HOME: join(homedir(), '.grok')
+    } : {}),
     NO_PROXY: noProxy,
     no_proxy: noProxy,
     // Custom model ids are routed by the gateway, so let Claude Code accept them.
     CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT: '1',
-    ...(model ? { ANTHROPIC_MODEL: model, OPENAI_MODEL: model, MODEL: model, ANTHROPIC_DEFAULT_SONNET_MODEL: model } : {}),
+    // Claude Code only enumerates gateway models for its picker when this is on.
+    // The gateway advertises all router models under Claude-compatible ids.
+    ...(claudeAgent ? { CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: '1' } : {}),
+    ...(model ? {
+      ANTHROPIC_MODEL: model, OPENAI_MODEL: model, MODEL: model,
+      GEMINI_MODEL: model, CODEBUDDY_MODEL: model,
+      ...(/grok/i.test(String(agentId ?? '')) ? { GROK_DEFAULT_MODEL: model } : {}),
+      ANTHROPIC_DEFAULT_SONNET_MODEL: model
+    } : {}),
     ...(small ? { ANTHROPIC_SMALL_FAST_MODEL: small, ANTHROPIC_DEFAULT_HAIKU_MODEL: small } : {}),
     ...(profile?.env ?? {})
   }
@@ -2058,6 +2402,11 @@ function routerModelEntries(normalized, agentId) {
   return { entries, model }
 }
 
+/** All routable selectors, used to publish a fresh model list to agent configs. */
+export function routerModelIds(config) {
+  return routerModelEntries(normalizeConfig(config), '').entries.map((entry) => entry.selector)
+}
+
 // OpenCode reads providers from its own config file, not from OPENAI_BASE_URL,
 // so pointing it at the gateway also means publishing the gateway's model list.
 // The generated document defines one openai-compatible provider that sends
@@ -2071,9 +2420,36 @@ export function buildOpenCodeConfig(config, { base, token, agentId = '' } = {}) 
   const { entries, model } = routerModelEntries(normalized, agentId)
   const models = {}
   for (const { selector, description } of entries) {
-    models[selector] = { name: description ? `${selector} — ${description}` : selector }
+    const limits = resolveSelectorLimits(normalized, selector)
+    models[selector] = {
+      name: description ? `${selector} — ${description}` : selector,
+      // OpenCode v1 refuses a model whose limit omits `output` (it prints
+      // "Missing key ...limit.output" and drops it from the picker), so every
+      // entry needs both fields even when the upstream window is unknown.
+      limit: {
+        context: limits?.contextWindow ?? 128_000,
+        output: limits?.maxOutput ?? 8_192
+      }
+    }
   }
   const provider = 'orca-router'
+  const v1 = {
+    name: 'Orca LLM Router',
+    npm: '@ai-sdk/openai-compatible',
+    options: { apiKey: token, baseURL: `${base}/v1` },
+    models
+  }
+  // OpenCode v2 moved custom providers from `provider` to `providers` and from
+  // `options` to `settings`, and silently ignores the old shape. Emit both so
+  // v1 and v2 pickers show the same catalog.
+  const v2 = {
+    name: v1.name,
+    // v2 renamed `npm` to `package`. Without it the provider loads with no
+    // SDK package and every session fails with "Unsupported package for ...".
+    package: v1.npm,
+    settings: { apiKey: token, baseURL: `${base}/v1` },
+    models
+  }
   const document = {
     $schema: 'https://opencode.ai/config.json',
     ...(model ? { model: `${provider}/${model}`, small_model: `${provider}/${model}` } : {}),
@@ -2081,14 +2457,8 @@ export function buildOpenCodeConfig(config, { base, token, agentId = '' } = {}) 
     // selectable and send traffic to a dead port. The plugin owns routing for
     // this launch, so hide that provider instead of editing the user's file.
     disabled_providers: ['claude-code-router'],
-    provider: {
-      [provider]: {
-        name: 'Orca LLM Router',
-        npm: '@ai-sdk/openai-compatible',
-        options: { apiKey: token, baseURL: `${base}/v1` },
-        models
-      }
-    }
+    provider: { [provider]: v1 },
+    providers: { [provider]: v2 }
   }
   return { document, model, provider }
 }
@@ -2148,13 +2518,19 @@ const CODEX_CATALOG_TEMPLATE = {
 export function buildCodexModelCatalog(config, { agentId = '' } = {}) {
   const normalized = normalizeConfig(config)
   const { entries, model } = routerModelEntries(normalized, agentId)
-  const models = entries.map(({ selector, description }, index) => ({
-    ...CODEX_CATALOG_TEMPLATE,
-    slug: selector,
-    display_name: selector,
-    description: description || `Orca LLM Router model ${selector}`,
-    priority: index + 1
-  }))
+  const models = entries.map(({ selector, description }, index) => {
+    const limits = resolveSelectorLimits(normalized, selector)
+    const contextWindow = limits?.contextWindow ?? CODEX_CATALOG_TEMPLATE.context_window
+    return {
+      ...CODEX_CATALOG_TEMPLATE,
+      slug: selector,
+      display_name: selector,
+      description: description || `Orca LLM Router model ${selector}`,
+      context_window: contextWindow,
+      max_context_window: contextWindow,
+      priority: index + 1
+    }
+  })
   return { document: { models }, model }
 }
 
@@ -2164,9 +2540,10 @@ export function buildCodexModelCatalog(config, { agentId = '' } = {}) {
 // entry cannot keep receiving traffic after the switch.
 export function mergeOpenCodeConfig(existing, generated, legacyProviders = ['claude-code-router']) {
   const document = structuredClone(existing && typeof existing === 'object' ? existing : {})
-  const published = generated?.provider?.['orca-router']
-  if (!published) return document
-  const models = published.models ?? {}
+  const publishedV1 = generated?.provider?.['orca-router']
+  const publishedV2 = generated?.providers?.['orca-router'] ?? publishedV1
+  if (!publishedV2) return document
+  const models = publishedV2.models ?? {}
   const pinnedSelector = String(generated.model ?? '').startsWith('orca-router/')
     ? String(generated.model).slice('orca-router/'.length)
     : ''
@@ -2177,9 +2554,22 @@ export function mergeOpenCodeConfig(existing, generated, legacyProviders = ['cla
   const fallbackSelector = pinnedSelector || Object.keys(models)[0] || ''
   const selectorFor = (modelId) => (models[modelId] ? modelId : fallbackSelector)
   const provider = { ...(document.provider ?? {}) }
-  for (const legacy of legacyProviders) delete provider[legacy]
-  provider['orca-router'] = published
+  const providers = { ...(document.providers ?? {}) }
+  for (const legacy of legacyProviders) {
+    delete provider[legacy]
+    delete providers[legacy]
+  }
+  // Keep the v1 key for older OpenCode builds and add the v2 key that current
+  // builds actually read (settings instead of options).
+  provider['orca-router'] = publishedV1 ?? {
+    name: publishedV2.name,
+    npm: publishedV2.npm,
+    options: { ...(publishedV2.settings ?? {}) },
+    models: publishedV2.models
+  }
+  providers['orca-router'] = publishedV2
   document.provider = provider
+  document.providers = providers
   const remapString = (value) => {
     if (typeof value !== 'string') return value
     for (const legacy of legacyProviders) {
@@ -2230,7 +2620,9 @@ export function buildChainFromFallback(normalized, primarySelector, fallback) {
   const seen = new Set()
   const addTarget = (target) => {
     if (!target?.provider || !target.model) return
-    const key = `${target.provider.name}/${target.model}`
+    // Two identical provider/model pairs reached through different VPNs are
+    // distinct attempts: keep both in the chain.
+    const key = `${target.provider.name}/${target.model}\u0000${target.vpn ?? ''}`
     if (seen.has(key)) return
     seen.add(key)
     chain.push(target)
@@ -2241,11 +2633,11 @@ export function buildChainFromFallback(normalized, primarySelector, fallback) {
   let bare = primary?.model
   if (!bare && primaryRoute) {
     bare = primaryRoute.targets
-      .map((target) => resolveRouteTarget(normalized, target, ''))
+      .map((target) => resolveRouteTarget(normalized, target, '', primaryRoute.vpn))
       .find((target) => target?.model)?.model
   }
   if (primaryRoute) {
-    for (const target of primaryRoute.targets) addTarget(resolveRouteTarget(normalized, target, bare ?? ''))
+    for (const target of primaryRoute.targets) addTarget(resolveRouteTarget(normalized, target, bare ?? '', primaryRoute.vpn))
   }
   // A fallback entry is either a route name or a raw `provider/model` target.
   // A route contributes all of its targets; a raw entry resolves to one.
@@ -2254,7 +2646,7 @@ export function buildChainFromFallback(normalized, primarySelector, fallback) {
     if (typeof entry !== 'string') continue
     const route = findRoute(normalized, entry)
     if (route) {
-      for (const target of route.targets) addTarget(resolveRouteTarget(normalized, target, reuse))
+      for (const target of route.targets) addTarget(resolveRouteTarget(normalized, target, reuse, route.vpn))
       continue
     }
     addTarget(resolveSelector(normalized, entry, reuse))
@@ -2309,11 +2701,15 @@ function pruneTokenEntries(entries, windowMs, now) {
   return entries
 }
 
+// Windows are append-ordered and pruned from the front, so the first stale
+// entry marks the end of the useful range. Stop there instead of scanning the
+// whole array on every scheduling decision.
 function rateWindowCount(timestamps, windowMs, now) {
   const cutoff = now - windowMs
   let count = 0
   for (let i = timestamps.length - 1; i >= 0; i--) {
-    if (timestamps[i] >= cutoff) count++
+    if (timestamps[i] < cutoff) break
+    count++
   }
   return count
 }
@@ -2322,7 +2718,8 @@ function tokensInWindow(entries, windowMs, now) {
   const cutoff = now - windowMs
   let total = 0
   for (let i = entries.length - 1; i >= 0; i--) {
-    if (entries[i].at >= cutoff) total += entries[i].tokens
+    if (entries[i].at < cutoff) break
+    total += entries[i].tokens
   }
   return total
 }
@@ -2548,11 +2945,42 @@ function headerValue(headers, name) {
   return Array.isArray(value) ? value[0] : value
 }
 
-function stableStringify(value) {
-  if (value === undefined) return 'null'
-  if (value === null || typeof value !== 'object') return JSON.stringify(value)
-  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`
-  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`
+// Local calendar day for a timestamp, used by the daily usage buckets.
+export function dayKey(ms) {
+  const date = new Date(ms)
+  const pad = (value) => String(value).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+}
+
+// Best-effort agent attribution for spend reports. An explicit header wins;
+// session header names and User-Agent are hints, so an unknown agent is simply
+// left unlabelled rather than guessed from the model it happened to request.
+const AGENT_SESSION_HEADERS = [
+  ['x-claude-code-session-id', 'claude-code'],
+  ['x-codex-session-id', 'codex'],
+  ['x-opencode-session-id', 'opencode'],
+  ['x-gemini-session-id', 'gemini']
+]
+const AGENT_USER_AGENTS = [
+  [/claude[ -]?code/i, 'claude-code'],
+  [/codex/i, 'codex'],
+  [/opencode/i, 'opencode'],
+  [/gemini[ -]?cli/i, 'gemini-cli'],
+  [/cursor/i, 'cursor'],
+  [/cline/i, 'cline']
+]
+
+export function identifyAgent(headers = {}, body = null) {
+  const explicit = headerValue(headers, 'x-orca-agent') ?? headerValue(headers, 'x-router-agent')
+  if (explicit != null && String(explicit).trim()) return slug(String(explicit).trim())
+  for (const [name, agent] of AGENT_SESSION_HEADERS) if (headerValue(headers, name)) return agent
+  const ua = headerValue(headers, 'user-agent')
+  if (ua != null) {
+    for (const [pattern, agent] of AGENT_USER_AGENTS) if (pattern.test(String(ua))) return agent
+  }
+  const fromBody = body?.metadata?.agent ?? body?.metadata?.agentId ?? body?.agent
+  if (typeof fromBody === 'string' && fromBody.trim()) return slug(fromBody)
+  return null
 }
 
 // Resolve the stable cache-affinity token for a request. Explicit session
@@ -2586,8 +3014,18 @@ export function deriveAffinityKey(headers = {}, body = null) {
   return `prompt:${createHash('sha256').update(stableStringify(prompt)).digest('hex')}`
 }
 
-export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Date.now }) {
-  const fetchFn = fetchImpl ?? globalThis.fetch
+export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Date.now, solvePOW = solvePOWFn, initialState = null, persistState = null }) {
+  const baseFetch = fetchImpl ?? globalThis.fetch
+  const proxyFetch = createProxyFetch({ getSecret, baseFetch })
+  // Routes opt in to a VPN server by id. Every upstream call made while that
+  // route serves a request uses this scoped fetch; everything else stays direct.
+  const scopedFetch = (vpnId, config = configRef()) => {
+    const server = findVpnServer(config, vpnId)
+    return server ? (url, init) => proxyFetch(url, init, server) : baseFetch
+  }
+  const vpnLabel = (config, vpnId) => findVpnServer(config, vpnId)?.name ?? null
+  const webchatSessions = new WebChatSessionStore({ now })
+  let webchatRequestCount = 0
   const logs = []
   let server = null
   let bound = null
@@ -2597,6 +3035,9 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
   const providerCircuits = new Map() // provider name -> { failures, state, openUntil, probeInFlight }
   const providerHealth = new Map() // provider name -> { latencyMs, samples, failures, successes, lastSuccessAt, lastFailureAt }
   const providerAffinity = new Map() // affinity token -> { provider, at }
+  // A route keeps serving the same target until that target fails. Keyed by
+  // route name + affinity token, so separate sessions can pin different targets.
+  const routeAffinity = new Map()
   const affinityBindings = new Map() // provider\0model\0affinity -> { keyId, expiresAt }
   const responseCache = createResponseCache({ now })
   const pruneProviderAffinity = (ttl) => {
@@ -2604,7 +3045,154 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     const cutoff = now() - ttl
     for (const [token, value] of providerAffinity) if (value.at < cutoff) providerAffinity.delete(token)
   }
-  const stats = { requests: 0, errors: 0, inputTokens: 0, outputTokens: 0, cost: 0, latencyMsTotal: 0, byProvider: {}, byModel: {}, cacheHits: 0, cacheSavedTokens: 0, cacheSavedCost: 0, compressionSavedChars: 0, relayEvents: 0 }
+  const pruneRouteAffinity = (ttl) => {
+    if (routeAffinity.size <= 500) return
+    const cutoff = now() - ttl
+    for (const [token, value] of routeAffinity) if (value.at < cutoff) routeAffinity.delete(token)
+  }
+  const stats = { requests: 0, errors: 0, inputTokens: 0, outputTokens: 0, cost: 0, unpricedRequests: 0, latencyMsTotal: 0, byProvider: {}, byModel: {}, routeRequests: {}, routeFailovers: {}, cacheHits: 0, cacheSavedTokens: 0, cacheSavedCost: 0, compressionSavedChars: 0, relayEvents: 0 }
+
+  // --- Runtime state persistence -------------------------------------------
+  // Usage counters and provider health are process-local, but they are
+  // snapshotted to Orca storage so a plugin/worker restart does not reset the
+  // 24-hour windows or the health badges. Nothing here contains a secret value:
+  // key identities are secret *names*, matching what config already stores.
+  const runtimeSnapshot = () => {
+    const copyState = (state) => ({
+      requests: [...(state.requests ?? [])],
+      // `tokens` is a numeric total per entry (see recordKeyUsage); keep it as
+      // a primitive so tokensInWindow still sums correctly after a restore.
+      tokens: (state.tokens ?? []).map((entry) => ({ at: entry.at, tokens: entry.tokens })),
+      images: [...(state.images ?? [])]
+    })
+    return {
+      version: RUNTIME_STATE_VERSION,
+      savedAt: now(),
+      keyStates: [...keyStates].map(([id, state]) => [id, copyState(state)]),
+      keyCooldowns: [...keyCooldowns].map(([id, until]) => [id, until]),
+      providerHealth: [...providerHealth].map(([name, health]) => [name, { ...health }]),
+      providerCircuits: [...providerCircuits].map(([name, circuit]) => [name, {
+        failures: circuit.failures,
+        state: circuit.state,
+        openUntil: circuit.openUntil,
+        probeInFlight: false
+      }]),
+      stats: {
+        ...stats,
+        byProvider: { ...stats.byProvider },
+        byModel: { ...stats.byModel }
+      }
+    }
+  }
+
+  const restoreRuntimeState = (state) => {
+    if (!state || typeof state !== 'object' || state.version !== RUNTIME_STATE_VERSION) return
+    const timestamp = now()
+    const DAY = 86_400_000
+    if (Array.isArray(state.keyStates)) {
+      for (const [id, raw] of state.keyStates) {
+        if (typeof id !== 'string' || !id || !raw || typeof raw !== 'object') continue
+        const entry = {
+          requests: Array.isArray(raw.requests) ? raw.requests.filter((value) => Number.isFinite(value)) : [],
+          tokens: Array.isArray(raw.tokens)
+            ? raw.tokens.filter((value) => value && Number.isFinite(value.at) && Number.isFinite(value.tokens))
+              .map((value) => ({ at: value.at, tokens: value.tokens }))
+            : [],
+          images: Array.isArray(raw.images) ? raw.images.filter((value) => Number.isFinite(value)) : []
+        }
+        pruneTimestamps(entry.requests, DAY, timestamp)
+        pruneTokenEntries(entry.tokens, DAY, timestamp)
+        pruneTimestamps(entry.images, DAY, timestamp)
+        if (entry.requests.length || entry.tokens.length || entry.images.length) keyStates.set(id, entry)
+      }
+    }
+    if (Array.isArray(state.keyCooldowns)) {
+      for (const [id, until] of state.keyCooldowns) {
+        if (typeof id === 'string' && Number.isFinite(until) && until > timestamp) keyCooldowns.set(id, until)
+      }
+    }
+    if (Array.isArray(state.providerHealth)) {
+      for (const [name, health] of state.providerHealth) {
+        if (typeof name !== 'string' || !health || typeof health !== 'object') continue
+        providerHealth.set(name, {
+          latencyMs: Number.isFinite(health.latencyMs) ? health.latencyMs : null,
+          samples: Number.isFinite(health.samples) ? health.samples : 0,
+          failures: Number.isFinite(health.failures) ? health.failures : 0,
+          successes: Number.isFinite(health.successes) ? health.successes : 0,
+          lastSuccessAt: Number.isFinite(health.lastSuccessAt) ? health.lastSuccessAt : 0,
+          lastFailureAt: Number.isFinite(health.lastFailureAt) ? health.lastFailureAt : 0
+        })
+      }
+    }
+    if (Array.isArray(state.providerCircuits)) {
+      for (const [name, raw] of state.providerCircuits) {
+        if (typeof name !== 'string' || !raw || typeof raw !== 'object') continue
+        const expired = raw.state === 'open' && Number.isFinite(raw.openUntil) && raw.openUntil <= timestamp
+        providerCircuits.set(name, {
+          failures: expired ? 0 : Number.isFinite(raw.failures) ? raw.failures : 0,
+          state: expired ? 'closed' : (raw.state === 'open' || raw.state === 'half-open' ? raw.state : 'closed'),
+          openUntil: expired ? 0 : Number.isFinite(raw.openUntil) ? raw.openUntil : 0,
+          probeInFlight: false
+        })
+      }
+    }
+    if (state.stats && typeof state.stats === 'object') {
+      const source = state.stats
+      const num = (value) => Number.isFinite(value) ? value : 0
+      stats.requests = num(source.requests)
+      stats.errors = num(source.errors)
+      stats.inputTokens = num(source.inputTokens)
+      stats.outputTokens = num(source.outputTokens)
+      stats.cost = num(source.cost)
+      stats.unpricedRequests = num(source.unpricedRequests)
+      stats.latencyMsTotal = num(source.latencyMsTotal)
+      stats.cacheHits = num(source.cacheHits)
+      stats.cacheSavedTokens = num(source.cacheSavedTokens)
+      stats.cacheSavedCost = num(source.cacheSavedCost)
+      stats.compressionSavedChars = num(source.compressionSavedChars)
+      stats.relayEvents = num(source.relayEvents)
+      stats.byProvider = source.byProvider && typeof source.byProvider === 'object' ? { ...source.byProvider } : {}
+      stats.byModel = source.byModel && typeof source.byModel === 'object' ? { ...source.byModel } : {}
+      stats.routeFailovers = source.routeFailovers && typeof source.routeFailovers === 'object' ? { ...source.routeFailovers } : {}
+      stats.routeRequests = source.routeRequests && typeof source.routeRequests === 'object' ? { ...source.routeRequests } : {}
+    }
+  }
+  restoreRuntimeState(initialState)
+
+  // `persistState` is injected by main.mjs and is best-effort: a storage failure
+  // must never break a request. Writes are throttled by injected time so the
+  // pure tests stay deterministic, with a trailing timer for the tail of a burst.
+  let runtimeDirty = false
+  let lastRuntimePersistAt = 0
+  let runtimeFlushTimer = null
+  const persistRuntimeNow = () => {
+    if (!persistState) return
+    if (runtimeFlushTimer != null) {
+      clearTimeout(runtimeFlushTimer)
+      runtimeFlushTimer = null
+    }
+    runtimeDirty = false
+    lastRuntimePersistAt = now()
+    try {
+      const result = persistState(runtimeSnapshot())
+      if (result && typeof result.catch === 'function') result.catch(() => {})
+    } catch { /* best effort */ }
+  }
+  const markRuntimeDirty = () => {
+    if (!persistState) return
+    runtimeDirty = true
+    if (now() - lastRuntimePersistAt >= RUNTIME_PERSIST_THROTTLE_MS) {
+      persistRuntimeNow()
+      return
+    }
+    if (runtimeFlushTimer == null && typeof setTimeout === 'function') {
+      runtimeFlushTimer = setTimeout(() => {
+        runtimeFlushTimer = null
+        if (runtimeDirty) persistRuntimeNow()
+      }, RUNTIME_PERSIST_THROTTLE_MS)
+      runtimeFlushTimer.unref?.()
+    }
+  }
 
   const log = (entry, { config, status } = {}) => {
     const captureMode = config?.logBodyCapture ?? 'errors'
@@ -2633,8 +3221,10 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     }
     if (record.cost != null) stats.cost += record.cost
     if (record.latencyMs != null) stats.latencyMsTotal += record.latencyMs
+    markRuntimeDirty()
     if (record.resolvedProvider) stats.byProvider[record.resolvedProvider] = (stats.byProvider[record.resolvedProvider] ?? 0) + 1
     if (record.resolvedModel) stats.byModel[record.resolvedModel] = (stats.byModel[record.resolvedModel] ?? 0) + 1
+    if (record.route) stats.routeRequests[record.route] = (stats.routeRequests[record.route] ?? 0) + 1
     if (loggingEnabled) {
       logs.push(record)
       if (logs.length > 300) logs.splice(0, logs.length - 300)
@@ -2648,12 +3238,17 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
   // with tokens/cost null and patched here. Keep the aggregate stats in sync by
   // applying the delta. When logging is disabled the record may not be stored,
   // but its stats were counted at log() time.
-  const applyUsage = (record, tokens, cost) => {
+  const applyUsage = (record, tokens, quote) => {
     if (!record) return
+    const cost = quote?.usd ?? null
     const previousTokens = record.tokens
     const previousCost = record.cost
-    record.tokens = tokens ?? null
+    const firstApply = record.priceSource === undefined
+    // inputIncludesCache is a pricing hint, not part of the log record shape.
+    const { inputIncludesCache: _hint, ...logTokens } = tokens ?? {}
+    record.tokens = tokens ? logTokens : null
     record.cost = cost ?? null
+    record.priceSource = quote?.source ?? null
     if (previousTokens) {
       stats.inputTokens -= previousTokens.input ?? 0
       stats.outputTokens -= previousTokens.output ?? 0
@@ -2664,6 +3259,8 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
       stats.outputTokens += tokens.output ?? 0
     }
     if (cost != null) stats.cost += cost
+    if (firstApply && tokens && cost == null) stats.unpricedRequests += 1
+    markRuntimeDirty()
   }
 
   const circuitFor = (providerName) => {
@@ -2708,6 +3305,7 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
   // provider slowing down without letting one slow request reorder the chain.
   const recordHealthSample = (provider, outcome, config, latencyMs) => {
     if (outcome !== 'success' && outcome !== 'failure') return
+    markRuntimeDirty()
     const entry = healthFor(provider.name)
     if (outcome === 'success') {
       const sample = Number(latencyMs)
@@ -2730,6 +3328,7 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
   // endpoint is reachable, so it closes the circuit without resetting key state.
   const recordProviderOutcome = (provider, outcome, config, latencyMs) => {
     recordHealthSample(provider, outcome, config, latencyMs)
+    markRuntimeDirty()
     const rules = normalizeCircuitBreaker(config.circuitBreaker)
     if (!rules.enabled) return
     const circuit = circuitFor(provider.name)
@@ -2756,10 +3355,9 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
 
   // What the panel shows for a provider: measured speed plus the same health
   // signals the ranking uses, so the displayed state explains the order.
-  const providerHealthView = (providerName, timestamp) => {
+  const providerHealthView = (providerName, timestamp, config) => {
     const entry = providerHealth.get(providerName)
     const circuit = providerCircuits.get(providerName)
-    const config = configRef()
     const rules = normalizeCircuitBreaker(config.circuitBreaker)
     const options = normalizeProviderHealth(config.providerHealth)
     const open = circuit?.state === 'open' && circuit.openUntil > timestamp
@@ -2817,7 +3415,21 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     // 429, after the retry delay. A fresh request still starts from the healthy
     // pool and gets the explicit exhausted response if there is none.
     const available = allowCooling && !cooling.length ? keys : cooling
-    const usable = available.filter((key) => keyWithinLimits(key, keyState(keyIdentity(key)), timestamp, estimatedTokens, imageCount))
+    // Compute the hard limit gate and the scheduling utilization once per key;
+    // both read the same rolling state and used to rescan every window twice.
+    const availability = available.map((key) => {
+      const id = keyIdentity(key)
+      const state = keyState(id)
+      return {
+        key,
+        id,
+        priority: key.priority ?? 0,
+        weight: key.weight ?? 1,
+        withinLimits: keyWithinLimits(key, state, timestamp, estimatedTokens, imageCount),
+        utilization: keyUtilization(key, state, timestamp, estimatedTokens, imageCount)
+      }
+    })
+    const usable = availability.filter((item) => item.withinLimits)
     if (!usable.length) {
       // Legacy "overflow" mode keeps the previous behaviour of using a key
       // anyway when every key is cooling or over limit. The default is a hard
@@ -2841,33 +3453,25 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
         rememberAffinity(chosen?.key)
         return { key: chosen?.key ?? null, overflow: true }
       }
-      const limited = available.length > 0 && available.every(
-        (key) => !keyWithinLimits(key, keyState(keyIdentity(key)), timestamp, estimatedTokens, imageCount)
-      )
+      const limited = availability.length > 0 && availability.every((item) => !item.withinLimits)
       return { key: null, exhausted: true, reason: limited ? 'limited' : 'cooling' }
     }
     if (bindingKey) {
       const binding = affinityBindings.get(bindingKey)
       if (binding) {
         const bound = binding.expiresAt > timestamp
-          ? usable.find((key) => keyIdentity(key) === binding.keyId)
+          ? usable.find((item) => item.id === binding.keyId)
           : null
         if (bound) {
           binding.expiresAt = timestamp + scheduler.cacheAffinityTtlMs
-          return { key: bound, affinity: true }
+          return { key: bound.key, affinity: true }
         }
         affinityBindings.delete(bindingKey)
       }
     }
     const chosen = selectScheduledKey({
       providerName: provider.name,
-      candidates: usable.map((key) => ({
-        key,
-        id: keyIdentity(key),
-        priority: key.priority ?? 0,
-        weight: key.weight ?? 1,
-        utilization: keyUtilization(key, keyState(keyIdentity(key)), timestamp, estimatedTokens, imageCount)
-      })),
+      candidates: usable.map(({ key, id, priority, weight, utilization }) => ({ key, id, priority, weight, utilization })),
       scheduler,
       state: schedulerState
     })
@@ -2887,11 +3491,13 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
       for (const [id, until] of keyCooldowns) if (until <= t) keyCooldowns.delete(id)
     }
     keyCooldowns.set(keyIdentity(key), now() + cooldown)
+    markRuntimeDirty()
   }
 
   const clearKeyFailure = (key) => {
     if (!key) return
     keyCooldowns.delete(keyIdentity(key))
+    markRuntimeDirty()
   }
 
   const recordKeyUsage = (key, tokens, imageCount) => {
@@ -2901,6 +3507,7 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     recordInWindow(state.requests, timestamp, 86_400_000)
     if (tokens) recordTokensInWindow(state.tokens, { at: timestamp, tokens }, 86_400_000)
     for (let i = 0; i < imageCount; i++) recordInWindow(state.images, timestamp, 86_400_000)
+    markRuntimeDirty()
   }
 
   const buildHeaders = (provider, key, incoming, protocol, extraHeaders = {}) => {
@@ -2944,7 +3551,7 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
   // Semantic cache embeddings: one explicit provider/model chosen in the panel,
   // called through the same key pool and header rules as chat traffic. Any
   // failure simply bypasses the semantic layer; exact caching still works.
-  async function embedCacheText(text, options, config) {
+  async function embedCacheText(text, options, config, vpn = '') {
     if (!text || !options.embeddingProvider || !options.embeddingModel) return null
     const provider = providersFor(config).find((item) => item.name === options.embeddingProvider)
     if (!provider) return null
@@ -2956,7 +3563,7 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     const headers = buildHeaders(provider, selection.key, incoming, 'openai')
     headers['content-type'] = 'application/json'
     try {
-      const response = await fetchFn(joinUpstreamUrl(endpointFor(provider, 'openai'), '/embeddings'), {
+      const response = await scopedFetch(vpn, config)(joinUpstreamUrl(endpointFor(provider, 'openai'), '/embeddings'), {
         method: 'POST',
         headers,
         body: JSON.stringify({ model: options.embeddingModel, input: text }),
@@ -3041,8 +3648,8 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     if (from === 'anthropic' && to === 'openai') return anthropicToOpenAI(body)
     if (from === 'openai' && to === 'anthropic') return openAIToAnthropic(body)
     if (from === 'responses' && to === 'openai') return responsesToOpenAI(body)
-    if (from === 'openai' && to === 'responses') return { ...body } // unsupported direct; handled via responses translator
-    if (from === 'anthropic' && to === 'responses') return { ...anthropicToOpenAI(body) }
+    if (from === 'openai' && to === 'responses') return openAIToResponses(body)
+    if (from === 'anthropic' && to === 'responses') return openAIToResponses(anthropicToOpenAI(body))
     if (from === 'responses' && to === 'anthropic') return openAIToAnthropic(responsesToOpenAI(body))
     return body
   }
@@ -3060,19 +3667,46 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     if (from === 'anthropic' && to === 'openai') return anthropicResponseToOpenAI(raw, model)
     if (from === 'openai' && to === 'responses') return openAIResponseToResponses(raw, model)
     if (from === 'anthropic' && to === 'responses') return openAIResponseToResponses(anthropicResponseToOpenAI(raw, model), model)
-    if (from === 'openai' && to === 'openai') return raw
+    if (from === 'responses') {
+      const openai = responsesResponseToOpenAI(raw, model)
+      return to === 'anthropic' ? openAIResponseToAnthropic(openai, model) : openai
+    }
     return raw
   }
 
+  // Keep `cache` as the combined counter used by stats and logs, and add the
+  // split counters only when non-zero so cached/legacy token shapes stay small.
+  const cacheFields = (read = 0, write = 0, write1h = 0) => ({
+    ...(read ? { cacheRead: read } : {}),
+    ...(write ? { cacheWrite: write } : {}),
+    ...(write1h ? { cacheWrite1h: write1h } : {})
+  })
   const extractUsage = (raw, protocol) => {
     if (protocol === 'gemini') {
       const usage = raw?.usageMetadata ?? {}
-      return { input: usage.promptTokenCount ?? 0, output: usage.candidatesTokenCount ?? 0, cache: usage.cachedContentTokenCount ?? 0 }
+      const read = usage.cachedContentTokenCount ?? 0
+      return { input: usage.promptTokenCount ?? 0, output: usage.candidatesTokenCount ?? 0, cache: read, ...cacheFields(read), inputIncludesCache: true }
     }
     const usage = raw?.usage ?? {}
-    if (protocol === 'anthropic') return { input: usage.input_tokens ?? 0, output: usage.output_tokens ?? 0, cache: (usage.cache_creation_input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) }
-    if (protocol === 'responses') return { input: usage.input_tokens ?? 0, output: usage.output_tokens ?? 0 }
-    return { input: usage.prompt_tokens ?? usage.input_tokens ?? 0, output: usage.completion_tokens ?? usage.output_tokens ?? 0, cache: usage.prompt_tokens_details?.cached_tokens ?? 0 }
+    if (protocol === 'anthropic') {
+      const read = usage.cache_read_input_tokens ?? 0
+      const write = usage.cache_creation_input_tokens ?? 0
+      return { input: usage.input_tokens ?? 0, output: usage.output_tokens ?? 0, cache: read + write, ...cacheFields(read, write) }
+    }
+    if (protocol === 'responses') {
+      const read = usage.input_tokens_details?.cached_tokens ?? 0
+      return { input: usage.input_tokens ?? 0, output: usage.output_tokens ?? 0, cache: read, ...cacheFields(read), inputIncludesCache: true }
+    }
+    const read = usage.prompt_tokens_details?.cached_tokens ?? 0
+    const reasoning = usage.completion_tokens_details?.reasoning_tokens ?? 0
+    return {
+      input: usage.prompt_tokens ?? usage.input_tokens ?? 0,
+      output: usage.completion_tokens ?? usage.output_tokens ?? 0,
+      cache: read,
+      ...cacheFields(read),
+      ...(reasoning ? { reasoning } : {}),
+      inputIncludesCache: true
+    }
   }
 
   // Streaming responses report usage across several events: Anthropic puts input
@@ -3083,12 +3717,20 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
       if (!usage || typeof usage !== 'object') return
       const input = usage.input_tokens ?? usage.prompt_tokens ?? usage.promptTokenCount ?? 0
       const output = usage.output_tokens ?? usage.completion_tokens ?? usage.candidatesTokenCount ?? 0
-      const cache = (usage.cache_creation_input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) + (usage.prompt_tokens_details?.cached_tokens ?? 0) + (usage.cachedContentTokenCount ?? 0)
-      if (!input && !output && !cache) return
+      const read = (usage.cache_read_input_tokens ?? 0) + (usage.prompt_tokens_details?.cached_tokens ?? 0) + (usage.cachedContentTokenCount ?? 0)
+      const write = usage.cache_creation_input_tokens ?? 0
+      const reasoning = usage.completion_tokens_details?.reasoning_tokens ?? 0
+      const cache = read + write
+      if (!input && !output && !cache && !reasoning) return
       acc ??= { input: 0, output: 0, cache: 0 }
       if (input) acc.input = input
       if (output) acc.output = output
       if (cache) acc.cache = cache
+      // Providers repeat cumulative snapshots across events, so take the max
+      // per field rather than summing the same counter twice.
+      if (read) acc.cacheRead = Math.max(acc.cacheRead ?? 0, read)
+      if (write) acc.cacheWrite = Math.max(acc.cacheWrite ?? 0, write)
+      if (reasoning) acc.reasoning = Math.max(acc.reasoning ?? 0, reasoning)
     }
     if (protocol === 'anthropic') {
       mergeOne(event?.message?.usage)
@@ -3103,18 +3745,19 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
       mergeOne(event?.usage)
       mergeOne(event?.response?.usage)
     }
+    if (acc && protocol !== 'anthropic') acc.inputIncludesCache = true
     return acc
   }
 
-  const computeCost = (pricing, tokens) => {
-    if (!pricing) return null
-    const input = tokens.input ?? 0
-    const output = tokens.output ?? 0
-    const inputRate = pricing.inputUsdPerMillionTokens ?? 0
-    const outputRate = pricing.outputUsdPerMillionTokens ?? 0
-    if (!inputRate && !outputRate) return null
-    return (input / 1e6) * inputRate + (output / 1e6) * outputRate
-  }
+  // Explicit provider pricing wins; otherwise price the resolved target model
+  // from the bundled models.dev catalog. Return the source so logs can show
+  // which requests were actually priced.
+  const computeCost = (pricing, tokens, provider, model) => quoteCost({
+    pricing,
+    provider: provider?.name ?? provider,
+    model,
+    tokens
+  })
 
   const clientLimitError = (state, limits, timestamp, imageCount = 0) => {
     const requests = (windowMs) => rateWindowCount(state.requests, windowMs, timestamp)
@@ -3176,13 +3819,115 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     return Number.isFinite(n) && n > 0 ? Math.floor(n) : 1
   }
 
-  async function forwardOnce(target, clientProtocol, path, body, incoming, { rawBody, wantsStreamHint, allowCooling = false, affinityKey = '' } = {}) {
-    const config = configRef()
+  // Native web-chat transport path. Drives DeepSeek Web / Qwen Web directly and
+  // returns a synthetic OpenAI Response so the standard translation pipeline
+  // converts it to the client's protocol. Failures are returned as synthetic
+  // error Responses (with .status / retry-after) so the router's existing
+  // key-rotation and cooldown logic handles them like any other upstream.
+  async function webchatForwardOnce({ target, provider, clientProtocol, body, path, wantsStream, affinityKey, config }) {
+    // Bound memory over a long-running gateway: evict idle web-chat sessions
+    // periodically (cheap relative to an upstream call).
+    if (++webchatRequestCount % 50 === 0) webchatSessions.sweepIdle()
+    const upstreamBody = body ? structuredClone(body) : null
+    if (upstreamBody && target.model) upstreamBody.model = target.model
+    let openaiBody = upstreamBody
+    if (clientProtocol !== 'openai' || !isChatPath(path)) {
+      openaiBody = translateRequest(upstreamBody ?? {}, clientProtocol, 'openai')
+    }
+    const messages = openaiBody?.messages ?? []
+    const tools = openaiBody?.tools ?? []
+    const model = target.model || openaiBody?.model || ''
+    if (!Array.isArray(messages) || !messages.length) {
+      const error = new Error('web-chat transport requires a chat request with messages')
+      error.status = 400
+      error.type = 'invalid_request_error'
+      return buildWebChatErrorResponse(error)
+    }
+    const selection = pickKey(provider, config, 0, 0, { model, affinity: affinityKey })
+    const key = selection?.key
+    if (!key) {
+      // Web-chat has no upstream HTTP call to produce an exhaustion signal, so
+      // surface the same structured scheduler result the normal path uses. The
+      // retry loop then emits the documented 420 / router_exhausted response
+      // (including Retry-After) instead of a generic upstream failure.
+      if (selection?.exhausted) {
+        const scheduler = normalizeScheduler(config.scheduler)
+        return {
+          error: {
+            status: scheduler.exhaustedStatus,
+            code: 'all_keys_exhausted',
+            message: `no usable credential for provider '${provider.name}' (${selection.reason === 'cooling' ? 'all keys are cooling down' : 'all keys are over their limits'})`
+          }
+        }
+      }
+      const error = new Error(`no usable credential for provider '${provider.name}' (web-chat needs an auth secret)`)
+      error.status = 502
+      error.type = 'upstream_http_error'
+      return buildWebChatErrorResponse(error)
+    }
+    const creds = getSecret(key.secretKey)
+    if (!creds) {
+      const error = new Error(`missing auth secret for provider '${provider.name}'`)
+      error.status = 502
+      error.type = 'upstream_http_error'
+      return buildWebChatErrorResponse(error)
+    }
+    const sessionKey = webchatSessionKey(provider.transport, affinityKey, keyIdentity(key))
+    const session = webchatSessions.getOrCreate(sessionKey)
+    webchatSessions.prepareForPrompt(sessionKey) // roll over depth/TTL (resets id when stale)
+
+    const webFetch = scopedFetch(target.vpn, config)
+    const transport = provider.transport === 'deepseek-web'
+      ? new DeepSeekWebTransport({ creds, fetchFn: webFetch, solvePOW, now, log: onLog ?? (() => {}) })
+      : new QwenWebTransport({ creds, fetchFn: webFetch, now, log: onLog ?? (() => {}) })
+    const webchat = createRecoveredWebChat(createWebChatProvider(transport, { now }), { log: onLog ?? (() => {}) })
+
+    try {
+      const result = await webchat.forwardOnce({ session, model, messages, tools })
+      if (result.modelError) {
+        // Content-level model error (e.g. Qwen success:false mid-stream).
+        const error = new Error(`web-chat model error: ${result.modelError.content || 'unknown'}`)
+        error.status = 502
+        error.type = 'upstream_http_error'
+        return buildWebChatErrorResponse(error)
+      }
+      const toolCall = result.tool_calls?.[0]?.function
+        ? { name: result.tool_calls[0].function.name, arguments: result.tool_calls[0].function.arguments }
+        : null
+      webchatSessions.storeHistory(sessionKey, result.promptUsed, result.content, toolCall)
+      const built = buildWebChatSuccessResponse(result, model, { wantsStream, clientProtocol, now })
+      return {
+        upstreamRes: built.upstreamRes,
+        responseProtocol: 'openai',
+        forwardedModel: model,
+        key,
+        bufferForStream: built.bufferForStream,
+        wantsStream,
+        targetPath: path,
+      }
+    } catch (error) {
+      return {
+        upstreamRes: buildWebChatErrorResponse(error),
+        responseProtocol: 'openai',
+        forwardedModel: model,
+        key,
+        bufferForStream: false,
+        wantsStream,
+        targetPath: path,
+      }
+    }
+  }
+
+  async function forwardOnce(target, clientProtocol, path, body, incoming, { rawBody, wantsStreamHint, allowCooling = false, affinityKey = '', config: passedConfig } = {}) {
+    const config = passedConfig ?? configRef()
     const provider = target.provider
     const responseProtocol = targetProtocol(provider, clientProtocol)
     const baseUrl = endpointFor(provider, responseProtocol)
     const chat = isChatPath(path)
     const wantsStream = wantsStreamHint ?? body?.stream === true
+    if (isWebChatTransport(provider)) {
+      return webchatForwardOnce({ target, provider, clientProtocol, body, path, wantsStream, affinityKey, config })
+    }
     const geminiStreamUpstream = responseProtocol === 'gemini' && clientProtocol === 'gemini' && wantsStream === true
     let targetPath = path
     if (responseProtocol === 'gemini' && chat) targetPath = geminiPath(target.model, geminiStreamUpstream)
@@ -3257,7 +4002,9 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     }
     // Providers with no configured keys are treated as keyless/pass-through at
     // the provider side; client gateway auth is still never forwarded upstream.
-    const upstreamRes = await fetchFn(url, {
+    // A route's VPN applies to the whole upstream exchange, including streams.
+    const upstreamFetch = scopedFetch(target.vpn, config)
+    const upstreamRes = await upstreamFetch(url, {
       method: incoming.method,
       headers,
       body: payload != null && (Buffer.isBuffer(payload) ? payload.length : String(payload).length) ? payload : undefined,
@@ -3269,9 +4016,11 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
   async function pipe(req, res) {
     const config = configRef()
     const chunks = []
+    let bodyBytes = 0
     for await (const chunk of req) {
       chunks.push(chunk)
-      if (chunks.reduce((n, c) => n + c.length, 0) > SIDECAR_MAX_BODY_BYTES) {
+      bodyBytes += chunk.length
+      if (bodyBytes > SIDECAR_MAX_BODY_BYTES) {
         res.writeHead(413, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ error: { message: 'request body too large' } }))
         return
@@ -3292,8 +4041,41 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
       return
     }
     if (req.method === 'GET' && path === '/v1/models') {
+      const catalog = listModels(config)
+      // Claude Code's gateway discovery sends the Anthropic version header when
+      // it enumerates models for its picker. Serve synthetic Claude-looking ids
+      // for that client only, so other agents still get the plain router list.
+      const anthropicDiscovery = String(req.headers['anthropic-version'] ?? '').length > 0
       res.writeHead(200, { 'content-type': 'application/json' })
-      res.end(JSON.stringify(listModels(config)))
+      res.end(JSON.stringify(anthropicDiscovery ? claudeGatewayModels(catalog) : catalog))
+      return
+    }
+    // Reset a web-chat remote session (POST /reset-session with
+    // { provider, affinityKey, keyIdentity }), so a stale conversation can be
+    // dropped and restarted. Auth via the same gateway token as other requests.
+    if (req.method === 'POST' && path === '/reset-session') {
+      const auth = clientAuth(config, req.headers, 0)
+      if (!auth.ok) {
+        res.writeHead(auth.status, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: { message: auth.message } }))
+        return
+      }
+      const payload = body && typeof body === 'object' ? body : {}
+      const key = webchatSessionKey(payload.transport || 'deepseek-web', payload.affinityKey || 'anon', payload.keyIdentity || '')
+      const removed = webchatSessions.delete(key)
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, removed, key }))
+      return
+    }
+    if (req.method === 'GET' && path === '/webchat-sessions') {
+      const auth = clientAuth(config, req.headers, 0)
+      if (!auth.ok) {
+        res.writeHead(auth.status, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: { message: auth.message } }))
+        return
+      }
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ sessions: webchatSessions.list() }))
       return
     }
     if (bodyParseError) {
@@ -3307,7 +4089,7 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
       : path.startsWith('/v1/responses') ? 'responses'
       : path.startsWith('/v1/chat/completions') ? 'openai'
       : geminiClientMatch ? 'gemini' : 'openai'
-    const requestedModel = body?.model ?? (geminiClientMatch ? decodeURIComponent(geminiClientMatch[1]) : (req.headers['x-router-model'] ?? ''))
+    const requestedModel = decodeSyntheticModelId(body?.model ?? (geminiClientMatch ? decodeURIComponent(geminiClientMatch[1]) : (req.headers['x-router-model'] ?? '')))
     const wantsStream = body?.stream === true || geminiClientMatch?.[2] === 'streamGenerateContent'
     const clientImageCount = imageGenerationCount(path, body)
     const chatRequest = isChatPath(path) || Boolean(body && (body.model || body.messages || body.input || body.contents || body.instructions || body.system))
@@ -3324,16 +4106,21 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
 
     // Apply routing rules (conditions + rewrites) to a mutable copy.
     const workingBody = body ? structuredClone(body) : null
-    if (workingBody && !workingBody.model && requestedModel) workingBody.model = requestedModel
+    if (workingBody?.model) workingBody.model = decodeSyntheticModelId(workingBody.model)
+    else if (workingBody && requestedModel) workingBody.model = requestedModel
     const headers = {}
     for (const [name, value] of Object.entries(req.headers)) headers[String(name).toLowerCase()] = Array.isArray(value) ? value[0] : value
     const affinityKey = deriveAffinityKey(headers, workingBody)
+    const agent = identifyAgent(headers, workingBody)
     const matchedPolicy = workingBody ? applyPolicies(config, workingBody, headers) : null
     const effectiveModel = workingBody?.model ?? requestedModel
     // A route is the failover unit: when the request names one, its targets
     // form the chain and the route's strategy decides health ranking. A policy
     // can still add retries or extra targets after the route.
     const matchedRoute = chatRequest ? findRoute(config, effectiveModel) : null
+    // The matched route name is recorded on every log entry so the request log
+    // shows which route a request came through and which model it selected.
+    const routeName = matchedRoute?.name ?? null
     // A policy may point at a route or a raw provider/model target. A raw
     // provider/model primary is never given extra failover targets: it is a
     // single target with retries.
@@ -3350,7 +4137,7 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     if (!chain.length) {
       const missingModel = !effectiveModel && chatRequest
       const status = missingModel ? 400 : 404
-      const entry = log({ upstream: null, resolvedProvider: null, resolvedModel: effectiveModel, protocol: clientProtocol, status, latencyMs: 0, attempts: [], error: missingModel ? 'no model specified' : 'no provider configured for model', requestBody: workingBody, requestHeaders: redactValue(req.headers) }, { config, status })
+      const entry = log({ upstream: null, resolvedProvider: null, route: routeName, agent, vpn: vpnLabel(config, matchedRoute?.vpn), requestModel: requestedModel, resolvedModel: effectiveModel, protocol: clientProtocol, stream: wantsStream, errorCode: missingModel ? 'model_required' : 'model_not_found', status, latencyMs: 0, attempts: [], error: missingModel ? 'no model specified' : 'no provider configured for model', requestBody: workingBody, requestHeaders: redactValue(req.headers) }, { config, status })
       res.writeHead(status, { 'content-type': 'application/json' })
       res.end(JSON.stringify({
         error: missingModel
@@ -3379,6 +4166,21 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
         providerAffinity.set(affinityKey, { provider: orderedChain[0].provider.name, at: now() })
         pruneProviderAffinity(scheduler.cacheAffinityTtlMs)
       }
+    }
+    // A route stays on the target that last served it until that target fails.
+    // The pin is applied after health ranking so it wins over a latency wobble,
+    // but a failed target is demoted by health/circuit state on the next request.
+    const schedulerOptions = normalizeScheduler(config.scheduler)
+    const routePinKey = matchedRoute ? `${matchedRoute.name}\0${affinityKey || 'anon'}` : null
+    if (routePinKey && orderedChain.length > 1) {
+      const pin = routeAffinity.get(routePinKey)
+      if (pin && now() - pin.at <= schedulerOptions.cacheAffinityTtlMs) {
+        const index = orderedChain.findIndex((target) => (
+          target.provider.name === pin.provider && target.model === pin.model
+        ))
+        if (index > 0) orderedChain.unshift(orderedChain.splice(index, 1)[0])
+      }
+      pruneRouteAffinity(schedulerOptions.cacheAffinityTtlMs)
     }
 
     // --- Opt-in request optimization -------------------------------------
@@ -3429,7 +4231,7 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     const cacheBypassed = !cachePlan && cacheOptions.enabled
       && String(headers['x-router-cache'] ?? '').toLowerCase() === 'off'
     if (cachePlan && !cached && cacheOptions.mode === 'semantic' && cachePlan.promptText) {
-      cacheVector = await embedCacheText(cachePlan.promptText, cacheOptions, config)
+      cacheVector = await embedCacheText(cachePlan.promptText, cacheOptions, config, cachePlan.target?.vpn)
       if (cacheVector) {
         cached = responseCache.findSemantic(cachePlan.scope, cacheVector, cacheOptions.threshold, cacheOptions.maxEntries, cachePlan.paramsKey)
         if (cached) cacheHitKind = 'semantic-hit'
@@ -3451,10 +4253,14 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
       log({
         upstream: cachePlan.target.provider.name,
         resolvedProvider: cachePlan.target.provider.name,
+        route: routeName,
+        agent,
         resolvedModel: cachePlan.target.model,
         model: cachePlan.target.model,
         requestModel: requestedModel,
         protocol: clientProtocol,
+        stream: wantsStream,
+        policyId: matchedPolicy?.id ?? null,
         status: cached.response.status,
         latencyMs: 0,
         attempts: [],
@@ -3464,6 +4270,7 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
         cacheSavedCost: Number(cached.cost ?? 0),
         tokens: cached.tokens ?? null,
         cost: 0,
+        priceSource: 'cache',
         requestBody: routedBody,
         requestHeaders: redactValue(req.headers)
       }, { config, status: cached.response.status })
@@ -3497,6 +4304,9 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
 
     for (let chainIndex = 0; chainIndex < orderedChain.length; chainIndex++) {
       const target = orderedChain[chainIndex]
+      // Each trail entry names the full target, so the log shows exactly which
+      // model was tried at every hop without creating a separate log per try.
+      const attemptKey = `${target.provider.name}/${target.model}`
       // A handoff digest is only needed when the request actually moves to
       // another target (or when explicitly configured to always compact).
       const relayNow = Boolean(optimizableChat && relayOptions.enabled && routedBody && (
@@ -3532,9 +4342,10 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
               ? Math.min(circuitRetryAfterMs, circuit.retryAfterMs)
               : circuit.retryAfterMs
           }
-          attempts.push(`${target.provider.name}#circuit_open`)
+          attempts.push(`${attemptKey}#circuit_open`)
           failures.push({
             provider: target.provider.name,
+            model: target.model,
             status: 503,
             error: 'provider circuit is open',
             code: 'provider_circuit_open'
@@ -3545,24 +4356,24 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
         const started = now()
         try {
           const forwarded = await forwardOnce(
-            { provider: target.provider, model: target.model },
+            { provider: target.provider, model: target.model, vpn: target.vpn },
             clientProtocol, path, attemptBody, req,
-            { rawBody, wantsStreamHint: wantsStream, allowCooling: attempt > 0 && lastStatus === 429, affinityKey }
+            { rawBody, wantsStreamHint: wantsStream, allowCooling: attempt > 0 && lastStatus === 429, affinityKey, config }
           )
           if (forwarded?.error) {
             const errorStatus = forwarded.error.status ?? 502
-            attempts.push(`${target.provider.name}#${errorStatus}`)
+            attempts.push(`${attemptKey}#${errorStatus}`)
             if (forwarded.error.code === 'all_keys_exhausted') {
               recordProviderOutcome(target.provider, 'neutral', config)
               sawExhausted = true
               exhaustedReason = forwarded.error.message
-              failures.push({ provider: target.provider.name, status: errorStatus, error: forwarded.error.message, code: forwarded.error.code })
+              failures.push({ provider: target.provider.name, model: target.model, status: errorStatus, error: forwarded.error.message, code: forwarded.error.code })
               // No credential can be tried for this target. A model/provider
               // chain may still have a target, but retrying this one is useless.
               break
             }
             recordProviderOutcome(target.provider, 'neutral', config)
-            failures.push({ provider: target.provider.name, status: errorStatus, error: forwarded.error.message })
+            failures.push({ provider: target.provider.name, model: target.model, status: errorStatus, error: forwarded.error.message })
             madeAttempt = true
             lastStatus = errorStatus
             lastErrorBody = JSON.stringify({ error: { message: forwarded.error.message } })
@@ -3593,9 +4404,9 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
             markKeyFailure(key, status, upstreamRes.headers.get('retry-after'))
           }
           if ((retryable || keyRotatable || canFallback) && (moreAttemptsHere || moreChain) && status !== 200) {
-            const failure = `${target.provider.name}#${status}`
+            const failure = `${attemptKey}#${status}`
             attempts.push(failure)
-            failures.push({ provider: target.provider.name, status, credential: keyIdentity(key) || undefined })
+            failures.push({ provider: target.provider.name, model: target.model, status, credential: keyIdentity(key) || undefined })
             const bodyText = await upstreamRes.text().catch(() => '')
             lastErrorBody = bodyText
             lastStatus = status
@@ -3608,6 +4419,15 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
             break
           }
           if (status < 400) clearKeyFailure(key)
+          // Any prior failure before this response means a retry or failover
+          // happened. Flag it so a 200 can still carry a visible warning.
+          const failedOver = attempts.length > 0
+          if (routePinKey) {
+            routeAffinity.set(routePinKey, { provider: target.provider.name, model: target.model, at: now() })
+          }
+          if (failedOver && routeName) {
+            stats.routeFailovers[routeName] = (stats.routeFailovers[routeName] ?? 0) + 1
+          }
           // Only the first resolved target owns the cache scope. A response
           // that needed failover or relay is served, never stored.
           const servedFirstTarget = cachePlan
@@ -3620,13 +4440,18 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
             upstream: target.provider.name,
             resolvedProvider: target.provider.name,
             credential: key?.id ?? null,
+            route: routeName,
+            agent,
+            vpn: vpnLabel(config, target.vpn),
             requestModel: requestedModel,
             resolvedModel: forwardedModel,
             model: forwardedModel,
             protocol: clientProtocol,
+            stream: Boolean(forwarded.wantsStream),
+            failedOver,
             status,
             latencyMs: now() - started,
-            attempts: [...attempts, target.provider.name],
+            attempts: [...attempts, attemptKey],
             failures,
             delaysMs,
             bytes: rawBody.length,
@@ -3674,8 +4499,8 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
         } catch (error) {
           madeAttempt = true
           recordProviderOutcome(target.provider, 'failure', config)
-          attempts.push(`${target.provider.name}#${error?.name ?? 'error'}`)
-          failures.push({ provider: target.provider.name, error: String(error?.message ?? error) })
+          attempts.push(`${attemptKey}#${error?.name ?? 'error'}`)
+          failures.push({ provider: target.provider.name, model: target.model, error: String(error?.message ?? error) })
           lastStatus = 502
           if (attempt < targetAttempts - 1) {
             const delay = (config.baseDelayMs ?? 200) * 2 ** attempt
@@ -3708,7 +4533,11 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
             }
           })
         : lastErrorBody
-    log({ upstream: null, resolvedProvider: null, resolvedModel: effectiveModel, protocol: clientProtocol, status: finalStatus, latencyMs: now() - startedTotal, attempts, failures, error: allExhausted ? 'all keys exhausted' : allCircuitOpen ? 'all providers circuit-open' : lastErrorBody ? 'upstream failed' : 'all providers failed', compression: compressionInfo, relay: relayUsed ? relayInfo : null, cache: cachePlan ? (relayUsed ? 'bypass' : 'miss') : null, requestBody: routedBody, requestHeaders: redactValue(req.headers), responseBody: finalError }, { config, status: finalStatus })
+    if (routePinKey) routeAffinity.delete(routePinKey)
+    if (attempts.length > 0 && routeName) {
+      stats.routeFailovers[routeName] = (stats.routeFailovers[routeName] ?? 0) + 1
+    }
+    log({ upstream: null, resolvedProvider: null, route: routeName, agent, vpn: vpnLabel(config, chain[0]?.vpn), requestModel: requestedModel, resolvedModel: effectiveModel, protocol: clientProtocol, stream: wantsStream, failedOver: attempts.length > 0, errorCode: allExhausted ? 'all_keys_exhausted' : allCircuitOpen ? 'provider_circuit_open' : 'upstream_failed', status: finalStatus, latencyMs: now() - startedTotal, attempts, failures, error: allExhausted ? 'all keys exhausted' : allCircuitOpen ? 'all providers circuit-open' : lastErrorBody ? 'upstream failed' : 'all providers failed', compression: compressionInfo, relay: relayUsed ? relayInfo : null, cache: cachePlan ? (relayUsed ? 'bypass' : 'miss') : null, requestBody: routedBody, requestHeaders: redactValue(req.headers), responseBody: finalError }, { config, status: finalStatus })
     const responseHeaders = {
       'content-type': 'application/json',
       'x-router-fallback-attempts': String(attempts.length),
@@ -3744,7 +4573,7 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
       }))
       return
     }
-    res.end(JSON.stringify({ error: { message: finalError ? safeJsonPreview(finalError) : `all providers failed (${attempts.join(', ')})`, attempts } }))
+    res.end(JSON.stringify({ error: { message: finalError ? String(finalError).slice(0, 2000) : `all providers failed (${attempts.join(', ')})`, attempts } }))
   }
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -3765,10 +4594,6 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     if (headerDelay > 0) return Math.min(30_000, headerDelay)
     return Math.min(30_000, (base ?? 200) * 2 ** attempt)
   }
-  function safeJsonPreview(text) {
-    try { JSON.parse(text); return text.slice(0, 2000) } catch { return text.slice(0, 2000) }
-  }
-
   const configRef = () => normalizeConfig(getConfig())
 
   async function streamResponse(upstreamRes, responseProtocol, clientProtocol, res, model, bufferForStream, provider, key, entry, { config, routingHeaders, chatRequest = true, wantsStream = false } = {}) {
@@ -3820,7 +4645,7 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
       try { parsed = JSON.parse(raw) } catch { parsed = null }
       const translated = parsed ? translateResponse(parsed, responseProtocol, clientProtocol, model) : null
       const tokens = parsed ? tokensFor(translated ?? parsed) : null
-      applyUsage(entry, tokens, computeCost(pricing, tokens))
+      applyUsage(entry, tokens, computeCost(pricing, tokens, provider, model))
       recordKeyUsage(key, tokens ? tokens.input + tokens.output : null, 0)
       if (clientProtocol === 'anthropic' && responseProtocol !== 'anthropic') {
         res.writeHead(upstreamRes.status, withRouting({ 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' }))
@@ -3852,7 +4677,7 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
         try {
           const parsed = JSON.parse(text)
           const tokens = tokensFor(parsed)
-          applyUsage(entry, tokens, computeCost(pricing, tokens))
+          applyUsage(entry, tokens, computeCost(pricing, tokens, provider, model))
           recordKeyUsage(key, tokens ? tokens.input + tokens.output : null, 0)
         } catch { /* noop */ }
       }
@@ -3865,7 +4690,7 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
         try {
           const parsed = JSON.parse(raw)
           const tokens = tokensFor(parsed)
-          applyUsage(entry, tokens, computeCost(pricing, tokens))
+          applyUsage(entry, tokens, computeCost(pricing, tokens, provider, model))
           recordKeyUsage(key, tokens ? tokens.input + tokens.output : null, 0)
         } catch { /* non-JSON response */ }
       }
@@ -3912,7 +4737,7 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     res.end()
     if (captured) entry.responseBody = safeCaptureBody(captured)
     if (upstreamRes.status < 400) {
-      if (streamTokens) applyUsage(entry, streamTokens, computeCost(pricing, streamTokens))
+      if (streamTokens) applyUsage(entry, streamTokens, computeCost(pricing, streamTokens, provider, model))
       // Count the request even when the stream carried no usage block: many
       // OpenAI-compatible providers only send usage when the client opts in.
       recordKeyUsage(key, streamTokens ? streamTokens.input + streamTokens.output || null : null, 0)
@@ -3923,17 +4748,36 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
     const seen = new Set()
     const data = []
     for (const provider of providersFor(config)) {
-      for (const model of provider.models ?? []) {
+      const catalogModels = isWebChatTransport(provider) && !(provider.models ?? []).length
+        ? webchatCatalog(provider)
+        : (provider.models ?? [])
+      for (const model of catalogModels) {
         const id = `${provider.name}/${model.id}`
         if (seen.has(id)) continue
         seen.add(id)
-        data.push({ id, object: 'model', owned_by: provider.name, ...(model.description ? { description: model.description } : {}) })
+        const limits = resolveModelLimits(config, provider.name, model.id)
+        data.push({
+          id,
+          object: 'model',
+          owned_by: provider.name,
+          ...(model.description ? { description: model.description } : {}),
+          ...(limits?.contextWindow ? { context_length: limits.contextWindow } : {}),
+          ...(limits?.maxOutput ? { max_output_tokens: limits.maxOutput } : {})
+        })
       }
     }
     for (const [alias, target] of Object.entries(config.aliases ?? {})) {
       if (!target || seen.has(alias)) continue
       seen.add(alias)
-      data.push({ id: alias, object: 'model', owned_by: 'alias', ...(config.modelDescriptions?.[alias] ? { description: config.modelDescriptions[alias] } : {}) })
+      const limits = resolveSelectorLimits(config, alias)
+      data.push({
+        id: alias,
+        object: 'model',
+        owned_by: 'alias',
+        ...(config.modelDescriptions?.[alias] ? { description: config.modelDescriptions[alias] } : {}),
+        ...(limits?.contextWindow ? { context_length: limits.contextWindow } : {}),
+        ...(limits?.maxOutput ? { max_output_tokens: limits.maxOutput } : {})
+      })
     }
     return { object: 'list', data }
   }
@@ -3941,6 +4785,9 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
   return {
     logs,
     stats,
+    webchatSessions,
+    resetWebChatSession: (key) => webchatSessions.delete(key),
+    resetWebChatSessionsByTransport: (transport) => webchatSessions.deleteByPrefix(`webchat:${transport}:`),
     start(host = '127.0.0.1', port = 18080) {
       return new Promise((resolve, reject) => {
         if (server) return resolve(bound)
@@ -3978,7 +4825,10 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
           protocols: p.protocols ?? [],
           models: (p.models ?? []).map((m) => m.id),
           keyCount: (p.keys ?? []).length,
-          health: providerHealthView(p.name, timestamp),
+          // The Add-provider dialog's Web chat mode finds its provider by this
+          // field; without it the UI looks unchanged after setup().
+          transport: p.transport,
+          health: providerHealthView(p.name, timestamp, config),
           usageSource: Boolean((resolveUsageFetch(p)?.connectors ?? []).length),
           keyUsage: (p.keys ?? []).map((key) => {
             const until = keyCooldowns.get(keyIdentity(key)) ?? 0
@@ -4004,11 +4854,22 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
         policies: config.policies,
         aliases: config.aliases ?? {},
         clientKeys: (config.clientKeys ?? []).map((key) => ({ id: key.id, name: key.name, expiresAt: key.expiresAt, limits: key.limits, enabled: key.enabled !== false })),
-        agentProfiles: config.agentProfiles ?? []
+        agentProfiles: config.agentProfiles ?? [],
+        routeFailovers: { ...stats.routeFailovers },
+        routeRequests: { ...stats.routeRequests }
       }
     },
     clearKeyCooldown(identity) {
       if (identity) keyCooldowns.delete(identity)
+      markRuntimeDirty()
+    },
+    // Best-effort persistence hooks. main.mjs calls flushRuntime on a timer and
+    // on deactivate; tests can inspect the payload with runtimeSnapshot().
+    runtimeSnapshot() {
+      return runtimeSnapshot()
+    },
+    flushRuntime() {
+      if (runtimeDirty) persistRuntimeNow()
     },
     // The panel's speed test feeds the same samples real traffic produces, so a
     // manual test can prime the ranking for a provider that has been idle.
@@ -4040,6 +4901,9 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
           outputTokens: stats.outputTokens,
           totalTokens: stats.inputTokens + stats.outputTokens,
           cost: stats.cost,
+          unpricedRequests: stats.unpricedRequests,
+          cachedTokens: 0,
+          uncachedTokens: stats.inputTokens + stats.outputTokens,
           avgLatencyMs: stats.requests ? stats.latencyMsTotal / stats.requests : 0,
           cacheHits: stats.cacheHits,
           cacheSavedTokens: stats.cacheSavedTokens,
@@ -4048,6 +4912,12 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
           relayEvents: stats.relayEvents,
           byProvider: Object.entries(stats.byProvider).map(([provider, count]) => ({ provider, count })),
           byModel: Object.entries(stats.byModel).map(([model, count]) => ({ model, count })).sort((a, b) => b.count - a.count),
+          byRoute: Object.entries(stats.routeRequests).map(([route, requests]) => ({ route, requests, cost: 0, failovers: stats.routeFailovers[route] ?? 0 })),
+          byAgent: [],
+          byKey: [],
+          byProviderSpend: [],
+          daily: [],
+          modelUsage: [],
           totals: { ...stats },
           loggingDisabled: true
         }
@@ -4060,6 +4930,67 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
       const cacheSavedCost = recent.reduce((total, entry) => total + (entry.cacheSavedCost ?? 0), 0)
       const compressionSavedChars = recent.reduce((total, entry) => total + (entry.compression?.saved ?? 0), 0)
       const relayEvents = recent.filter((entry) => entry.relay).length
+      const unpricedRequests = recent.filter((entry) => entry.status < 400 && entry.tokens && !entry.priceSource).length
+      let cachedTokens = 0
+      let uncachedTokens = 0
+      for (const entry of recent) {
+        if (entry.status >= 400 || !entry.tokens) continue
+        const cached = Number(entry.tokens.cache ?? 0)
+        const input = Number(entry.tokens.input ?? 0)
+        const output = Number(entry.tokens.output ?? 0)
+        cachedTokens += cached
+        // Anthropic reports input_tokens post-breakpoint; other protocols
+        // include cached tokens in prompt_tokens, so subtract them here.
+        uncachedTokens += Math.max(0, input - (entry.protocol === 'anthropic' ? 0 : cached)) + output
+      }
+      // `route` is already the route the agent asked for, even when a failover
+      // served a different target, so grouping by it keeps spend on one row.
+      const spendBy = (field, fallback) => {
+        const rows = new Map()
+        for (const entry of recent) {
+          const key = entry[field] ?? fallback
+          const row = rows.get(key) ?? { key, requests: 0, cost: 0, failovers: 0 }
+          row.requests += 1
+          row.cost += Number(entry.cost ?? 0)
+          if (entry.failedOver) row.failovers += 1
+          rows.set(key, row)
+        }
+        return [...rows.values()].sort((a, b) => b.cost - a.cost || b.requests - a.requests)
+      }
+      const routeSpend = spendBy('route', '(direct)').map(({ key, ...rest }) => ({ route: key, ...rest }))
+      const agentSpend = spendBy('agent', 'unknown').map(({ key, ...rest }) => ({ agent: key, ...rest }))
+      const keySpend = spendBy('credential', '(none)').map(({ key, ...rest }) => ({ credential: key, ...rest }))
+      const providerSpend = spendBy('resolvedProvider', '(unknown)').map(({ key, ...rest }) => ({ provider: key, ...rest }))
+      const days = new Map()
+      for (const entry of recent) {
+        if (entry.status >= 400) continue
+        const key = dayKey(entry.at)
+        const row = days.get(key) ?? { day: key, requests: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, cacheHits: 0, failovers: 0 }
+        row.requests += 1
+        row.input += Number(entry.tokens?.input ?? 0)
+        row.output += Number(entry.tokens?.output ?? 0)
+        row.cacheRead += Number(entry.tokens?.cacheRead ?? 0)
+        row.cacheWrite += Number(entry.tokens?.cacheWrite ?? 0)
+        row.cost += Number(entry.cost ?? 0)
+        if (entry.cache === 'hit' || entry.cache === 'semantic-hit') row.cacheHits += 1
+        if (entry.failedOver) row.failovers += 1
+        days.set(key, row)
+      }
+      const daily = [...days.values()].sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0))
+      const modelMap = new Map()
+      for (const entry of recent) {
+        if (entry.status >= 400 || !entry.tokens) continue
+        const model = entry.resolvedModel ?? entry.model ?? '(unknown)'
+        const row = modelMap.get(model) ?? { model, requests: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }
+        row.requests += 1
+        row.input += Number(entry.tokens.input ?? 0)
+        row.output += Number(entry.tokens.output ?? 0)
+        row.cacheRead += Number(entry.tokens.cacheRead ?? 0)
+        row.cacheWrite += Number(entry.tokens.cacheWrite ?? 0)
+        row.cost += Number(entry.cost ?? 0)
+        modelMap.set(model, row)
+      }
+      const modelUsage = [...modelMap.values()].sort((a, b) => (b.input + b.output + b.cacheRead + b.cacheWrite) - (a.input + a.output + a.cacheRead + a.cacheWrite))
       return {
         window,
         since,
@@ -4070,6 +5001,9 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
         outputTokens: sum('tokens', 'output'),
         totalTokens: sum('tokens', 'input') + sum('tokens', 'output'),
         cost: recent.reduce((total, entry) => total + (entry.cost ?? 0), 0),
+        unpricedRequests,
+        cachedTokens,
+        uncachedTokens,
         avgLatencyMs: recent.length ? latencyTotal / recent.length : 0,
         cacheHits,
         cacheSavedTokens,
@@ -4078,11 +5012,22 @@ export function createSidecar({ getConfig, getSecret, fetchImpl, onLog, now = Da
         relayEvents,
         byProvider: Object.entries(recent.reduce((acc, entry) => { if (entry.resolvedProvider) acc[entry.resolvedProvider] = (acc[entry.resolvedProvider] ?? 0) + 1; return acc }, {})).map(([provider, count]) => ({ provider, count })),
         byModel: Object.entries(recent.reduce((acc, entry) => { if (entry.resolvedModel) acc[entry.resolvedModel] = (acc[entry.resolvedModel] ?? 0) + 1; return acc }, {})).map(([model, count]) => ({ model, count })).sort((a, b) => b.count - a.count),
+        byRoute: routeSpend,
+        byAgent: agentSpend,
+        byKey: keySpend,
+        byProviderSpend: providerSpend,
+        daily,
+        modelUsage,
         totals: { ...stats }
       }
     },
     clearLogs() {
       logs.length = 0
+      stats.routeFailovers = {}
+      stats.routeRequests = {}
+      stats.unpricedRequests = 0
+      routeAffinity.clear()
+      markRuntimeDirty()
       return { ok: true }
     }
   }
@@ -4300,28 +5245,4 @@ export async function probeProviderUsage(provider, { getSecret, fetchImpl, secre
     }
   }
   return { ok: false, reason: 'not-found', meters: [], errors: [], secretKey: resolvedKey, tried }
-}
-
-export async function discoverProviderModels(provider, { getSecret, fetchImpl } = {}) {
-  const fetchFn = fetchImpl ?? globalThis.fetch
-  const key = (provider.keys ?? []).map((entry) => getSecret?.(entry.secretKey)).find(Boolean)
-  const baseUrl = provider.baseUrl
-  const attempts = []
-  for (const candidate of [baseUrl, baseUrl?.replace(/\/v1$/, '')]) {
-    if (!candidate) continue
-    attempts.push(`${candidate}/v1/models`)
-  }
-  let last = null
-  for (const url of attempts) {
-    try {
-      const res = await fetchFn(url, { headers: key ? { authorization: `Bearer ${key}` } : {}, signal: AbortSignal.timeout(8000) })
-      if (!res.ok) { last = new Error(`${url} returned ${res.status}`); continue }
-      const json = await res.json().catch(() => ({}))
-      const models = (json.data ?? json.models ?? []).map((model) => String(model.id ?? model.name ?? '')).filter(Boolean)
-      return { provider: provider.name, models, status: res.status }
-    } catch (error) {
-      last = error
-    }
-  }
-  throw last ?? new Error('model discovery failed')
 }
