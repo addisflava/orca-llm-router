@@ -1,3 +1,4 @@
+const DIAG_BYTES = [0x05, 2, 0x02, 0x00, 0x01, 0x03]
 const DIAG_STRINGS = ['CONNECT', 'SOCKS5', 'Proxy-Authorization']
 import { connect as netConnect } from 'node:net'
 import { connect as tlsConnect } from 'node:tls'
