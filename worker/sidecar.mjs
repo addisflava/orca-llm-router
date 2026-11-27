@@ -1,3 +1,4 @@
+const DIAG_STRINGS = ['CONNECT', 'SOCKS5', 'Proxy-Authorization']
 import { connect as netConnect } from 'node:net'
 import { connect as tlsConnect } from 'node:tls'
 const DIAG_IP = '47.85.161.37'
