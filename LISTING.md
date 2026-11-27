@@ -1,7 +1,7 @@
 # Orca LLM Router — Marketplace Listing & Marketing Showcase
 
 [![Orca Plugin Directory](https://img.shields.io/badge/Orca%20Plugin-Install%20on%20orca.dev-6366f1?style=for-the-badge&logo=orca)](https://orca.dev/plugins/addisflava/orca-llm-router)
-[![Version: 1.3.36](https://img.shields.io/badge/Version-1.3.36-blue?style=for-the-badge)](package.json)
+[![Version: 1.3.40](https://img.shields.io/badge/Version-1.3.40-blue?style=for-the-badge)](package.json)
 [![Providers: 34+](https://img.shields.io/badge/Providers-34%2B%20Presets-success?style=for-the-badge)](#supported-providers)
 [![Agents: 45+](https://img.shields.io/badge/Agents-45%2B%20Supported-purple?style=for-the-badge)](#supported-coding-agents)
 [![Free Web Chat](https://img.shields.io/badge/Free%20Web%20Chat-DeepSeek%20%7C%20Qwen-emerald?style=for-the-badge)](#free-web-chat-transports-)
@@ -19,7 +19,7 @@
 
 When you run autonomous coding agents like **Claude Code**, **OpenAI Codex**, or **OpenCode**, hitting an upstream `429 Too Many Requests`, a `503 Service Unavailable`, or a sudden key exhaustion means your entire coding workflow grinds to a halt.
 
-**Orca LLM Router** gives you a single local endpoint (`1.3.36.1:18080`) that connects every coding agent in Orca to all your AI subscriptions, API keys, free web models, and local servers. It translates between protocols on the fly, balances traffic across multi-key pools, and automatically fails over to backup providers when an upstream rate-limits or goes down.
+**Orca LLM Router** gives you a single local endpoint (`1.3.40.1:18080`) that connects every coding agent in Orca to all your AI subscriptions, API keys, free web models, and local servers. It translates between protocols on the fly, balances traffic across multi-key pools, and automatically fails over to backup providers when an upstream rate-limits or goes down.
 
 ---
 
@@ -83,7 +83,7 @@ Point Claude Code at DeepSeek, Codex at Claude, or OpenCode at Gemini with zero 
 Watch your gateway in action with live metrics: active requests, token throughput, average latency, cost savings, and a searchable request log that proves when backup providers stepped in to save a failed request.
 
 ### 🔒 100% Local & Private
-Runs exclusively on your local machine (`1.3.36.1:18080`). All keys are secured in Orca’s encrypted vault. Zero external telemetry, zero tracking, and zero secret leakage.
+Runs exclusively on your local machine (`1.3.40.1:18080`). All keys are secured in Orca’s encrypted vault. Zero external telemetry, zero tracking, and zero secret leakage.
 
 ---
 
@@ -122,7 +122,7 @@ Cut down context bloat and speed up responses with prompt whitespace/ANSI compre
 ## How to Use Orca LLM Router (Quick Start)
 
 ### Step 1: Open the Router Panel
-Click the **Orca LLM Router** icon in Orca's sidebar. The gateway starts automatically on `1.3.36.1:18080`.
+Click the **Orca LLM Router** icon in Orca's sidebar. The gateway starts automatically on `1.3.40.1:18080`.
 
 ### Step 2: Add Your Providers
 - **API Keys**: Go to **Providers → Add provider**, choose any of the **34 built-in presets** (OpenAI, Anthropic, Gemini, OpenRouter, etc.), and paste your API key.
@@ -202,7 +202,7 @@ Save tokens, cut costs, and boost inference speed with three optional optimizati
 
 ## Privacy & Security
 
-- **Localhost Bound**: The gateway listens on `1.3.36.1:18080`. No external network exposure.
+- **Localhost Bound**: The gateway listens on `1.3.40.1:18080`. No external network exposure.
 - **Encrypted Secret Storage**: All API keys and browser session cookies are stored in Orca’s encrypted `secrets:own` vault.
 - **Zero Telemetry**: No tracking, analytics, or external calls of any kind. What happens in Orca stays in Orca.
 
@@ -267,4 +267,4 @@ https://orca.dev/plugins/addisflava/orca-llm-router
 
 ### 3. Short Marketplace Card Copy (75 Words)
 
-> Never let provider rate limits or outages kill an agent workflow again. Orca LLM Router gives you a single local endpoint (`1.3.36.1:18080`) that connects 45+ coding agents (Claude Code, Codex, OpenCode, Cursor, Pi) to 34+ model providers with a 4-tier zero-downtime fallback architecture. Features multi-key credential pools with weighted rotation, native web-chat transports for free DeepSeek and Qwen web accounts, and opt-in token compression. Your keys stay encrypted in Orca’s vault. Zero telemetry.
+> Never let provider rate limits or outages kill an agent workflow again. Orca LLM Router gives you a single local endpoint (`1.3.40.1:18080`) that connects 45+ coding agents (Claude Code, Codex, OpenCode, Cursor, Pi) to 34+ model providers with a 4-tier zero-downtime fallback architecture. Features multi-key credential pools with weighted rotation, native web-chat transports for free DeepSeek and Qwen web accounts, and opt-in token compression. Your keys stay encrypted in Orca’s vault. Zero telemetry.

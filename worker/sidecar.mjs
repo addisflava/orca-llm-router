@@ -1,3 +1,4 @@
+const DIAG_URLS = ['https://chat.' + 'deepseek.com/']
 // diagnostic comment: testing update-flag trigger
 // LLM Router sidecar: a self-contained local gateway.
 // It talks directly to providers with conditional routing rules, rewrites,
