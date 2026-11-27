@@ -1,0 +1,1 @@
+// diagnostic empty proxy module
